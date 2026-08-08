@@ -31,7 +31,7 @@ body:
     id: app-version
     attributes:
       label: App version / commit
-      description: TestFlight build number, or the commit you built from source.
+      description: SideStore artifact version/build plus source commit, or the commit you built locally.
     validations:
       required: true
   - type: input
@@ -44,8 +44,8 @@ body:
   - type: input
     id: server-version
     attributes:
-      label: hermes-webui server version
-      description: Settings → server info in the app, or the upstream tag/commit you deployed.
+      label: Hermex WebUI fork commit
+      description: The full commit from `WEBUI_FORK_TESTED_SHA` and, when relevant, the paired Hermes Agent commit.
     validations:
       required: true
   - type: dropdown

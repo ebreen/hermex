@@ -2,26 +2,27 @@
 
 ## Reporting a vulnerability
 
-Please **do not** report security vulnerabilities through public GitHub issues.
+Do **not** report a vulnerability through a public issue. Private vulnerability reporting is
+not currently enabled for this fork. Send the report to **ebreen@proton.me** with the subject
+`Hermex security report`.
 
-Instead, use GitHub's private vulnerability reporting: go to the repository's
-**Security** tab and click **Report a vulnerability** (or open
-`https://github.com/uzairansaruzi/hermex/security/advisories/new`). This opens a
-private security advisory that only the maintainer can see.
+Include, when available:
 
-Include as much of the following as you can:
+- a clear description and impact;
+- reproduction steps or a proof of concept;
+- the Hermex app commit and iOS version;
+- the canonical WebUI fork commit from `WEBUI_FORK_TESTED_SHA`;
+- whether the behavior also exists unchanged in upstream `nesquena/hermes-webui`.
 
-- A description of the vulnerability and its impact
-- Steps to reproduce, or a proof of concept
-- The app version (or commit) and iOS version you tested against
-
-You should get an initial response within a week. Please give the maintainer a
-reasonable window to ship a fix before disclosing publicly.
+Expect an initial response within seven days. Allow a reasonable remediation window before
+public disclosure.
 
 ## Scope
 
-This repository contains only the iOS client. Vulnerabilities in the
-[hermes-webui](https://github.com/nesquena/hermes-webui) server should be
-reported to that project instead. Issues with how *this app* stores
-credentials, talks to the server, or handles untrusted server responses are in
-scope here.
+Hermex spans the native iOS app, the canonical `ebreen/hermes-webui` server fork, their wire
+contract, and the Apple-credential-free SideStore release pipeline. Credential storage, authentication,
+untrusted server/model content, consent boundaries, source retrieval, scheduling, handoffs,
+artifact integrity, and fork-owned server behavior are in scope.
+
+If a vulnerability is inherited unchanged from upstream, report it here first so the fork can
+assess exposure and coordinate with the upstream project without exposing private details.

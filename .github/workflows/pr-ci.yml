@@ -1,6 +1,6 @@
-# Contributor CI: build and run the full XCTest suite on every pull request
-# that touches app code. Docs-only PRs (markdown, docs/, community files) skip
-# the macOS runner entirely and pass via the cheap gate job.
+# Contributor CI: run the Improvements contract validator on cheap Ubuntu for
+# every pull request, then build and run the full XCTest suite when app code is
+# touched. Docs-only PRs skip only the macOS runner.
 #
 # The required branch-protection check is "CI Gate", not "Build and Test":
 # a skipped required check would block merges forever, so the gate always
@@ -9,7 +9,7 @@
 # Uses no repository secrets, so PRs from forks get green CI too.
 #
 # Code signing is disabled (CODE_SIGNING_ALLOWED=NO) — fine for compile/test
-# runs per TESTFLIGHT.md; the "simulator installs must be signed" rule applies
+# runs per DEVELOPMENT.md; the "simulator installs must be signed" rule applies
 # to manual simulator testing, not CI.
 
 name: PR CI
@@ -39,21 +39,109 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --paginate --jq '.[].filename')
-          echo "Changed files:"
-          echo "${files}"
-          # Fail closed: anything NOT on the docs-only allowlist triggers the
-          # full suite (including workflow, project, and config changes).
-          non_docs=$(echo "${files}" | grep -vE '^(docs/.*|LICENSE|\.gitignore|\.github/ISSUE_TEMPLATE/.*|\.github/CODEOWNERS|\.github/dependabot\.yml|\.github/FUNDING\.yml|.*\.md)$' || true)
-          if [[ -n "${non_docs}" ]]; then
-            echo "Non-docs changes detected — running the full suite:"
-            echo "${non_docs}"
-            echo "run_ios=true" >> "$GITHUB_OUTPUT"
+          metadata_file=$(mktemp)
+          files_file=$(mktemp)
+          trap 'rm -f "${metadata_file}" "${files_file}"' EXIT
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" > "${metadata_file}"
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --slurp > "${files_file}"
+          run_ios=$(
+            python3 - "${metadata_file}" "${files_file}" <<'PY'
+          import json
+          import re
+          import sys
+
+          def fail(message: str) -> None:
+              raise SystemExit(f"Changed-file classification failed: {message}")
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              metadata = json.load(handle)
+          with open(sys.argv[2], encoding="utf-8") as handle:
+              pages = json.load(handle)
+
+          expected = metadata.get("changed_files") if isinstance(metadata, dict) else None
+          if type(expected) is not int or expected <= 0:
+              fail(f"invalid changed_files count: {expected!r}")
+          if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+              fail("files response is not a paginated list")
+          records = [record for page in pages for record in page]
+          if len(records) != expected:
+              fail(f"expected {expected} file records, received {len(records)}")
+
+          allowed_statuses = {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
+          paths = []
+          for index, record in enumerate(records):
+              if not isinstance(record, dict):
+                  fail(f"record {index} is not an object")
+              filename = record.get("filename")
+              status = record.get("status")
+              if not isinstance(filename, str) or not filename or "\x00" in filename:
+                  fail(f"record {index} has an invalid filename")
+              if status not in allowed_statuses:
+                  fail(f"record {index} has an invalid status: {status!r}")
+              paths.append(filename)
+              previous = record.get("previous_filename")
+              if status == "renamed":
+                  if not isinstance(previous, str) or not previous or "\x00" in previous:
+                      fail(f"renamed record {index} has no valid previous_filename")
+                  paths.append(previous)
+              elif previous is not None:
+                  fail(f"non-renamed record {index} unexpectedly has previous_filename")
+
+          docs_only = re.compile(
+              r"(?:docs/.*|LICENSE|\.gitignore|\.github/ISSUE_TEMPLATE/.*|"
+              r"\.github/CODEOWNERS|\.github/dependabot\.yml|\.github/FUNDING\.yml|.*\.md)"
+          )
+          for path in paths:
+              print(f"Changed path: {path!r}", file=sys.stderr)
+          print("true" if any(docs_only.fullmatch(path) is None for path in paths) else "false")
+          PY
+          )
+          printf 'run_ios=%s\n' "${run_ios}" >> "$GITHUB_OUTPUT"
+          if [[ "${run_ios}" == "true" ]]; then
+            printf '%s\n' "Non-docs changes detected — running the full suite."
+          elif [[ "${run_ios}" == "false" ]]; then
+            printf '%s\n' "Docs-only change — skipping the macOS runner."
           else
-            echo "Docs-only change — skipping the macOS runner."
-            echo "run_ios=false" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "Classifier returned an invalid result: ${run_ios}" >&2
+            exit 1
           fi
+
+  contract:
+    name: Improvements contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      validated: ${{ steps.validate.outputs.validated }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Validate canonical contract
+        id: validate
+        run: |
+          set -euo pipefail
+          expected_count=25
+          log_file=$(mktemp)
+          trap 'rm -f "${log_file}"' EXIT
+          python3 -m unittest tests/test_fork_contract.py -v 2>&1 | tee "${log_file}"
+          actual_count=$(
+            python3 - "${log_file}" <<'PY'
+          import re
+          import sys
+
+          text = open(sys.argv[1], encoding="utf-8").read()
+          counts = re.findall(r"(?m)^Ran (\d+) tests in ", text)
+          if len(counts) != 1:
+              raise SystemExit(f"expected one unittest count, found {counts}")
+          print(counts[0])
+          PY
+          )
+          if [[ "${actual_count}" != "${expected_count}" ]]; then
+            echo "Contract test manifest mismatch: expected ${expected_count}, found ${actual_count}." >&2
+            exit 1
+          fi
+          printf 'validated=true\n' >> "$GITHUB_OUTPUT"
 
   test:
     name: Build and Test
@@ -71,7 +159,7 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -188,15 +276,16 @@ jobs:
 
       - name: Upload test results on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: test-results
           path: ${{ env.RESULT_BUNDLE_PATH }}
           if-no-files-found: ignore
+          retention-days: 14
 
   gate:
     name: CI Gate
-    needs: [changes, test]
+    needs: [changes, contract, test]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -205,12 +294,34 @@ jobs:
         run: |
           set -euo pipefail
           echo "changes: ${{ needs.changes.result }}"
+          echo "contract: ${{ needs.contract.result }}"
+          echo "contract validated: ${{ needs.contract.outputs.validated }}"
+          echo "run_ios: ${{ needs.changes.outputs.run_ios }}"
           echo "test: ${{ needs.test.result }}"
           if [[ "${{ needs.changes.result }}" != "success" ]]; then
             echo "Path detection failed — failing the gate." >&2
             exit 1
           fi
-          case "${{ needs.test.result }}" in
-            success|skipped) echo "Gate passed." ;;
-            *) echo "Build and Test did not pass — failing the gate." >&2; exit 1 ;;
-          esac
+          if [[ "${{ needs.contract.result }}" != "success" ]]; then
+            echo "Improvements contract validation failed — failing the gate." >&2
+            exit 1
+          fi
+          if [[ "${{ needs.contract.outputs.validated }}" != "true" ]]; then
+            echo "Improvements contract validator did not prove execution — failing the gate." >&2
+            exit 1
+          fi
+          if [[ "${{ needs.changes.outputs.run_ios }}" == "true" ]]; then
+            if [[ "${{ needs.test.result }}" != "success" ]]; then
+              echo "Build and Test was required but did not pass — failing the gate." >&2
+              exit 1
+            fi
+          elif [[ "${{ needs.changes.outputs.run_ios }}" == "false" ]]; then
+            if [[ "${{ needs.test.result }}" != "skipped" ]]; then
+              echo "Build and Test ran unexpectedly for a docs-only change — failing the gate." >&2
+              exit 1
+            fi
+          else
+            echo "Path detection returned an invalid run_ios value — failing the gate." >&2
+            exit 1
+          fi
+          echo "Gate passed."

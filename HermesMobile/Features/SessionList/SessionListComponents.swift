@@ -1583,8 +1583,8 @@ struct SessionRowSkeletonConfiguration: Identifiable {
             relativeDate: "3h"
         ),
         SessionRowSkeletonConfiguration(
-            id: "testflight",
-            title: "TestFlight validation checklist",
+            id: "sidestore-validation",
+            title: "SideStore artifact validation checklist",
             messageCount: "6 messages",
             workspace: "release",
             relativeDate: "1d"

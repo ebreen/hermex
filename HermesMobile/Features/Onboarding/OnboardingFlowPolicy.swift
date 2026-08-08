@@ -8,7 +8,7 @@ enum OnboardingFlowPolicy {
     static let agentSetupPrompt = """
 Set up Hermes Web UI on this machine for access from my iPhone via Tailscale.
 
-Clone and install https://github.com/nesquena/hermes-webui — it's a Node.js web app. Install dependencies and start it on port 8787.
+Until the canonical Hermex WebUI fork is published, use https://github.com/nesquena/hermes-webui only as an inherited-feature compatibility fallback. It is a Python server. Follow its README to install dependencies and start it on port 8787.
 Enable password authentication by setting the HERMES_WEBUI_PASSWORD environment variable. Generate a secure random password and save it — I'll need it for the iPhone app.
 Install Tailscale on this machine. Search the web for the correct install method for this OS if you're unsure. Authenticate to my Tailscale account — if this requires opening a URL or an auth key, tell me exactly what to do.
 Make the WebUI reachable over Tailscale:

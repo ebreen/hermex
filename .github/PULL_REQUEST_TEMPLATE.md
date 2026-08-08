@@ -19,4 +19,5 @@ Fixes #
 - [ ] The full test suite passes locally (`xcodebuild test -project HermesMobile.xcodeproj -scheme HermesMobile -destination 'platform=iOS Simulator,name=iPhone 17'`)
 - [ ] New/changed `Codable` models decode tolerantly (optionals for fields the server might add or rename)
 - [ ] No new third-party dependencies (the list in `PROJECT_SPEC.md` is locked)
-- [ ] No invented API endpoints or JSON shapes (verified against upstream source or a running server)
+- [ ] No invented API endpoints or JSON shapes (verified against the authenticated running canonical fork and version-matched fork source; upstream only for inherited behavior)
+- [ ] AI usage is disclosed in one line, or the PR says `human-authored`
