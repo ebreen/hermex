@@ -2,6 +2,14 @@ name: Bug report
 description: Something in the app is broken or behaving unexpectedly
 labels: ["bug", "needs-triage"]
 body:
+  - type: checkboxes
+    id: public-privacy
+    attributes:
+      label: Public issue privacy
+      description: GitHub issues and attachments are public. Remove private or identifying data before submitting. Security vulnerabilities must use the private process in SECURITY.md.
+      options:
+        - label: I removed credentials, authorization headers, private server URLs, prompts, transcripts, Memory excerpts, and other personal data.
+          required: true
   - type: textarea
     id: steps
     attributes:
@@ -64,6 +72,6 @@ body:
     id: screenshots
     attributes:
       label: Screenshots or screen recordings
-      description: Visual evidence helps a lot. Drag and drop to attach.
+      description: Attachments are public. Redact private URLs, account details, prompts, transcripts, Memory, notifications, and other identifying data before uploading.
     validations:
       required: false

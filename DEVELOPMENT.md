@@ -1,7 +1,10 @@
 # Development
 
-This app is developed against the self-hosted canonical `ebreen/hermes-webui` fork exposed
-over real HTTPS. See [`PROJECT_SPEC.md`](PROJECT_SPEC.md) for the full product and API plan.
+At the issue #14 bootstrap baseline, `ebreen/hermes-webui` had not been created. Current server
+testing validates inherited compatibility against the upstream commit in `UPSTREAM_TESTED_SHA`.
+After issue #45 creates the public fork and `WEBUI_FORK_TESTED_SHA` passes the trusted fixed-host
+commit check, that exact fork commit becomes the canonical primary target over real HTTPS. See
+[`PROJECT_SPEC.md`](PROJECT_SPEC.md) for the full product and API plan.
 
 > The inherited TestFlight/App Store Connect path is retired. Distribution uses the
 > Apple-credential-free SideStore flow described below.
@@ -14,7 +17,11 @@ Use:
 https://<your-server>
 ```
 
-Point this at your own `hermes-webui` server exposed through an HTTPS tunnel or reverse proxy (e.g. Cloudflare Tunnel). Real HTTPS works from both the iOS simulator and physical devices without an App Transport Security exception. If the server sets `HERMES_WEBUI_PASSWORD`, you need that password to sign in.
+Before the verified fork pin exists, point this only at an upstream-compatible server for inherited
+feature testing; it cannot validate Improvements. After the pin exists, point it at that exact
+Hermex WebUI fork commit through an HTTPS tunnel or reverse proxy (for example, Cloudflare Tunnel).
+Real HTTPS works from both the iOS simulator and physical devices without an App Transport Security
+exception. If the server sets `HERMES_WEBUI_PASSWORD`, you need that password to sign in.
 
 Before debugging the app, verify the server is reachable:
 

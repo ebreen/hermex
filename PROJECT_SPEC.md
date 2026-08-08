@@ -280,7 +280,7 @@ There is no verified full `/insights` dashboard REST endpoint in the pinned upst
 - Timeframe filtering is local to the fetched session metadata. Label this as **Usage Analytics** rather than claiming full parity with the CLI/WebUI `/insights` command.
 
 ### 6.8 Endpoints we deliberately skip in v1
-The native app deliberately omits Terminal (`/api/terminal/*`), generic Cron mutation, Skills mutation, native Memory mutation, Profile administration, file mutation, OAuth, approvals, and clarify prompts from this legacy v1 surface. Improvements can retrieve bounded Memory excerpts only under its canonical consent contract and never takes ownership of Memory. Architect optional surfaces with a `Capability` enum or similar.
+The native legacy v1 surface deliberately omits Terminal (`/api/terminal/*`) and OAuth. Generic Cron jobs remain mutable through the inherited Tasks surface (`/api/crons/create`, `/api/crons/update`, `/api/crons/delete`, `/api/crons/run`, `/api/crons/pause`, `/api/crons/resume`) as native Hermes records; see §10.1. Improvements never reuses generic Cron records as Dream Schedule entities. Dream projections are server-owned and routed only through the authenticated admission adapter defined in `docs/improvements-contract.md` §6; the app cannot create, edit, or delete them directly. Improvements can retrieve bounded Memory excerpts only under its canonical consent contract and never takes ownership of Memory. Architect optional surfaces with a `Capability` enum or similar.
 
 ### 6.9 Improvements
 
@@ -588,7 +588,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Persistence/cache impact:** No offline cache in v1; show normal network error state.
 - **Tests:** Cron list/status/output decoding and date formatting.
 - **Manual simulator test plan:** Open Tasks, refresh, open a job, confirm active/running status if any job is running, and confirm recent output appears.
-- **Risks/open questions:** v1 is read-only. Do not expose create/edit/run/pause/resume even though upstream endpoints exist.
+- **Risks/open questions:** The Tasks page ships create/edit/delete/run/pause/resume against the inherited generic Cron endpoints. Keep those mutations on native Hermes records and never let them touch Improvements Dream projections, which are server-owned and admission-routed (see `docs/improvements-contract.md` §6).
 
 #### 10.2 Skills page
 - **User-facing goal:** Add a Skills row/button on the Sessions screen. Tapping it opens all skills sorted by category; tapping a skill opens its detail.
@@ -802,7 +802,7 @@ These are useful directions outside the locked v1 scope. Implement one only thro
 - **Offline/cache strategy:** Decide how much transcript/workspace context should live on-device, whether extra encryption is needed beyond iOS defaults, and whether Settings needs "Clear local cache" or sensitive-session exclusions.
 - **Chat maintainability:** Continue optional focused extraction slices for `ChatView`, `ChatViewModel`, and composer/services after behavior is locked down. Keep these refactors small, test-backed, and behavior-preserving.
 - **Cloudflare Access login flow:** If the owner later puts Cloudflare Access in front of the server, design an iOS authentication flow deliberately instead of bolting it onto password auth.
-- **Dangerous admin actions:** Terminal, file mutation, generic Cron mutation, Skill mutation, and Profile administration are v2+ only through a dedicated safety contract. Native Memory remains source-owned; Improvements may retrieve only consented excerpts.
+- **Dangerous admin actions:** Terminal and additional generic file-editing surfaces are v2+ only through a dedicated safety contract. Native Memory remains source-owned; Improvements may retrieve only consented excerpts.
 
 ---
 

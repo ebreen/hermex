@@ -121,7 +121,7 @@ Fork-owned behavior is developed and tested against the canonical commit in `WEB
 - [`PROJECT_INTENT.md`](PROJECT_INTENT.md): short orientation; useful for product tradeoffs, not implementation details.
 - [`DEVELOPMENT.md`](DEVELOPMENT.md): local development, isolated server tests, and validation workflow.
 - [`TESTFLIGHT.md`](TESTFLIGHT.md): tombstone for the retired inherited TestFlight path.
-- [`CONTRACT_TESTS.md`](CONTRACT_TESTS.md): upstream contract-test readiness and the pin-advance policy.
+- [`CONTRACT_TESTS.md`](CONTRACT_TESTS.md): fork-owned contract-test readiness, the trusted-validator bootstrap, and the pin-advance policy.
 - [`PRIVACY.md`](PRIVACY.md): app, configured-server, provider-consent, and third-party request boundaries.
 - [`SECURITY.md`](SECURITY.md): how to report a vulnerability.
 - [`docs/agents/`](docs/agents): repo-local agent workflow conventions (issues, triage labels, domain notes).

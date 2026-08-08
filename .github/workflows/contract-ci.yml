@@ -39,6 +39,7 @@ jobs:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           path: candidate
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
           fetch-depth: 1
           submodules: false
           lfs: false
@@ -46,19 +47,36 @@ jobs:
       - name: Validate candidate with trusted test manifest
         run: |
           set -euo pipefail
-          if [[ -L "${GITHUB_WORKSPACE}/candidate/tests/test_fork_contract.py" ]] \
-            || [[ ! -f "${GITHUB_WORKSPACE}/candidate/tests/test_fork_contract.py" ]]; then
-            echo "The candidate contract validator must be a regular file." >&2
-            exit 1
-          fi
+          mapfile -t tests_entries < <(
+            git -C "${GITHUB_WORKSPACE}/candidate" ls-tree -d HEAD -- tests
+          )
+          [[ "${#tests_entries[@]}" -eq 1 ]]
+          read -r tests_mode tests_type tests_oid tests_path <<< "${tests_entries[0]}"
+          [[ "${tests_mode}" == "040000" ]]
+          [[ "${tests_type}" == "tree" ]]
+          [[ "${tests_path}" == "tests" ]]
+
+          mapfile -t validator_entries < <(
+            git -C "${GITHUB_WORKSPACE}/candidate" ls-tree HEAD -- tests/test_fork_contract.py
+          )
+          [[ "${#validator_entries[@]}" -eq 1 ]]
+          read -r validator_mode validator_type validator_oid validator_path <<< "${validator_entries[0]}"
+          [[ "${validator_mode}" == "100644" ]]
+          [[ "${validator_type}" == "blob" ]]
+          [[ "${validator_path}" == "tests/test_fork_contract.py" ]]
+          candidate_validator="${RUNNER_TEMP}/candidate-test_fork_contract.py"
+          git -C "${GITHUB_WORKSPACE}/candidate" cat-file blob "${validator_oid}" \
+            > "${candidate_validator}"
           if ! cmp -s "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" \
-            "${GITHUB_WORKSPACE}/candidate/tests/test_fork_contract.py"; then
+            "${candidate_validator}"; then
             echo "The trusted contract validator changed; use the documented trust-root update procedure." >&2
             exit 1
           fi
+          rm -f -- "${candidate_validator}"
           expected_count=25
           actual_count=$(
-            HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
+            PYTHONDONTWRITEBYTECODE=1 \
+              HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
               HERMEX_CONTRACT_BASE_ROOT="${GITHUB_WORKSPACE}/validator" \
               python3 - "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" <<'PY'
           import importlib.util
@@ -78,7 +96,8 @@ jobs:
             echo "Trusted validator manifest mismatch: expected ${expected_count}, found ${actual_count}." >&2
             exit 1
           fi
-          HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
+          PYTHONDONTWRITEBYTECODE=1 \
+            HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
             HERMEX_CONTRACT_BASE_ROOT="${GITHUB_WORKSPACE}/validator" \
             python3 "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" -v
 
@@ -98,6 +117,7 @@ jobs:
                 exit 1
               fi
               [[ "$(git -C "${verify_dir}" rev-parse FETCH_HEAD)" == "${webui_pin}" ]]
+              [[ "$(git -C "${verify_dir}" cat-file -t FETCH_HEAD)" == "commit" ]]
               rm -rf -- "${verify_dir}"
               trap - EXIT
             fi

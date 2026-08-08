@@ -2,6 +2,14 @@ name: Feature request
 description: Suggest new functionality or an improvement
 labels: ["enhancement", "needs-triage"]
 body:
+  - type: checkboxes
+    id: public-privacy
+    attributes:
+      label: Public issue privacy
+      description: GitHub issues and attachments are public. Remove private or identifying data before submitting. Security vulnerabilities must use the private process in SECURITY.md.
+      options:
+        - label: I removed credentials, authorization headers, private server URLs, prompts, transcripts, Memory excerpts, and other personal data.
+          required: true
   - type: textarea
     id: use-case
     attributes:

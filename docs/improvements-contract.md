@@ -51,7 +51,7 @@ ordering, Profile, or storage location and are never reused. The top-level recor
 | **Context Source** | A bounded reference to evidence for one Subject. | `active`, `suspended`, or `revoked`; revocation prevents later retrieval but preserves audit history. |
 | **Consent Grant** | Versioned authorization for one principal, Schedule, provider boundary, source scope, purpose, and expiry. | `active`, `expired`, or `revoked`; terminal versions remain auditable. |
 | **Dream Schedule** | The Subject, source set, trigger, Lead Profile, Lead Dream Perspective, optional Critic, and limits for recurring study. | `paused`, `enabled`, `degraded`, or `archived`. |
-| **Dream Cycle** | One scheduled or manual attempt using an immutable consent snapshot and input manifest. | `queued`, `running`, `succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, or `skipped_overlap`. A retry is a new linked Cycle, never a rewritten attempt. |
+| **Dream Cycle** | One scheduled or manual attempt using an immutable consent snapshot and input manifest. | `queued`, `running`, `succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, `skipped_overlap`, or `skipped_policy`. A retry is a new linked Cycle, never a rewritten attempt. |
 | **Proposal** | One reviewable, actionable thesis produced for one Subject and traceable to its originating Dream Cycle. | Review state is `new`, `reviewing`, `accepted`, `deferred`, `rejected`, or `dismissed`. Origin and original thesis remain immutable. |
 | **Proposal Update** | Append-only evidence or reasoning that materially updates an existing Proposal without duplicating it. | Immutable after append. |
 | **Proposal Decision** | An append-only human decision transition with actor, reason, time, and observed Proposal version. | Immutable; current Proposal review state is a projection of ordered Decisions and idempotent Review Return events. |
@@ -77,7 +77,10 @@ explainable. The sole user-visible exception is the explicit permanent Subject p
   archived Subject restores only to `paused`, so restoration cannot restart spend. Permanent
   purge is a separate explicit operation, not a status change.
 - Context Source: `active` ↔ `suspended`; either may become terminal `revoked`. Re-adding a
-  revoked source creates a new ID and consent lineage.
+  revoked source creates a new ID and consent lineage. Suspending or revoking a source atomically
+  increments its authorization epoch and the linked Subject fence. A queued or running Cycle that
+  names that source cannot retrieve again; at its next boundary it becomes `cancelled` with
+  `source_suspended` or `source_revoked`.
 - Consent Grant: a new Grant starts `active`. It becomes `expired` when server time reaches its
   `expires_at`, or `revoked` through an append-only revocation event. Both states are terminal and
   cannot be reactivated. Renewal creates a new Consent Grant with a new stable ID and links it to
@@ -85,7 +88,7 @@ explainable. The sole user-visible exception is the explicit permanent Subject p
   transaction revokes it with reason `superseded`. Renewal never rewrites a terminal Grant.
 - Dream Schedule: `paused` ↔ `enabled`; validation or drift may move either to `degraded`;
   repair returns it to `paused`; `paused` or `degraded` may become terminal `archived`.
-- Dream Cycle: `queued` may become `running`, `cancelled`, or `skipped_overlap`; `running`
+- Dream Cycle: `queued` may become `running`, `cancelled`, `skipped_overlap`, or `skipped_policy`; `running`
   becomes one of the other terminal Cycle results. Terminal Cycles never reopen or rewrite.
 - Proposal review: `new` may become `reviewing`; a new append-only Decision may project any
   non-purged Proposal to `accepted`, `deferred`, `rejected`, or `dismissed`. Dismissal and
@@ -99,7 +102,10 @@ explainable. The sole user-visible exception is the explicit permanent Subject p
   appends the deterministic `defer_elapsed` event for each overdue, unsuperseded Defer Decision,
   transitions its Proposal to `reviewing`, and marks that event complete exactly once. Repeated
   reconciliation and restart replay use the Defer Decision ID as the event idempotency key. A
-  Review Return never increments unread, accepts, creates a Handoff, or starts work.
+  A `defer_elapsed` Review Return never increments unread, accepts, creates a Handoff, or starts
+  work. The separate `evidence_reopened` behavior is defined in §6.
+  Proposal has no `archived`, `abandoned`, or `implemented` review state; those words belong to
+  Subject, Outcome, or delivery lifecycles and never shorthand a Proposal review transition.
 - Handoff: `preparing` may advance to `created`, `outcome_uncertain`, `failed`, or `cancelled`;
   `created` may advance to `started`, `completed`, `outcome_uncertain`, `failed`, or `cancelled`;
   `started` may advance to `completed`, `outcome_uncertain`, `failed`, or `cancelled`. An ambiguous
@@ -275,7 +281,8 @@ matching current Grants; and acquires one durable per-Subject lease. The lease r
 owner, acquisition and heartbeat times, expiry, in-flight provider deadline, and a monotonically
 increasing fencing token. Only after that transaction commits may the controlled worker start.
 Every retrieval, provider submission, result ingestion, and lease renewal must present the
-current token; a stale fencing token fails closed before data access or egress.
+current token and the current authorization epoch of every named Context Source. A stale fencing
+token or changed source epoch fails closed before data access or egress.
 
 The initial lease lasts 120 seconds and a live worker heartbeats at least every 30 seconds. Before
 one bounded provider request, it renews the lease beyond that request's enforced timeout plus a
@@ -299,9 +306,14 @@ active Cycle rather than creating another.
 Only one Dream Cycle may run for a Subject, even when several schedules fire. A fire that loses
 the lease transaction records `skipped_overlap`, links the active Cycle, and performs zero
 retrieval or provider egress. A fire that fails Subject, Schedule, source, role, Grant, or
-configuration validation records a policy-specific terminal Cycle and also performs zero
-retrieval or provider egress. A losing or policy-blocked fire never queues a backlog. Native
-collapsed catch-up creates at most one `catch_up` Cycle after downtime and advances to the next
+configuration validation records `skipped_policy` and exactly one closed reason code:
+`subject_inactive`, `schedule_not_enabled`, `projection_mismatch`, `source_suspended`,
+`source_revoked`, `profile_unavailable`, `workdir_unavailable`, `toolset_unavailable`,
+`skill_unavailable`, `budget_invalid`, `retry_not_permitted`, `dependency_unavailable`,
+`provider_unavailable`, `grant_missing`, `grant_expired`, `grant_revoked`,
+`grant_scope_mismatch`, or `configuration_invalid`. It performs zero retrieval or provider egress.
+No other admission-failure state or reason is valid. A losing or policy-blocked fire never queues a
+backlog. Native collapsed catch-up creates at most one `catch_up` Cycle after downtime and advances to the next
 future occurrence; it never replays every missed interval. Pausing stops future recurrence only.
 
 A transient provider/network or schema-ingestion failure permits one bounded retry as a new
@@ -386,16 +398,21 @@ or other out-of-scope autonomy.
 
 Deduplication has three ordered layers. First, a unique deterministic fingerprint detects an
 exact semantic key for the same Subject, affected area, problem, and intended outcome. Second,
-local similarity retrieves a bounded related-record corpus across active, rejected, dismissed,
-archived, and implemented Proposals; `active` includes `new`, `reviewing`, `accepted`, and
-`deferred`, and compacted records remain eligible through their retained fingerprint, title,
-reason, and relationship metadata. Third, the Lead and Critic compare the candidate with that
+local similarity retrieves a bounded related-record corpus across every non-purged Proposal,
+including all six declared review states. Delivery State and Outcome remain separate axes and are
+never treated as Proposal review states. Compacted records remain eligible through their retained
+fingerprint, title, reason, and relationship metadata. Third, the Lead and Critic compare the candidate with that
 bounded set and persist a novelty explanation. Probabilistic similarity is retrieval only and
 must not reject a candidate by itself, select a canonical record, or create an Update without the
 semantic comparison. An exact retry returns the existing record. The same thesis/outcome with
-genuinely new evidence creates an immutable Proposal Update linked to that Proposal. A material
-difference creates a new related Proposal and records the relationship; it is not discarded as a
-near duplicate.
+genuinely new evidence creates an immutable Proposal Update linked to that Proposal only while its
+generated body and bounded evidence remain present. That append atomically adds an
+`evidence_reopened` Review Return event, projects the Proposal to `reviewing`, marks it unread, and
+resets its 180-day compaction clock; it never accepts or starts work. If the matching Proposal was
+already compacted, the server creates a new fully reviewable Proposal with complete current body
+and evidence and a `reopens_compacted` edge to the retained record. It never appends an unread
+Update to a hollow compacted Proposal. A material difference creates a new related Proposal and
+records the relationship; it is not discarded as a near duplicate.
 
 Only candidates that pass every hard gate receive Proposal Score. The score is an integer from
 0 through 100 and the initial inbox quality threshold is 70. The fixed V1 score weights are
@@ -499,6 +516,12 @@ the Cycle as `cancelled` with `consent_expired` or `consent_revoked`, and never 
 snapshot to continue. Already-used evidence remains represented by redacted
 provenance sufficient for audit. Caps are enforced before provider submission and again before
 persistence.
+
+At those same boundaries the server revalidates that every exact Context Source remains `active`,
+linked to the Subject, inside the current Grant, and at the snapshotted authorization epoch.
+Suspension or revocation atomically advances the Subject fence. No later retrieval, provider
+submission, retry, or result ingestion may use that source. A result already in flight is retained
+only as a policy-stop audit digest; it cannot publish or update a Proposal.
 
 This policy-blocked terminal result is never automatically retried.
 
@@ -685,7 +708,8 @@ Preservation overrides compaction. A Proposal that ever entered `accepted` or `d
 had a Handoff or Outcome, or ever had a Delivery State other than `Unsent` retains its full
 original thesis, bounded Source Evidence, Proposal Updates, Decisions, Handoffs, and Outcomes
 until explicit permanent Subject purge, regardless of its current review state. This historical
-predicate wins if that Proposal is later rejected, dismissed, archived, or abandoned.
+predicate wins if that Proposal is later rejected or dismissed, or if a linked Outcome later
+becomes `abandoned` or `superseded`.
 
 Only a Proposal that has never been accepted or deferred, has no Handoff or Outcome, has always
 remained `Unsent`, is unpinned, and is currently rejected or dismissed may compact after 180 days.
@@ -696,8 +720,8 @@ offers review, defer, or dismiss.
 
 `queued` and `running` Cycles are not eligible for age compaction; recovery must first reconcile
 them to a terminal state. Full diagnostics for terminal `succeeded`, `no_proposal`,
-`invalid_output`, `failed`, `cancelled`, `unknown`, and `skipped_overlap` Cycles remain for 90
-days. After that:
+`invalid_output`, `failed`, `cancelled`, `unknown`, `skipped_overlap`, and `skipped_policy` Cycles
+remain for 90 days. After that:
 
 - evidence and configuration linked to a published Proposal follow that Proposal's longer
   retention rule;
@@ -750,7 +774,11 @@ preserve the exact issue #14 identity quarantine or complete the canonical issue
 Partial identity migration fails. Completion requires zero inherited Team, bundle, app-group,
 URL-scheme, extension-suffix, owner-route, Keychain, or source-fallback occurrences; an empty Team
 assignment; every target at `0.1.0`; and the exact canonical app, `.tests`, `.share`, `.liveactivity`,
-app-group, Keychain, URL-scheme, and source-fallback values.
+app-group, Keychain, URL-scheme, and source-fallback values. In the migration commit, tracked
+`APP_IDENTIFIER_SUFFIX` and `APP_URL_SCHEME_SUFFIX` assignments remain empty, and no tracked
+conditional or later assignment may override any identity variable. Static assignment inventory and
+resolved build settings for every target and configuration must both prove the exact values. Both
+app-group entitlement consumers use that same canonical variable.
 
 Before every archive, the release gate follows redirects with an unauthenticated GET to the exact
 `AppConfig.privacyPolicyURL` and `AppConfig.supportURL`. Both final responses must be `2xx`, remain

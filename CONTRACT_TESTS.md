@@ -19,14 +19,19 @@ malformed, private, missing, or unreachable pin fails before `Trusted Contract G
 
 `.github/workflows/contract-ci.yml` uses `pull_request_target` only as a read-only validation
 boundary. It checks out the trusted base validator separately, treats the pull-request merge
-tree as inert data, requires the candidate validator to be byte-for-byte identical to the base
-copy, and never executes candidate code. `Trusted Contract Gate` is the branch-protection check
+tree as inert data, and never executes candidate code. The inert candidate checkout alone uses
+`allow-unsafe-pr-checkout: true` so fork-originated PR merge refs can be read; it persists no
+credentials. The base workflow requires `tests` to be a Git tree and
+`tests/test_fork_contract.py` to be a regular `100644` blob, extracts that blob with `git cat-file`,
+and compares its bytes with the base validator. Filesystem checks separately reject a symlink in
+the validator path or any lexical ancestor. `Trusted Contract Gate` is the branch-protection check
 for this boundary.
 
 The validator also carries two base-relative one-way identity ratchets. One covers inherited Apple
 Team and bundle/app-group/source-fallback values. The other covers inherited runtime owner URLs,
 the predecessor URL scheme, and the old Share/Live Activity suffixes. Both scan regular content,
-binary lines, paths, and symlink targets. The exact base multiset is the maximum: the base-relative
+binary lines, paths, tracked `__pycache__` paths, and symlink targets; trusted Python runs with
+bytecode generation disabled. The exact base multiset is the maximum: the base-relative
 ratchet permits deletion but rejects copying, movement, or reintroduction. A separate atomic-state
 gate accepts only the exact issue #14 quarantine or the complete canonical issue #15 replacement;
 a partial migration fails. This lets issue #15 remove the quarantined identity without locking it in
@@ -43,8 +48,9 @@ URL is expected to return `404` before issue #14 reaches `master`; this is not w
 release. Immediately after merge, verify unauthenticated `2xx` responses and expected fork content
 for both the configured privacy and support URLs before identity or artifact work continues.
 
-An ordinary pull request must not change `tests/test_fork_contract.py` or either protected
-workflow executable digest. Use this trust-root update procedure only when the validator itself
+An ordinary pull request must not change `tests/test_fork_contract.py` or any protected workflow's
+exact-byte SHA-256 digest. Blank lines and comments are included because a comment inside `run: |`
+can break a shell continuation. Use this trust-root update procedure only when the validator itself
 must change:
 
 1. Open a dedicated trust-root pull request containing only the validator, protected workflows,

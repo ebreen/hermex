@@ -27,9 +27,9 @@ CANONICAL_DOCS = (
     ROOT / "CONTRIBUTING.md",
 )
 AGENT_GUIDANCE = tuple(sorted((ROOT / "docs" / "agents").glob("*.md")))
-PR_CI_EXECUTABLE_SHA256 = "d4c5ceff3c6f445c1bb2c439a0fa9f9385456cced55c5e7835fa7a7c47ef8c39"
-CONTRACT_CI_EXECUTABLE_SHA256 = "15fb554bf0011a1f21c26b3ce42cc65b4e286b3eddc2c7dba3e95d1b5ca73a0c"
-UPSTREAM_WATCH_EXECUTABLE_SHA256 = "d605f0865407f63cdbc865e68768278bd5671d5f5d2cdc88210bcf336bc974c3"
+PR_CI_EXECUTABLE_SHA256 = "7a00facbc3ad85a86af1495372b18bd40c1b8030137e16437c934526ed70c191"
+CONTRACT_CI_EXECUTABLE_SHA256 = "962889f05c30f363ef5d75eb28f3e9dc64375da95dd8687b4d13b465442e1d23"
+UPSTREAM_WATCH_EXECUTABLE_SHA256 = "8b107d6ea011acbf886751b1827fcbd95762dcf29445d1660174c3ad256def8a"
 PROTECTED_WORKFLOW_SHA256 = {
     "contract-ci.yml": CONTRACT_CI_EXECUTABLE_SHA256,
     "pr-ci.yml": PR_CI_EXECUTABLE_SHA256,
@@ -86,10 +86,36 @@ def read(path: Path) -> str:
     return read_within(ROOT, path)
 
 
+def regular_path_findings(root: Path, relative: str, *, directory: bool = False) -> list[str]:
+    """Reject a missing, symlinked, or wrong-kind path and every symlinked ancestor."""
+    findings: list[str] = []
+    current = root
+    parts = Path(relative).parts
+    for index, part in enumerate(parts):
+        current = current / part
+        is_leaf = index == len(parts) - 1
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            return [f"protected path is missing: {relative}"]
+        if current.is_symlink():
+            findings.append(f"protected path or ancestor is a symlink: {current.relative_to(root)}")
+            return findings
+        if not is_leaf and not current.is_dir():
+            findings.append(f"protected path ancestor is not a directory: {current.relative_to(root)}")
+            return findings
+        if is_leaf:
+            expected_kind = current.is_dir() if directory else current.is_file()
+            if not expected_kind:
+                kind = "directory" if directory else "file"
+                findings.append(f"protected path is not a regular {kind}: {relative}")
+    return findings
+
+
 def inherited_identity_occurrences(root: Path) -> list[tuple[str, str]]:
     """Return every byte-level occurrence of identity values quarantined for issue #15."""
     tokens = (INHERITED_TEAM_ID.encode(), INHERITED_BUNDLE_ID.encode())
-    excluded = {".git", "__pycache__"}
+    excluded = {".git"}
     findings: list[tuple[str, str]] = []
     for path in root.rglob("*"):
         relative = path.relative_to(root)
@@ -125,7 +151,7 @@ def unapproved_inherited_identity_occurrences(
 
 def inherited_runtime_identity_occurrences(root: Path) -> list[tuple[str, str]]:
     """Find deferred URL, owner-route, and extension identity covered by issue #15."""
-    excluded = {".git", "__pycache__"}
+    excluded = {".git"}
     findings: list[tuple[str, str]] = []
     for path in root.rglob("*"):
         relative = path.relative_to(root)
@@ -168,14 +194,24 @@ def canonical_identity_migration_findings(
     expected_lines = {
         "Config/Shared.xcconfig": {
             "DEVELOPMENT_TEAM =": 1,
+            "APP_IDENTIFIER_SUFFIX =": 1,
             "APP_BUNDLE_IDENTIFIER = no.gior.hermex$(APP_IDENTIFIER_SUFFIX)": 1,
             "APP_GROUP_IDENTIFIER = group.no.gior.hermex$(APP_IDENTIFIER_SUFFIX)": 1,
         },
         ".xcodebuildmcp/config.yaml": {'bundleId: "no.gior.hermex"': 1},
         "HermesMobile.xcodeproj/project.pbxproj": {
+            'APP_URL_SCHEME_SUFFIX = "";': 2,
             'HERMES_URL_SCHEME = "hermex$(APP_URL_SCHEME_SUFFIX)";': 2,
+            'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER)";': 2,
+            'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).tests";': 2,
             'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).share";': 2,
             'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).liveactivity";': 2,
+        },
+        "HermesMobile/Resources/HermesMobile.entitlements": {
+            "<string>$(APP_GROUP_IDENTIFIER)</string>": 1,
+        },
+        "HermesShareExtension/Resources/HermesShareExtension.entitlements": {
+            "<string>$(APP_GROUP_IDENTIFIER)</string>": 1,
         },
         "HermesMobile/Auth/KeychainStore.swift": {'?? "no.gior.hermex"': 1},
         "HermesMobile/Features/Share/SharedDraftStore.swift": {
@@ -199,6 +235,73 @@ def canonical_identity_migration_findings(
             actual = sum(candidate_line == line for candidate_line in lines)
             if actual != count:
                 findings.append(f"{relative}: expected {count} occurrence(s) of {line!r}, found {actual}")
+
+    identity_assignment = re.compile(
+        r"^\s*(?:APP_IDENTIFIER_SUFFIX|APP_BUNDLE_IDENTIFIER|APP_GROUP_IDENTIFIER|"
+        r"APP_URL_SCHEME_SUFFIX|HERMES_URL_SCHEME|PRODUCT_BUNDLE_IDENTIFIER)\s*="
+    )
+    allowed_assignments = Counter(
+        {
+            ("Config/Shared.xcconfig", "APP_IDENTIFIER_SUFFIX ="): 1,
+            (
+                "Config/Shared.xcconfig",
+                "APP_BUNDLE_IDENTIFIER = no.gior.hermex$(APP_IDENTIFIER_SUFFIX)",
+            ): 1,
+            (
+                "Config/Shared.xcconfig",
+                "APP_GROUP_IDENTIFIER = group.no.gior.hermex$(APP_IDENTIFIER_SUFFIX)",
+            ): 1,
+            ("HermesMobile.xcodeproj/project.pbxproj", 'APP_URL_SCHEME_SUFFIX = "";'): 2,
+            (
+                "HermesMobile.xcodeproj/project.pbxproj",
+                'HERMES_URL_SCHEME = "hermex$(APP_URL_SCHEME_SUFFIX)";',
+            ): 2,
+            (
+                "HermesMobile.xcodeproj/project.pbxproj",
+                'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER)";',
+            ): 2,
+            (
+                "HermesMobile.xcodeproj/project.pbxproj",
+                'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).tests";',
+            ): 2,
+            (
+                "HermesMobile.xcodeproj/project.pbxproj",
+                'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).share";',
+            ): 2,
+            (
+                "HermesMobile.xcodeproj/project.pbxproj",
+                'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).liveactivity";',
+            ): 2,
+        }
+    )
+    actual_assignments: Counter[tuple[str, str]] = Counter()
+    assignment_paths = sorted(root.rglob("*.xcconfig"))
+    project_path = root / "HermesMobile.xcodeproj/project.pbxproj"
+    if project_path.exists():
+        assignment_paths.append(project_path)
+    for assignment_path in assignment_paths:
+        relative = str(assignment_path.relative_to(root))
+        for line in read_within(root, assignment_path).splitlines():
+            stripped = line.strip()
+            if identity_assignment.match(stripped):
+                actual_assignments[(relative, stripped)] += 1
+    for key in ("APP_IDENTIFIER_SUFFIX", "APP_URL_SCHEME_SUFFIX"):
+        invalid = [
+            f"{relative}: {line}"
+            for (relative, line), count in actual_assignments.items()
+            if line.startswith(f"{key} =")
+            and (relative, line) not in allowed_assignments
+            for _ in range(count)
+        ]
+        if invalid:
+            findings.append(f"{key} must be empty in every tracked build configuration: {invalid}")
+    unexpected_assignments = actual_assignments - allowed_assignments
+    missing_assignments = allowed_assignments - actual_assignments
+    if unexpected_assignments or missing_assignments:
+        findings.append(
+            "effective identity assignment inventory must resolve exactly to "
+            "no.gior.hermex, .tests, .share, .liveactivity, group.no.gior.hermex, and hermex"
+        )
 
     project_path = root / "HermesMobile.xcodeproj/project.pbxproj"
     if project_path.exists() and project_path.is_file() and not project_path.is_symlink():
@@ -258,6 +361,7 @@ def webui_fork_routing_findings(root: Path) -> list[str]:
     fork_url = "https://github.com/ebreen/hermes-webui"
     guidance_paths = (
         "CONTRACT_TESTS.md",
+        "DEVELOPMENT.md",
         "PROJECT_SPEC.md",
         "README.md",
         "docs/improvements-contract.md",
@@ -288,18 +392,50 @@ def webui_fork_routing_findings(root: Path) -> list[str]:
     return findings
 
 
+def app_config_route_findings(root: Path) -> list[str]:
+    """Require exact runtime declarations and reject predecessor-owned production routes."""
+    relative = "HermesMobile/Config/AppConfig.swift"
+    path = root / relative
+    if path_findings := regular_path_findings(root, relative):
+        return path_findings
+    text = read_within(root, path)
+    expected = {
+        "privacyPolicyURL": "https://github.com/ebreen/hermex/blob/master/PRIVACY.md",
+        "supportURL": "https://github.com/ebreen/hermex/issues",
+    }
+    findings: list[str] = []
+    for property_name, expected_url in expected.items():
+        matches = re.findall(
+            rf'(?m)^\s*static let {property_name} = URL\(staticString: "([^"]+)"\)\s*$',
+            text,
+        )
+        if matches != [expected_url]:
+            findings.append(
+                f"{relative}: {property_name} must declare exactly {expected_url}"
+            )
+
+    prohibited_routes = (
+        "https://github.com/uzairansaruzi/hermex",
+        INHERITED_OWNER_DOMAIN,
+    )
+    mobile_root = root / "HermesMobile"
+    for swift_path in sorted(mobile_root.rglob("*.swift")):
+        swift_text = read_within(root, swift_path)
+        for route in prohibited_routes:
+            if route in swift_text:
+                findings.append(
+                    f"{swift_path.relative_to(root)} routes production UI to predecessor owner: {route}"
+                )
+    return findings
+
+
 def normalize_prose(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
 def executable_workflow_sha256(workflow: str) -> str:
-    """Hash executable YAML while allowing blank and comment-only line changes."""
-    canonical = "\n".join(
-        line.rstrip()
-        for line in workflow.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ) + "\n"
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    """Hash exact workflow bytes; comments inside block scalars can alter shell execution."""
+    return hashlib.sha256(workflow.encode("utf-8")).hexdigest()
 
 
 def active_workflow_texts(root: Path) -> dict[str, str]:
@@ -405,6 +541,22 @@ SEMANTIC_REVERSAL_CASES = (
     (r"multi-Handoff Delivery State (?:is|may be) implementation-defined", "Multi-Handoff Delivery State is implementation-defined."),
     (r"retention for (?:cancelled|unknown|succeeded) Cycles (?:is|may be) implementation-defined", "Retention for unknown Cycles is implementation-defined."),
     (r"Grant confirmation evidence may be deleted before Subject purge", "Grant confirmation evidence may be deleted before Subject purge."),
+    (
+        r"Context Source revoked after admission may remain usable",
+        "A Context Source revoked after admission may remain usable for the current Cycle.",
+    ),
+    (
+        r"queued Cycle may transition to `?policy_denied`?",
+        "A queued Cycle may transition to policy_denied when admission fails.",
+    ),
+    (
+        r"Proposal review (?:may|can) transition to `?(?:archived|abandoned|implemented)`?",
+        "Proposal review may transition to archived after delivery.",
+    ),
+    (
+        r"compacted Proposal may receive an unread Update without (?:a )?(?:complete body|reviewable successor)",
+        "A compacted Proposal may receive an unread Update without a complete body.",
+    ),
 )
 
 SEMANTIC_REVERSALS = tuple(pattern for pattern, _ in SEMANTIC_REVERSAL_CASES)
@@ -462,16 +614,26 @@ def normalized_prose_with_line_map(text: str) -> tuple[str, list[int]]:
 
 
 def match_is_explicitly_negated(text: str, start: int) -> bool:
-    """Return true when the match is inside an explicit negative safety clause."""
+    """Return true only when a nearby negator directly governs the matched proposition."""
     prefix = text[:start]
     clause = re.split(r"[.!?;:,]", prefix)[-1]
-    return bool(
-        re.search(
+    negators = list(
+        re.finditer(
             r"\b(?:never|do not|does not|must not|cannot|can't|is forbidden to|are forbidden to)\b",
             clause,
             flags=re.IGNORECASE,
         )
     )
+    if not negators:
+        return False
+    between = clause[negators[-1].end() :]
+    if re.search(
+        r"\b(?:and|although|because|but|except|however|or|since|so|that|then|unless|while|yet)\b",
+        between,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return len(re.findall(r"\b[\w'-]+\b", between)) <= 5
 
 
 def superseded_guidance_findings(text: str) -> list[tuple[int, str, str]]:
@@ -883,7 +1045,7 @@ class ForkContractTests(unittest.TestCase):
                 "If consent expires during a Cycle, or is revoked",
                 "Retrieved text is untrusted data",
                 "`paused`, `enabled`, `degraded`, or `archived`",
-                "`queued`, `running`, `succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, or `skipped_overlap`",
+                "`queued`, `running`, `succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, `skipped_overlap`, or `skipped_policy`",
                 "Cron job ID is an adapter reference",
                 "one deployment scheduling timezone: `Europe/Oslo`",
                 "next three wall-clock runs and UTC offsets",
@@ -998,7 +1160,19 @@ class ForkContractTests(unittest.TestCase):
         self.assertEqual([], findings, f"semantic contract reversals remain: {findings}")
 
     def test_contract_closes_reviewed_safety_and_state_machine_gaps(self) -> None:
-        contract = normalize_prose(read(CONTRACT))
+        raw_contract = read(CONTRACT)
+        self.assertNotRegex(
+            raw_contract,
+            r"The immutable snapshot is evidence[\s\S]{0,160}\*{3}",
+            "ongoing authorization clause has no live actor/verb",
+        )
+        self.assertIn(
+            "The immutable snapshot is evidence, not ongoing authorization: the server\n"
+            "checks the current Consent Grant immediately before every retrieval and every provider\n"
+            "submission, and again between bounded batches.",
+            raw_contract,
+        )
+        contract = normalize_prose(raw_contract)
         self.assert_contains_all(
             contract,
             (
@@ -1059,6 +1233,9 @@ class ForkContractTests(unittest.TestCase):
                 "monotonically increasing fencing token",
                 "zero retrieval or provider egress",
                 "stale fencing token",
+                "current authorization epoch of every named Context Source",
+                "`source_suspended` or `source_revoked`",
+                "A result already in flight is retained only as a policy-stop audit digest",
                 "automatic takeover remains blocked even after the deadline",
                 "Lead and Critic role independently",
                 "`manual_once`",
@@ -1070,13 +1247,25 @@ class ForkContractTests(unittest.TestCase):
                 "idempotent `prepare_target` step",
                 "creation-key hash and start-operation-key hash",
                 "creation-payload hash and start-payload hash",
-                "active, rejected, dismissed, archived, and implemented Proposals",
+                "across every non-purged Proposal",
+                "including all six declared review states",
+                "never treated as Proposal review states",
+                "Proposal has no `archived`, `abandoned`, or `implemented` review state",
+                "tracked `APP_IDENTIFIER_SUFFIX` and `APP_URL_SCHEME_SUFFIX` assignments remain empty",
+                "resolved build settings for every target and configuration",
+                "Both app-group entitlement consumers use that same canonical variable",
                 "Probabilistic similarity is retrieval only",
                 "must not reject a candidate by itself",
+                "records `skipped_policy` and exactly one closed reason code",
+                "No other admission-failure state or reason is valid",
+                "`evidence_reopened` Review Return event",
+                "resets its 180-day compaction clock",
+                "`reopens_compacted` edge",
+                "never appends an unread Update to a hollow compacted Proposal",
                 "deterministic fold across all Handoffs",
                 "`Verified` > `Implemented` > `In Progress` > `Planned` > `Discussing`",
                 "ever entered `accepted` or `deferred`",
-                "`succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, and `skipped_overlap`",
+                "`succeeded`, `no_proposal`, `invalid_output`, `failed`, `cancelled`, `unknown`, `skipped_overlap`, and `skipped_policy`",
                 "Grant confirmation evidence",
                 "provider-submission provenance",
                 "strongest positive",
@@ -1232,12 +1421,15 @@ class ForkContractTests(unittest.TestCase):
         self.assertIn("ebreen@proton.me", code_of_conduct)
 
     def test_unrelated_negation_does_not_hide_superseded_guidance(self) -> None:
-        poison = "Do not ignore this, Hermex is an iOS client only."
-        findings = superseded_guidance_findings(poison)
-        self.assertIn(
-            r"Hermex (?:is|contains) (?:an? )?(?:iOS|mobile) client only",
-            {pattern for _, pattern, _ in findings},
-        )
+        for poison in (
+            "Do not ignore this, Hermex is an iOS client only.",
+            "Do not be confused because Hermex is an iOS client only.",
+        ):
+            findings = superseded_guidance_findings(poison)
+            self.assertIn(
+                r"Hermex (?:is|contains) (?:an? )?(?:iOS|mobile) client only",
+                {pattern for _, pattern, _ in findings},
+            )
 
     def test_superseded_guidance_scan_allows_valid_safety_wording(self) -> None:
         valid = (
@@ -1344,6 +1536,28 @@ If these files do not exist, proceed silently.
             [(1, poisoned)],
             fork_routing_findings(poisoned_path, poisoned),
         )
+        readme = read(ROOT / "README.md")
+        self.assertNotIn(
+            "upstream contract-test readiness",
+            readme,
+            "README still describes CONTRACT_TESTS.md as upstream readiness",
+        )
+        self.assertIn(
+            "fork-owned contract-test readiness",
+            readme,
+            "README does not describe CONTRACT_TESTS.md as fork-owned",
+        )
+        triage_labels = read(ROOT / "docs" / "agents" / "triage-labels.md")
+        self.assertIn(
+            "fork-owned server behavior",
+            triage_labels,
+            "triage labels do not route fork-owned server defects to the fork",
+        )
+        self.assertNotIn(
+            "As a client repo, a chunk of incoming bugs are really server bugs",
+            triage_labels,
+            "triage labels still treat this repo as an upstream-only client",
+        )
 
     def test_readme_privacy_claim_matches_link_preview_networking(self) -> None:
         readme = read(ROOT / "README.md")
@@ -1414,6 +1628,57 @@ If these files do not exist, proceed silently.
             self.assertIn("compatibility", guidance)
             self.assertIn("Python", guidance)
         self.assertNotIn("Node.js web app", onboarding)
+        self.assert_contains_all(
+            normalize_prose(development),
+            (
+                "At the issue #14 bootstrap baseline, `ebreen/hermes-webui` had not been created",
+                "Current server testing validates inherited compatibility",
+                "After issue #45 creates the public fork",
+                "that exact fork commit becomes the canonical primary target",
+            ),
+            "development fork transition",
+        )
+        self.assertNotIn(
+            "This app is developed against the self-hosted canonical `ebreen/hermes-webui` fork",
+            development,
+        )
+        project_spec = read(ROOT / "PROJECT_SPEC.md")
+        self.assertNotIn(
+            "generic Cron mutation,",
+            project_spec,
+            "PROJECT_SPEC still claims generic Cron mutation is omitted",
+        )
+        self.assertNotIn(
+            "Do not expose create/edit/run/pause/resume",
+            project_spec,
+            "PROJECT_SPEC still declares Tasks read-only",
+        )
+        self.assertIn(
+            "Dream projections are server-owned",
+            project_spec,
+            "PROJECT_SPEC does not separate Dream projections from generic Cron",
+        )
+        with tempfile.TemporaryDirectory(prefix="hermex-webui-guidance-poison-") as temp:
+            poisoned_root = Path(temp)
+            for relative in (
+                "CONTRACT_TESTS.md",
+                "DEVELOPMENT.md",
+                "PROJECT_SPEC.md",
+                "README.md",
+                "docs/improvements-contract.md",
+            ):
+                target = poisoned_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(read(ROOT / relative))
+            poisoned_development = poisoned_root / "DEVELOPMENT.md"
+            poisoned_development.write_text(
+                poisoned_development.read_text()
+                + "\nCurrent server: https://github.com/ebreen/hermes-webui\n"
+            )
+            findings = webui_fork_routing_findings(poisoned_root)
+            self.assertTrue(
+                any("DEVELOPMENT.md represents the unpinned WebUI fork as live" in item for item in findings)
+            )
 
     def test_fork_owned_repository_metadata(self) -> None:
         self.assertEqual([], webui_fork_routing_findings(ROOT))
@@ -1421,6 +1686,7 @@ If these files do not exist, proceed silently.
             pin_root = Path(temp)
             guidance_paths = (
                 "CONTRACT_TESTS.md",
+                "DEVELOPMENT.md",
                 "PROJECT_SPEC.md",
                 "README.md",
                 "docs/improvements-contract.md",
@@ -1469,6 +1735,18 @@ If these files do not exist, proceed silently.
         self.assertIn("SideStore artifact", bug_form)
         self.assertIn("WEBUI_FORK_TESTED_SHA", bug_form)
         self.assertNotIn("TestFlight build", bug_form)
+        feature_form = read(ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.yml")
+        for form in (bug_form, feature_form):
+            self.assert_contains_all(
+                normalize_prose(form),
+                (
+                    "GitHub issues and attachments are public",
+                    "I removed credentials, authorization headers, private server URLs, prompts, transcripts, Memory excerpts",
+                    "Security vulnerabilities must use the private process in SECURITY.md",
+                    "required: true",
+                ),
+                "public issue privacy acknowledgment",
+            )
         production_testflight = [
             str(path.relative_to(ROOT))
             for path in (ROOT / "HermesMobile").rglob("*.swift")
@@ -1479,25 +1757,22 @@ If these files do not exist, proceed silently.
             production_testflight,
             f"production UI still names the retired TestFlight path: {production_testflight}",
         )
-        app_config = read(ROOT / "HermesMobile" / "Config" / "AppConfig.swift")
-        self.assertIn(
-            'https://github.com/ebreen/hermex/blob/master/PRIVACY.md',
-            app_config,
-        )
-        self.assertIn(
-            'https://github.com/ebreen/hermex/issues',
-            app_config,
-        )
-        runtime_owner_routes = [
-            str(path.relative_to(ROOT))
-            for path in (ROOT / "HermesMobile").rglob("*.swift")
-            if INHERITED_OWNER_DOMAIN in read(path)
-        ]
-        self.assertEqual(
-            [],
-            runtime_owner_routes,
-            f"runtime still routes users to the inherited owner: {runtime_owner_routes}",
-        )
+        self.assertEqual([], app_config_route_findings(ROOT))
+        with tempfile.TemporaryDirectory(prefix="hermex-route-decoy-") as temp:
+            route_root = Path(temp)
+            route_path = route_root / "HermesMobile" / "Config" / "AppConfig.swift"
+            route_path.parent.mkdir(parents=True)
+            route_path.write_text(
+                "import Foundation\n"
+                "enum AppConfig {\n"
+                '    static let privacyPolicyURL = URL(staticString: "https://github.com/ebreen/hermex/blob/master/PRIVACY.md")\n'
+                '    static let supportURL = URL(staticString: "https://github.com/uzairansaruzi/hermex/issues")\n'
+                '    static let decoy = "https://github.com/ebreen/hermex/issues"\n'
+                "}\n"
+            )
+            route_findings = app_config_route_findings(route_root)
+            self.assertTrue(any("supportURL must declare exactly" in item for item in route_findings))
+            self.assertTrue(any("routes production UI to predecessor owner" in item for item in route_findings))
         privacy = read(ROOT / "PRIVACY.md")
         self.assert_contains_all(
             normalize_prose(privacy),
@@ -1642,6 +1917,9 @@ If these files do not exist, proceed silently.
             (poisoned_root / "copied-identity.bin").write_bytes(
                 b"prefix\x00" + INHERITED_TEAM_ID.encode() + b"\n"
             )
+            tracked_cache = poisoned_root / "payload" / "__pycache__" / "copied.bin"
+            tracked_cache.parent.mkdir(parents=True)
+            tracked_cache.write_bytes(INHERITED_BUNDLE_ID.encode() + b"\n")
             (poisoned_root / "copied-identity-link").symlink_to(INHERITED_BUNDLE_ID)
             (poisoned_root / f"{INHERITED_BUNDLE_ID}.txt").write_text("safe payload")
             self.assertEqual(
@@ -1650,12 +1928,20 @@ If these files do not exist, proceed silently.
                         ("copied-identity.bin", f"prefix\x00{INHERITED_TEAM_ID}"),
                         ("copied-identity-link", INHERITED_BUNDLE_ID),
                         (f"{INHERITED_BUNDLE_ID}.txt", "<path>"),
+                        ("payload/__pycache__/copied.bin", INHERITED_BUNDLE_ID),
                     ]
                 ),
                 inherited_identity_occurrences(poisoned_root),
             )
             (poisoned_root / "copied-scheme.bin").write_bytes(
                 b"prefix\x00" + INHERITED_URL_SCHEME.encode() + b"://session/2"
+            )
+            tracked_runtime_cache = (
+                poisoned_root / "runtime" / "__pycache__" / "scheme.bin"
+            )
+            tracked_runtime_cache.parent.mkdir(parents=True)
+            tracked_runtime_cache.write_bytes(
+                INHERITED_URL_SCHEME.encode() + b"://cached"
             )
             (poisoned_root / "copied-owner-route").symlink_to(
                 f"https://www.{INHERITED_OWNER_DOMAIN}/hermes-mobile"
@@ -1670,6 +1956,10 @@ If these files do not exist, proceed silently.
                         (
                             "copied-scheme.bin",
                             f"prefix\x00{INHERITED_URL_SCHEME}://session/2",
+                        ),
+                        (
+                            "runtime/__pycache__/scheme.bin",
+                            f"{INHERITED_URL_SCHEME}://cached",
                         ),
                     ]
                 ),
@@ -1708,6 +1998,7 @@ If these files do not exist, proceed silently.
                 "Config/Shared.xcconfig": "\n".join(
                     (
                         "DEVELOPMENT_TEAM =",
+                        "APP_IDENTIFIER_SUFFIX =",
                         "APP_BUNDLE_IDENTIFIER = no.gior.hermex$(APP_IDENTIFIER_SUFFIX)",
                         "APP_GROUP_IDENTIFIER = group.no.gior.hermex$(APP_IDENTIFIER_SUFFIX)",
                     )
@@ -1715,11 +2006,20 @@ If these files do not exist, proceed silently.
                 ".xcodebuildmcp/config.yaml": 'bundleId: "no.gior.hermex"',
                 "HermesMobile.xcodeproj/project.pbxproj": "\n".join(
                     (
+                        *('APP_URL_SCHEME_SUFFIX = "";',) * 2,
                         *('HERMES_URL_SCHEME = "hermex$(APP_URL_SCHEME_SUFFIX)";',) * 2,
+                        *('PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER)";',) * 2,
+                        *('PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).tests";',) * 2,
                         *('PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).share";',) * 2,
                         *('PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).liveactivity";',) * 2,
                         *("MARKETING_VERSION = 0.1.0;",) * 8,
                     )
+                ),
+                "HermesMobile/Resources/HermesMobile.entitlements": (
+                    "<string>$(APP_GROUP_IDENTIFIER)</string>"
+                ),
+                "HermesShareExtension/Resources/HermesShareExtension.entitlements": (
+                    "<string>$(APP_GROUP_IDENTIFIER)</string>"
                 ),
                 "HermesMobile/Auth/KeychainStore.swift": '?? "no.gior.hermex"',
                 "HermesMobile/Features/Share/SharedDraftStore.swift": "\n".join(
@@ -1751,7 +2051,43 @@ If these files do not exist, proceed silently.
                     "0.1.0",
                 ),
             )
+            shared_path = complete_root / "Config/Shared.xcconfig"
+            shared_path.write_text(
+                shared_path.read_text().replace(
+                    "APP_IDENTIFIER_SUFFIX =\n",
+                    "APP_IDENTIFIER_SUFFIX = .preview\n",
+                )
+            )
+            suffix_findings = identity_migration_findings(
+                complete_root,
+                expected_inherited_identity,
+                expected_runtime_identity,
+            )
+            self.assertTrue(any("APP_IDENTIFIER_SUFFIX must be empty" in item for item in suffix_findings))
+            shared_path.write_text(
+                shared_path.read_text().replace(
+                    "APP_IDENTIFIER_SUFFIX = .preview\n",
+                    "APP_IDENTIFIER_SUFFIX =\n",
+                )
+            )
             project_path = complete_root / "HermesMobile.xcodeproj/project.pbxproj"
+            project_path.write_text(
+                project_path.read_text().replace(
+                    'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).tests";\n',
+                    "",
+                    1,
+                )
+            )
+            tests_identity_findings = identity_migration_findings(
+                complete_root,
+                expected_inherited_identity,
+                expected_runtime_identity,
+            )
+            self.assertTrue(any(".tests" in item for item in tests_identity_findings))
+            project_path.write_text(
+                'PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_IDENTIFIER).tests";\n'
+                + project_path.read_text()
+            )
             project_path.write_text(
                 project_path.read_text().replace(
                     "MARKETING_VERSION = 0.1.0;",
@@ -1842,6 +2178,36 @@ If these files do not exist, proceed silently.
         self.assertEqual([], missing_links, f"canonical docs missing Improvements contract link: {missing_links}")
 
     def test_trusted_contract_workflow_executes_only_the_base_validator(self) -> None:
+        for relative, directory in (
+            ("tests/test_fork_contract.py", False),
+            (".github/CODEOWNERS", False),
+            (".github/workflows", True),
+            (".github/workflows/contract-ci.yml", False),
+            (".github/workflows/pr-ci.yml", False),
+            (".github/workflows/upstream-watch.yml", False),
+        ):
+            self.assertEqual(
+                [],
+                regular_path_findings(ROOT, relative, directory=directory),
+            )
+        with tempfile.TemporaryDirectory(prefix="hermex-protected-parent-symlink-") as temp:
+            poison_root = Path(temp)
+            trusted_tests = poison_root / "trusted-tests"
+            trusted_tests.mkdir()
+            (trusted_tests / "test_fork_contract.py").write_text("trusted\n")
+            (poison_root / "tests").symlink_to("trusted-tests", target_is_directory=True)
+            self.assertEqual(
+                ["protected path or ancestor is a symlink: tests"],
+                regular_path_findings(poison_root, "tests/test_fork_contract.py"),
+            )
+            github = poison_root / ".github"
+            github.mkdir()
+            (poison_root / "owner").write_text("* @ebreen\n")
+            (github / "CODEOWNERS").symlink_to("../owner")
+            self.assertEqual(
+                ["protected path or ancestor is a symlink: .github/CODEOWNERS"],
+                regular_path_findings(poison_root, ".github/CODEOWNERS"),
+            )
         path = ROOT / ".github" / "workflows" / "contract-ci.yml"
         self.assertTrue(path.is_file(), "trusted contract workflow is missing")
         workflow = read(path)
@@ -1892,23 +2258,28 @@ If these files do not exist, proceed silently.
                 "ref: ${{ github.event.pull_request.base.sha }}",
                 "ref: refs/pull/${{ github.event.pull_request.number }}/merge",
                 "persist-credentials: false",
+                "allow-unsafe-pr-checkout: true",
                 "path: validator",
                 "path: candidate",
                 'HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate"',
+                "PYTHONDONTWRITEBYTECODE=1",
                 'python3 "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" -v',
                 'cmp -s "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py"',
-                '"${GITHUB_WORKSPACE}/candidate/tests/test_fork_contract.py"',
-                '[[ -L "${GITHUB_WORKSPACE}/candidate/tests/test_fork_contract.py" ]]',
+                'ls-tree -d HEAD -- tests',
+                'ls-tree HEAD -- tests/test_fork_contract.py',
+                '[[ "${validator_mode}" == "100644" ]]',
+                'cat-file blob "${validator_oid}"',
                 "expected_count=25",
                 'pin_file="${GITHUB_WORKSPACE}/candidate/WEBUI_FORK_TESTED_SHA"',
                 "https://github.com/ebreen/hermes-webui.git",
                 'git -C "${verify_dir}" fetch --quiet --depth=1 --no-tags',
                 "WEBUI_FORK_TESTED_SHA does not resolve to a public fork commit",
                 '[[ "$(git -C "${verify_dir}" rev-parse FETCH_HEAD)" == "${webui_pin}" ]]',
+                '[[ "$(git -C "${verify_dir}" cat-file -t FETCH_HEAD)" == "commit" ]]',
             ),
             "trusted contract workflow",
         )
-        self.assertEqual(3, workflow.count("candidate/tests/test_fork_contract.py"))
+        self.assertEqual(1, workflow.count("allow-unsafe-pr-checkout: true"))
         self.assertNotIn('python3 "${GITHUB_WORKSPACE}/candidate', workflow)
         self.assertNotIn("cd candidate", workflow)
         self.assertNotIn("github.event.pull_request.head.repo", workflow)
@@ -1924,6 +2295,17 @@ If these files do not exist, proceed silently.
         self.assertNotEqual(
             CONTRACT_CI_EXECUTABLE_SHA256,
             executable_workflow_sha256(credentialed_candidate_checkout),
+        )
+        continuation_breaker = workflow.replace(
+            '            HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \\\n',
+            '            HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \\\n'
+            "            # breaks the shell continuation\n",
+            1,
+        )
+        self.assertNotEqual(workflow, continuation_breaker)
+        self.assertNotEqual(
+            CONTRACT_CI_EXECUTABLE_SHA256,
+            executable_workflow_sha256(continuation_breaker),
         )
 
         procedure = normalize_prose(read(ROOT / "CONTRACT_TESTS.md"))
@@ -2006,7 +2388,7 @@ If these files do not exist, proceed silently.
         canonical_corpus = "\n".join(read(path) for path in MAINTAINED_GUIDANCE)
         self.assertEqual([], semantic_reversal_findings(canonical_corpus))
 
-    def test_workflow_guard_ignores_comment_only_decoys(self) -> None:
+    def test_workflow_guard_rejects_comment_only_changes(self) -> None:
         decoy = """jobs:
   contract:
     # name: Improvements contract
@@ -2028,7 +2410,7 @@ If these files do not exist, proceed silently.
 #  gate:
 #    name: CI Gate
 """
-        self.assertEqual([], required_workflow_gate_findings(commented_decoys))
+        self.assertTrue(required_workflow_gate_findings(commented_decoys))
 
     def test_workflow_guard_rejects_inert_required_paths(self) -> None:
         workflow = read(ROOT / ".github" / "workflows" / "pr-ci.yml")
