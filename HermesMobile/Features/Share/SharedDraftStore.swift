@@ -40,7 +40,7 @@ struct SharedImport: Equatable {
 
 enum HermesShareDraft {
     /// Effective app-group identifier for the current install: the
-    /// SideStore-remapped value when present, the canonical build-time
+    /// SideStore-remapped value when present, the configured build-time
     /// identifier otherwise. A malformed or ambiguous SideStore remapping
     /// throws rather than silently writing to an arbitrary container.
     static var appGroupIdentifier: String {

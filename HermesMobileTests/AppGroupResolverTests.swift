@@ -3,27 +3,60 @@ import XCTest
 
 final class AppGroupResolverTests: XCTestCase {
     private let canonical = HermesAppGroupResolver.canonicalIdentifier
+    private let configuredOverride = "group.example.hermex"
+    private let teamIdentifier = "TEAM123"
 
-    func testAbsentALTAppGroupsFallsBackToCanonical() throws {
-        let info: [String: Any] = ["HermesAppGroupIdentifier": canonical]
+    func testAbsentALTAppGroupsUsesConfiguredHermesAppGroupIdentifier() throws {
+        let info: [String: Any] = [
+            "HermesAppGroupIdentifier": configuredOverride,
+        ]
         let resolved = try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
-        XCTAssertEqual(resolved, canonical)
+        XCTAssertEqual(resolved, configuredOverride)
     }
 
-    func testEmptyInfoDictionaryFallsBackToCanonical() throws {
+    func testAbsentALTAppGroupsFallsBackToCanonicalWhenConfigurationIsMissing() throws {
         let resolved = try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: [:])
         XCTAssertEqual(resolved, canonical)
     }
 
-    func testProductionSeamUsesCanonicalFallbackWhenALTAppGroupsIsAbsent() throws {
+    func testInvalidConfiguredHermesAppGroupIdentifierFallsBackToCanonical() throws {
+        let invalidValues: [Any] = [
+            "",
+            "group.example..hermex",
+            "com.example.hermex",
+            "group.example hermex",
+            42,
+        ]
+
+        for invalidValue in invalidValues {
+            let info: [String: Any] = [
+                "HermesAppGroupIdentifier": invalidValue,
+            ]
+            let resolved = try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
+            XCTAssertEqual(resolved, canonical, "unexpected base for \(invalidValue)")
+        }
+    }
+
+    func testConfiguredOverrideIsUsedForSideStoreRemap() throws {
+        let remapped = "\(configuredOverride).\(teamIdentifier)"
+        let info: [String: Any] = [
+            "HermesAppGroupIdentifier": configuredOverride,
+            "ALTAppGroups": [remapped],
+        ]
+        let resolved = try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
+        XCTAssertEqual(resolved, remapped)
+    }
+
+    func testProductionSeamUsesConfiguredBaseWhenALTAppGroupsIsAbsent() throws {
         let resolved = try HermesShareDraft.resolvedAppGroupIdentifier(
-            infoDictionary: ["HermesAppGroupIdentifier": canonical]
+            infoDictionary: ["HermesAppGroupIdentifier": configuredOverride]
         )
-        XCTAssertEqual(resolved, canonical)
+        XCTAssertEqual(resolved, configuredOverride)
     }
 
     func testProductionSeamFailsClosedForInvalidPresentALTAppGroups() {
         let info: [String: Any] = [
+            "HermesAppGroupIdentifier": configuredOverride,
             "ALTAppGroups": ["group.altstore.unrelated"],
         ]
         XCTAssertThrowsError(
@@ -35,8 +68,8 @@ final class AppGroupResolverTests: XCTestCase {
         }
     }
 
-    func testSideStoreRemappedGroupIsSelectedBySuffix() throws {
-        let remapped = "group.altstore.3F2A91C0-D5E6-4B7A-9C1E-2F8A0B6D4E5F.\(canonical)"
+    func testSideStoreRemapUsesCanonicalBaseThenOneTeamComponent() throws {
+        let remapped = "\(canonical).\(teamIdentifier)"
         let info: [String: Any] = [
             "ALTAppGroups": [remapped],
         ]
@@ -44,9 +77,9 @@ final class AppGroupResolverTests: XCTestCase {
         XCTAssertEqual(resolved, remapped)
     }
 
-    func testSideStoreListWithUnrelatedGroupsOnlyFails() {
+    func testExactBaseIsRejectedWhenALTAppGroupsIsPresent() {
         let info: [String: Any] = [
-            "ALTAppGroups": ["group.altstore.ABC123.other.group", "group.altstore.DEF456.another"],
+            "ALTAppGroups": [canonical],
         ]
         XCTAssertThrowsError(
             try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
@@ -57,11 +90,43 @@ final class AppGroupResolverTests: XCTestCase {
         }
     }
 
+    func testSyntheticAltStorePrefixEndingInCanonicalBaseIsRejected() {
+        let synthetic = "group.altstore.3F2A91C0-D5E6-4B7A-9C1E-2F8A0B6D4E5F.\(canonical)"
+        assertUnrelated([synthetic])
+    }
+
+    func testCanonicalPrefixCollisionIsRejected() {
+        assertUnrelated(["\(canonical)evil.\(teamIdentifier)"])
+    }
+
+    func testEmptyTeamComponentIsRejected() {
+        assertUnrelated(["\(canonical)."])
+    }
+
+    func testMultiComponentTeamSuffixIsRejected() {
+        assertUnrelated(["\(canonical).\(teamIdentifier).extra"])
+    }
+
+    func testInvalidTeamComponentIsRejected() {
+        assertUnrelated([
+            "\(canonical).TEAM_ID",
+            "\(canonical).TEAM/ID",
+            "\(canonical).TEAM ID",
+        ])
+    }
+
+    func testUnrelatedGroupsOnlyFail() {
+        assertUnrelated([
+            "group.altstore.ABC123.other.group",
+            "group.altstore.DEF456.another",
+        ])
+    }
+
     func testAmbiguousMatchingGroupsFail() {
         let info: [String: Any] = [
             "ALTAppGroups": [
-                "group.altstore.AAAA.\(canonical)",
-                "group.altstore.BBBB.\(canonical)",
+                "\(canonical).AAAA",
+                "\(canonical).BBBB",
             ],
         ]
         XCTAssertThrowsError(
@@ -94,9 +159,8 @@ final class AppGroupResolverTests: XCTestCase {
     }
 
     func testEmptyALTAppGroupsFailVisibly() {
-        let info: [String: Any] = ["ALTAppGroups": [String]()]
         XCTAssertThrowsError(
-            try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
+            try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: ["ALTAppGroups": [String]()])
         ) { error in
             guard case HermesAppGroupResolver.Error.unrelatedSideStoreGroups = error else {
                 return XCTFail("expected unrelatedSideStoreGroups, got \(error)")
@@ -106,5 +170,17 @@ final class AppGroupResolverTests: XCTestCase {
 
     func testCanonicalIdentifierIsUnchanged() {
         XCTAssertEqual(canonical, "group.no.gior.hermex")
+    }
+
+    private func assertUnrelated(_ groups: [String], file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(
+            try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: ["ALTAppGroups": groups]),
+            file: file,
+            line: line
+        ) { error in
+            guard case HermesAppGroupResolver.Error.unrelatedSideStoreGroups = error else {
+                return XCTFail("expected unrelatedSideStoreGroups, got \(error)", file: file, line: line)
+            }
+        }
     }
 }
