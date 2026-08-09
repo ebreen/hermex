@@ -1733,6 +1733,73 @@ If these files do not exist, proceed silently.
                 any("DEVELOPMENT.md represents the unpinned WebUI fork as live" in item for item in findings)
             )
 
+    def test_invalid_app_group_import_is_visible_to_the_user(self) -> None:
+        content_view = read(ROOT / "HermesMobile" / "ContentView.swift")
+        self.assertNotRegex(
+            content_view,
+            r"guard\s+let\s+directory\s*=\s*HermesShareDraft\.containerURL\(\)\s*else\s*\{\s*return\s*\}",
+            "invalid app-group metadata is still silently ignored",
+        )
+
+        switch_match = re.search(
+            r"switch\s+HermesShareDraft\.pendingImportAttempt\s*\([^)]*\)\s*\{",
+            content_view,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(
+            switch_match,
+            "ContentView must switch on the pending import attempt",
+        )
+        assert switch_match is not None
+        switch_text = content_view[switch_match.start() :]
+        unavailable_match = re.search(
+            r"(?ms)^\s*case\s+\.unavailable\b(?P<body>.*?)(?=^\s*case\b|^\s*}\s*$)",
+            switch_text,
+        )
+        self.assertIsNotNone(
+            unavailable_match,
+            "pending import switch must handle .unavailable",
+        )
+        assert unavailable_match is not None
+        unavailable_body = unavailable_match.group("body")
+        self.assertRegex(
+            unavailable_body,
+            r"pendingSharedImport\s*=\s*nil",
+            "the unavailable branch must clear any pending shared import",
+        )
+
+        state_names = re.findall(
+            r"(?m)^\s*@State(?:\([^)]*\))?\s+(?:private\s+)?var\s+([A-Za-z_]\w*)\b",
+            content_view,
+        )
+        presentation_states = [
+            name
+            for name in state_names
+            if name != "pendingSharedImport"
+            and re.search(rf"\b{re.escape(name)}\s*=", unavailable_body)
+        ]
+        self.assertTrue(
+            presentation_states,
+            "the unavailable branch must set a dedicated presentation state",
+        )
+
+        alert_heads = [
+            match.group(1).split(") {", 1)[0]
+            for match in re.finditer(
+                r"\.alert\s*\((.{0,1200})",
+                content_view,
+                flags=re.DOTALL,
+            )
+        ]
+        self.assertTrue(
+            any(
+                re.search(r"\b(?:isPresented|item)\s*:", head)
+                and any(state in head for state in presentation_states)
+                for head in alert_heads
+            ),
+            "the unavailable presentation state must be bound to a SwiftUI alert",
+        )
+
     def test_fork_owned_repository_metadata(self) -> None:
         self.assertEqual([], webui_fork_routing_findings(ROOT))
         with tempfile.TemporaryDirectory(prefix="hermex-webui-pin-") as temp:

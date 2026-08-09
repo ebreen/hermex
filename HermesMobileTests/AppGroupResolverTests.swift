@@ -68,6 +68,21 @@ final class AppGroupResolverTests: XCTestCase {
         }
     }
 
+    func testAppImportAttemptSurfacesInvalidPresentMetadataAsUnavailable() {
+        let info: [String: Any] = [
+            "HermesAppGroupIdentifier": canonical,
+            "ALTAppGroups": [
+                "\(canonical).\(teamIdentifier)",
+                "",
+            ],
+        ]
+
+        let attempt = HermesShareDraft.pendingImportAttempt(infoDictionary: info)
+        guard case .unavailable = attempt else {
+            return XCTFail("expected invalid present app-group metadata to be unavailable")
+        }
+    }
+
     func testSideStoreRemapUsesCanonicalBaseThenOneTeamComponent() throws {
         let remapped = "\(canonical).\(teamIdentifier)"
         let info: [String: Any] = [
