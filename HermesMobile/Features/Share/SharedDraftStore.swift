@@ -45,12 +45,11 @@ enum HermesShareDraft {
     /// fails loudly (debug assertion) rather than silently writing to an
     /// arbitrary container.
     static var appGroupIdentifier: String {
-        do {
-            return try HermesAppGroupResolver.effectiveAppGroupIdentifier()
-        } catch {
-            assertionFailure("Unresolvable app group: \(error)")
-            return "group.no.gior.hermex"
+        let resolved = try? HermesAppGroupResolver.effectiveAppGroupIdentifier()
+        if resolved == nil {
+            assertionFailure("Unresolvable app group; using canonical fallback")
         }
+        return resolved ?? "group.no.gior.hermex"
     }
 
     static let pendingDraftFileName = "pending-share-draft.json"
