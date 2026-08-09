@@ -73,6 +73,12 @@ enum HermesAppGroupResolver {
             throw Error.unrelatedSideStoreGroups
         }
 
+        guard groups.allSatisfy({
+            isValidRemappedIdentifier($0, baseIdentifier: baseIdentifier)
+        }) else {
+            throw Error.unrelatedSideStoreGroups
+        }
+
         return matching[0]
     }
 
