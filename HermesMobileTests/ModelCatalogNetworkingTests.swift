@@ -351,7 +351,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         )
 
         let escapedGroupName = NSRegularExpression.escapedPattern(for: groupName)
-        let groupPattern = #"(?ms)^\t\t[0-9A-F]{24} /\* \#(escapedGroupName) \*/ = \{.*?^\t\t\};"#
+        let groupPattern = #"(?ms)^\t\t[0-9A-F]{24} /\* \#(escapedGroupName) \*/ = \{\n\t\t\tisa = PBXGroup;.*?^\t\t\};"#
         let groupBlocks = captureAllBlocks(pattern: groupPattern, in: pbx)
         XCTAssertEqual(groupBlocks.count, 1, "Expected exactly one \(groupName) PBXGroup")
         if let group = groupBlocks.first {
