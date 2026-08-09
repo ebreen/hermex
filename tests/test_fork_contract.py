@@ -1733,7 +1733,6 @@ If these files do not exist, proceed silently.
                 any("DEVELOPMENT.md represents the unpinned WebUI fork as live" in item for item in findings)
             )
 
-    def test_invalid_app_group_import_is_visible_to_the_user(self) -> None:
         content_view = read(ROOT / "HermesMobile" / "ContentView.swift")
         self.assertNotRegex(
             content_view,
