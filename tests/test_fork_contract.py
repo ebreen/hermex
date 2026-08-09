@@ -1397,9 +1397,16 @@ class ForkContractTests(unittest.TestCase):
 
     def test_canonical_docs_reject_superseded_contracts(self) -> None:
         findings: list[str] = []
+        scanned = 0
         for path in MAINTAINED_GUIDANCE:
+            scanned += 1
             for line_number, pattern, line in superseded_guidance_findings(read(path)):
                 findings.append(f"{path.name}:{line_number}: /{pattern}/ -> {line}")
+        self.assertEqual(
+            len(MAINTAINED_GUIDANCE),
+            scanned,
+            "superseded-guidance scan did not visit the maintained inventory",
+        )
         self.assertEqual([], findings, "superseded canonical statements remain:\n" + "\n".join(findings))
 
     def test_all_maintained_guidance_rejects_semantic_reversals(self) -> None:
