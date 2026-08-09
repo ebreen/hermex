@@ -23,7 +23,7 @@
 		1A2B3C4D5E6F700000000343 /* ProfileEntity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000342 /* ProfileEntity.swift */; };
 		1A2B3C4D5E6F700000000341 /* AppIntentNewChatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000340 /* AppIntentNewChatTests.swift */; };
 		1A2B3C4D5E6F700000000345 /* AppIntentNewChatInProfileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000344 /* AppIntentNewChatInProfileTests.swift */; };
-		1A2B3C4D5E6F700000000347 /* AppGroupResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000346 /* AppGroupResolverTests.swift */; };
+		1A2B3C4D5E6F700000000351 /* AppGroupResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000350 /* AppGroupResolverTests.swift */; };
 		1A2B3C4D5E6F700000000003 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F700000000014 /* Assets.xcassets */; };
 		10CA110C0DE000000000B001 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 10CA110C0DE000000000B002 /* Localizable.xcstrings */; };
 		10CA110C0DE000000000B003 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 10CA110C0DE000000000B002 /* Localizable.xcstrings */; };
@@ -248,8 +248,8 @@
 		9E2A653D968A4ACDA19A8142 /* ThirdPartyNotices in Resources */ = {isa = PBXBuildFile; fileRef = 488791F556304AD2AC59BC5D /* ThirdPartyNotices */; };
 		B5A100000000000000000001 /* SharedDraftStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000010 /* SharedDraftStore.swift */; };
 		B5A100000000000000000002 /* SharedDraftStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000010 /* SharedDraftStore.swift */; };
-		B5A100000000000000000021 /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000020 /* AppGroupResolver.swift */; };
-		B5A100000000000000000022 /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000020 /* AppGroupResolver.swift */; };
+		B5A100000000000000000041 /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000040 /* AppGroupResolver.swift */; };
+		B5A100000000000000000042 /* AppGroupResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000040 /* AppGroupResolver.swift */; };
 		B5A100000000000000000003 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000011 /* ShareViewController.swift */; };
 		B5A100000000000000000007 /* ShareInputReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000018 /* ShareInputReader.swift */; };
 		B5A100000000000000000008 /* ShareInputReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A100000000000000000018 /* ShareInputReader.swift */; };
@@ -370,7 +370,7 @@
 		1A2B3C4D5E6F700000000342 /* ProfileEntity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileEntity.swift; sourceTree = "<group>"; };
 		1A2B3C4D5E6F700000000340 /* AppIntentNewChatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIntentNewChatTests.swift; sourceTree = "<group>"; };
 		1A2B3C4D5E6F700000000344 /* AppIntentNewChatInProfileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIntentNewChatInProfileTests.swift; sourceTree = "<group>"; };
-		1A2B3C4D5E6F700000000346 /* AppGroupResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolverTests.swift; sourceTree = "<group>"; };
+		1A2B3C4D5E6F700000000350 /* AppGroupResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolverTests.swift; sourceTree = "<group>"; };
 		1A2B3C4D5E6F700000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A2B3C4D5E6F700000000014 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		10CA110C0DE000000000B002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
@@ -608,7 +608,7 @@
 		A710739233F64F4FA4C2B710 /* ComposerVoiceInputController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerVoiceInputController.swift; sourceTree = "<group>"; };
 		A710739233F64F4FA4C2B711 /* ComposerVoiceDraftComposerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerVoiceDraftComposerTests.swift; sourceTree = "<group>"; };
 		B5A100000000000000000010 /* SharedDraftStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedDraftStore.swift; sourceTree = "<group>"; };
-		B5A100000000000000000020 /* AppGroupResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolver.swift; sourceTree = "<group>"; };
+		B5A100000000000000000040 /* AppGroupResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupResolver.swift; sourceTree = "<group>"; };
 		B5A100000000000000000011 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		B5A100000000000000000018 /* ShareInputReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareInputReader.swift; sourceTree = "<group>"; };
 		B5A100000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -853,7 +853,7 @@
 				A04500000000000000000018 /* LiveActivityTests.swift */,
 				1A2B3C4D5E6F700000000340 /* AppIntentNewChatTests.swift */,
 				1A2B3C4D5E6F700000000344 /* AppIntentNewChatInProfileTests.swift */,
-				1A2B3C4D5E6F700000000346 /* AppGroupResolverTests.swift */,
+				1A2B3C4D5E6F700000000350 /* AppGroupResolverTests.swift */,
 			);
 			path = HermesMobileTests;
 			sourceTree = "<group>";
@@ -1136,7 +1136,7 @@
 			isa = PBXGroup;
 			children = (
 				B5A100000000000000000010 /* SharedDraftStore.swift */,
-				B5A100000000000000000020 /* AppGroupResolver.swift */,
+				B5A100000000000000000040 /* AppGroupResolver.swift */,
 			);
 			path = Share;
 			sourceTree = "<group>";
@@ -1620,7 +1620,7 @@
 				26AB000000000000000000B1 /* ProvidersViewModel.swift in Sources */,
 				26AB000000000000000000B2 /* ProvidersView.swift in Sources */,
 				B5A100000000000000000001 /* SharedDraftStore.swift in Sources */,
-				B5A100000000000000000021 /* AppGroupResolver.swift in Sources */,
+				B5A100000000000000000041 /* AppGroupResolver.swift in Sources */,
 				B5A100000000000000000008 /* ShareInputReader.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1721,7 +1721,7 @@
 				A04500000000000000000008 /* LiveActivityTests.swift in Sources */,
 				1A2B3C4D5E6F700000000341 /* AppIntentNewChatTests.swift in Sources */,
 				1A2B3C4D5E6F700000000345 /* AppIntentNewChatInProfileTests.swift in Sources */,
-				1A2B3C4D5E6F700000000347 /* AppGroupResolverTests.swift in Sources */,
+				1A2B3C4D5E6F700000000351 /* AppGroupResolverTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1730,7 +1730,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B5A100000000000000000002 /* SharedDraftStore.swift in Sources */,
-				B5A100000000000000000022 /* AppGroupResolver.swift in Sources */,
+				B5A100000000000000000042 /* AppGroupResolver.swift in Sources */,
 				B5A100000000000000000003 /* ShareViewController.swift in Sources */,
 				B5A100000000000000000007 /* ShareInputReader.swift in Sources */,
 			);
