@@ -42,13 +42,14 @@ enum HermesShareDraft {
     /// Effective app-group identifier for the current install: the
     /// SideStore-remapped value when present, the canonical build-time
     /// identifier otherwise. A malformed or ambiguous SideStore remapping
-    /// fails loudly rather than silently writing to the wrong container.
+    /// fails loudly (debug assertion) rather than silently writing to an
+    /// arbitrary container.
     static var appGroupIdentifier: String {
         do {
             return try HermesAppGroupResolver.effectiveAppGroupIdentifier()
         } catch {
             assertionFailure("Unresolvable app group: \(error)")
-            return HermesAppGroupResolver.canonicalIdentifier
+            return "group.no.gior.hermex"
         }
     }
 
