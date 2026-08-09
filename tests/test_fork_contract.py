@@ -1404,9 +1404,16 @@ class ForkContractTests(unittest.TestCase):
 
     def test_all_maintained_guidance_rejects_semantic_reversals(self) -> None:
         findings: list[str] = []
+        scanned = 0
         for path in MAINTAINED_GUIDANCE:
+            scanned += 1
             for pattern in semantic_reversal_findings(read(path)):
                 findings.append(f"{path.relative_to(ROOT)}: /{pattern}/")
+        self.assertEqual(
+            len(MAINTAINED_GUIDANCE),
+            scanned,
+            "semantic-reversal scan did not visit the maintained inventory",
+        )
         self.assertEqual([], findings, "semantic reversals remain:\n" + "\n".join(findings))
 
     def test_maintained_guidance_inventory_and_enforcement_contact_are_fork_owned(self) -> None:
@@ -1524,11 +1531,17 @@ If these files do not exist, proceed silently.
         )
         stale = [path.name for path in guidance if "github.com/uzairansaruzi/hermex" in read(path)]
         self.assertEqual([], stale, f"fork guidance still routes to upstream owner: {stale}")
-        routing_findings = [
-            (str(path.relative_to(ROOT)), line_number, line)
-            for path in MAINTAINED_GUIDANCE
-            for line_number, line in fork_routing_findings(path, read(path))
-        ]
+        routing_findings: list[tuple[str, int, str]] = []
+        scanned = 0
+        for path in MAINTAINED_GUIDANCE:
+            scanned += 1
+            for line_number, line in fork_routing_findings(path, read(path)):
+                routing_findings.append((str(path.relative_to(ROOT)), line_number, line))
+        self.assertEqual(
+            len(MAINTAINED_GUIDANCE),
+            scanned,
+            "fork-routing scan did not visit the maintained inventory",
+        )
         self.assertEqual([], routing_findings, f"maintained guidance routes to predecessor: {routing_findings}")
         poisoned_path = ROOT / ".github" / "ISSUE_TEMPLATE" / "upstream-help.yml"
         poisoned = "Open https://github.com/uzairansaruzi/hermex/issues for support."
