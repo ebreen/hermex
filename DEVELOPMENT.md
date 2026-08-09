@@ -1,9 +1,13 @@
 # Development
 
-At the issue #14 bootstrap baseline, `ebreen/hermes-webui` had not been created. Current server
+At the issue #14 bootstrap baseline, `ebreen/hermes-webui` had not been created. Issue #45 has since
+created and verified the fork (`https://github.com/ebreen/hermes-webui`), and the full tested commit
+in `WEBUI_FORK_TESTED_SHA` is the canonical primary server target. Current server
 testing validates inherited compatibility against the upstream commit in `UPSTREAM_TESTED_SHA`.
 After issue #45 creates the public fork and `WEBUI_FORK_TESTED_SHA` passes the trusted fixed-host
-commit check, that exact fork commit becomes the canonical primary target over real HTTPS. See
+commit check, that exact fork commit becomes the canonical primary target over real HTTPS.
+The trusted fixed-host commit check passes only when `FETCH_HEAD` equals the pinned fork commit.
+See
 [`PROJECT_SPEC.md`](PROJECT_SPEC.md) for the full product and API plan.
 
 > The inherited TestFlight/App Store Connect path is retired. Distribution uses the

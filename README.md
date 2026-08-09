@@ -59,10 +59,10 @@ The screenshots show inherited mobile capabilities. The Inbox-first Improvements
 ## Getting started
 
 Hermex will require the self-hosted Hermex WebUI fork, inherited from the MIT-licensed [upstream
-WebUI](https://github.com/nesquena/hermes-webui). At the issue #14 bootstrap baseline, the intended
-`ebreen/hermes-webui` repository had not been created; [issue
-#45](https://github.com/ebreen/hermex/issues/45) establishes and verifies its clean baseline before
-server feature work. These setup steps apply only after that baseline exists:
+WebUI](https://github.com/nesquena/hermes-webui). The fork
+[`ebreen/hermes-webui`](https://github.com/ebreen/hermes-webui) was created and its clean baseline
+verified by [issue #45](https://github.com/ebreen/hermex/issues/45); the exact tested commit is
+recorded in `WEBUI_FORK_TESTED_SHA`. These setup steps apply against that baseline:
 
 1. **Run the fork.** Install and start the version pinned by `WEBUI_FORK_TESTED_SHA` on macOS, Linux, or Windows/WSL2. Set `HERMES_WEBUI_PASSWORD`.
 2. **Make it reachable from your phone** (see options below).

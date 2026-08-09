@@ -5,9 +5,10 @@ peeled commit `f1d399b437c1ca7fe4b6d2093aebe334c32f34a3`.
 
 `UPSTREAM_TESTED_SHA` is the machine-readable inherited-compatibility pin. At the issue #14
 bootstrap baseline, the intended fork repository name was `ebreen/hermes-webui`, and it had not
-been created. Issue [#45](https://github.com/ebreen/hermex/issues/45) creates and verifies it, then
-records its tested commit in `WEBUI_FORK_TESTED_SHA`. Until then, server implementation remains
-blocked. A contract runner tests the fork first and consults upstream only for unchanged inherited
+been created. Issue [#45](https://github.com/ebreen/hermex/issues/45) created and verified it, then
+recorded its tested commit in `WEBUI_FORK_TESTED_SHA`
+(`https://github.com/ebreen/hermes-webui`). Server implementation proceeds from the pinned commit.
+A contract runner tests the fork first and consults upstream only for unchanged inherited
 behavior.
 
 When `WEBUI_FORK_TESTED_SHA` becomes non-empty, the trusted workflow performs an unauthenticated
