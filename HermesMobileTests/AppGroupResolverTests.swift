@@ -128,10 +128,19 @@ final class AppGroupResolverTests: XCTestCase {
     }
 
     func testMixedALTAppGroupsWithMalformedRelatedEntryFailsClosed() {
-        assertUnrelated([
-            "\(canonical).\(teamIdentifier)",
-            "\(canonical).",
-        ])
+        let info: [String: Any] = [
+            "ALTAppGroups": [
+                "\(canonical).\(teamIdentifier)",
+                "\(canonical).",
+            ],
+        ]
+        XCTAssertThrowsError(
+            try HermesAppGroupResolver.effectiveAppGroupIdentifier(infoDictionary: info)
+        ) { error in
+            guard case HermesAppGroupResolver.Error.malformedSideStoreGroups = error else {
+                return XCTFail("expected malformedSideStoreGroups, got \(error)")
+            }
+        }
     }
 
     func testEmptyTeamComponentIsRejected() {
