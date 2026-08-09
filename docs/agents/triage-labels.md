@@ -49,3 +49,5 @@ If the GitHub repository does not yet have these labels, create them before appl
 Canary verification commit for issue #30 branch protection.
 
 Canary after trust-root update.
+
+Canary after IPA tracer lock fix.
