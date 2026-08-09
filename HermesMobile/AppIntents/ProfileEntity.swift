@@ -150,8 +150,19 @@ struct ProfileEntityCache {
     // `updateAppShortcutParameters()` once even though the profile list itself is unchanged.
     private let storageKey = "cachedProfileEntities.v2"
 
-    init(defaults: UserDefaults? = UserDefaults(suiteName: HermesShareDraft.appGroupIdentifier)) {
+    init(defaults: UserDefaults?) {
         self.defaults = defaults
+    }
+
+    init() {
+        self.init(defaults: Self.makeDefaults())
+    }
+
+    private static func makeDefaults() -> UserDefaults? {
+        guard let appGroupIdentifier = try? HermesShareDraft.appGroupIdentifier else {
+            return nil
+        }
+        return UserDefaults(suiteName: appGroupIdentifier)
     }
 
     /// Mirrors the profiles into the cache: writes a compact snapshot when non-empty, clears

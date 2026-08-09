@@ -15,6 +15,26 @@ final class AppGroupResolverTests: XCTestCase {
         XCTAssertEqual(resolved, canonical)
     }
 
+    func testProductionSeamUsesCanonicalFallbackWhenALTAppGroupsIsAbsent() throws {
+        let resolved = try HermesShareDraft.resolvedAppGroupIdentifier(
+            infoDictionary: ["HermesAppGroupIdentifier": canonical]
+        )
+        XCTAssertEqual(resolved, canonical)
+    }
+
+    func testProductionSeamFailsClosedForInvalidPresentALTAppGroups() {
+        let info: [String: Any] = [
+            "ALTAppGroups": ["group.altstore.unrelated"],
+        ]
+        XCTAssertThrowsError(
+            try HermesShareDraft.resolvedAppGroupIdentifier(infoDictionary: info)
+        ) { error in
+            guard case HermesAppGroupResolver.Error.unrelatedSideStoreGroups = error else {
+                return XCTFail("expected unrelatedSideStoreGroups, got \(error)")
+            }
+        }
+    }
+
     func testSideStoreRemappedGroupIsSelectedBySuffix() throws {
         let remapped = "group.altstore.3F2A91C0-D5E6-4B7A-9C1E-2F8A0B6D4E5F.\(canonical)"
         let info: [String: Any] = [

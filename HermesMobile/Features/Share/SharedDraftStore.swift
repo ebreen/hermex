@@ -42,13 +42,20 @@ enum HermesShareDraft {
     /// Effective app-group identifier for the current install: the
     /// SideStore-remapped value when present, the canonical build-time
     /// identifier otherwise. A malformed or ambiguous SideStore remapping
-    /// fails loudly (debug assertion) rather than silently writing to an
-    /// arbitrary container.
+    /// throws rather than silently writing to an arbitrary container.
     static var appGroupIdentifier: String {
-        let resolved = try? HermesAppGroupResolver.effectiveAppGroupIdentifier()
-        if resolved == nil {
-            assertionFailure("Unresolvable app group; using canonical fallback")
+        get throws {
+            try resolvedAppGroupIdentifier()
         }
+    }
+
+    /// Production resolution seam with an injectable Info.plist for tests.
+    static func resolvedAppGroupIdentifier(
+        infoDictionary: [String: Any]? = Bundle.main.infoDictionary
+    ) throws -> String {
+        let resolved: String? = try HermesAppGroupResolver.effectiveAppGroupIdentifier(
+            infoDictionary: infoDictionary
+        )
         return resolved
             ?? "group.no.gior.hermex"
     }
@@ -83,7 +90,10 @@ enum HermesShareDraft {
     }
 
     static func containerURL(fileManager: FileManager = .default) -> URL? {
-        fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
+        guard let appGroupIdentifier = try? HermesShareDraft.appGroupIdentifier else {
+            return nil
+        }
+        return fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
     }
 
     static func draftText(textSnippets: [String], urls: [URL]) -> String {
