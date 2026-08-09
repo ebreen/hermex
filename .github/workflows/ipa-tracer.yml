@@ -1,0 +1,141 @@
+# Apple-credential-free SideStore IPA tracer (issue #29).
+#
+# Builds the app and both extensions with Apple signing disabled, applies
+# deterministic inside-out local ad-hoc signatures so concrete entitlement
+# intent survives SideStore inspection, packages a SideStore-consumable IPA,
+# and emits a provenance manifest, checksum, and test summary. The repository
+# holds no Apple identity, certificate, profile, team, account, or credential.
+
+name: SideStore IPA Tracer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-tracer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    name: Build SideStore IPA
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Run the fork contract suite
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -p 'test_fork_contract.py' -v
+
+      - name: Resolve and lock Swift packages
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project HermesMobile.xcodeproj -scheme HermesMobile \
+            -clonedSourcePackagesDirPath .swiftpm-cache
+          RESOLVED="HermesMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          [[ -f "${RESOLVED}" ]]
+          if [[ -n "$(git status --porcelain -- "${RESOLVED}")" ]]; then
+            echo "Package.resolved is missing or drifts from the resolved graph; commit the generated lock." >&2
+            exit 1
+          fi
+
+      - name: Upload resolved lock on first-run drift
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: package-resolved-bootstrap
+          path: HermesMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          retention-days: 14
+
+      - name: Archive with Apple signing disabled
+        run: |
+          set -euo pipefail
+          xcodebuild -project HermesMobile.xcodeproj -scheme HermesMobile \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO \
+            -archivePath build/Hermex.xcarchive archive
+
+      - name: Ad-hoc sign nested code inside-out
+        run: |
+          set -euo pipefail
+          APP="build/Hermex.xcarchive/Products/Applications/HermesMobile.app"
+          [[ -d "${APP}" ]]
+          EXT="${APP}/PlugIns"
+          if [[ -d "${EXT}" ]]; then
+            for entry in "${EXT}"/*.appex; do
+              codesign --force --sign - --entitlements \
+                "HermesShareExtension/Resources/HermesShareExtension.entitlements" "${entry}"
+            done
+          fi
+          codesign --force --sign - --entitlements \
+            "HermesMobile/Resources/HermesMobile.entitlements" "${APP}"
+
+      - name: Fail closed on provisioning profiles and identity drift
+        run: |
+          set -euo pipefail
+          APP="build/Hermex.xcarchive/Products/Applications/HermesMobile.app"
+          if find "${APP}" -name 'embedded.mobileprovision' | grep -q .; then
+            echo "embedded provisioning profile found" >&2
+            exit 1
+          fi
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "${APP}/Info.plist")"
+          if [[ "${BUNDLE_ID}" != "no.gior.hermex" ]]; then
+            echo "unexpected bundle identifier: ${BUNDLE_ID}" >&2
+            exit 1
+          fi
+
+      - name: Package SideStore IPA
+        run: |
+          set -euo pipefail
+          APP="build/Hermex.xcarchive/Products/Applications/HermesMobile.app"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "${APP}/Info.plist")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "${APP}/Info.plist")"
+          SHORT_SOURCE="$(git rev-parse --short=8 HEAD)"
+          PAYLOAD="build/Payload"
+          mkdir -p "${PAYLOAD}"
+          cp -R "${APP}" "${PAYLOAD}/"
+          IPA="Hermex-${VERSION}-${BUILD}-${SHORT_SOURCE}.ipa"
+          (cd build && zip -qry "../${IPA}" Payload)
+          echo "built ${IPA}"
+          echo "ipa=${IPA}" >> "$GITHUB_OUTPUT"
+
+      - name: Emit provenance manifest and checksum
+        run: |
+          set -euo pipefail
+          IPA=$(ls Hermex-*.ipa | head -1)
+          SHORT_SOURCE="$(git rev-parse --short=8 HEAD)"
+          FULL_SOURCE="$(git rev-parse HEAD)"
+          MANIFEST="${IPA%.ipa}-manifest.txt"
+          XCODE="$(xcodebuild -version | head -1)"
+          TOOLCHAIN="$(xcodebuild -version | tail -1)"
+          {
+            echo "artifact=${IPA}"
+            echo "source_commit=${FULL_SOURCE}"
+            echo "source_short=${SHORT_SOURCE}"
+            echo "xcode=${XCODE}"
+            echo "toolchain=${TOOLCHAIN}"
+            echo "os=$(sw_vers -productVersion)"
+          } > "${MANIFEST}"
+          shasum -a 256 Hermex-*.ipa > Hermex-SHA256SUMS.txt
+          cat Hermex-SHA256SUMS.txt
+
+      - name: Upload IPA and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: side-store-ipa
+          path: |
+            Hermex-*.ipa
+            Hermex-*-manifest.txt
+            Hermex-SHA256SUMS.txt
+          retention-days: 14
