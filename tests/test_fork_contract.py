@@ -30,7 +30,7 @@ AGENT_GUIDANCE = tuple(sorted((ROOT / "docs" / "agents").glob("*.md")))
 PR_CI_EXECUTABLE_SHA256 = "05609045c481858d7ca1fe483db52f11d72ec88fc061f3165ea94c48c307e2ec"
 CONTRACT_CI_EXECUTABLE_SHA256 = "962889f05c30f363ef5d75eb28f3e9dc64375da95dd8687b4d13b465442e1d23"
 UPSTREAM_WATCH_EXECUTABLE_SHA256 = "8b107d6ea011acbf886751b1827fcbd95762dcf29445d1660174c3ad256def8a"
-IPA_TRACER_EXECUTABLE_SHA256 = "8f17c85f74427368197f15487538fc67fe42bc61440150c762e3986994d5e55e"
+IPA_TRACER_EXECUTABLE_SHA256 = "81af30dd3ace6962030dcc38c438dfcf0860a3e6ff53a307b3db1a464f6f3053"
 PROTECTED_WORKFLOW_SHA256 = {
     "contract-ci.yml": CONTRACT_CI_EXECUTABLE_SHA256,
     "ipa-tracer.yml": IPA_TRACER_EXECUTABLE_SHA256,
@@ -2212,6 +2212,10 @@ If these files do not exist, proceed silently.
         self.assertIn("CODE_SIGNING_ALLOWED=NO", tracer)
         self.assertIn("codesign", tracer)
         self.assertIn("--sign -", tracer)
+        self.assertIn("HermesShareExtension.appex", tracer)
+        self.assertIn("HermesLiveActivityWidget.appex", tracer)
+        self.assertIn("group.no.gior.hermex", tracer)
+        self.assertIn("APP_GROUP", tracer)
         self.assertIn("Payload", tracer)
         self.assertIn("Hermex-", tracer)
         self.assertIn("SHORT_SOURCE", tracer)

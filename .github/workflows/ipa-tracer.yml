@@ -71,15 +71,34 @@ jobs:
           set -euo pipefail
           APP="build/Hermex.xcarchive/Products/Applications/HermesMobile.app"
           [[ -d "${APP}" ]]
+          # codesign does not substitute build settings; resolve the canonical
+          # app-group value into temporary entitlement files first.
+          APP_ENTS="$(mktemp)"
+          SHARE_ENTS="$(mktemp)"
+          trap 'rm -f "${APP_ENTS}" "${SHARE_ENTS}"' EXIT
+          sed 's/\$(APP_GROUP_IDENTIFIER)/group.no.gior.hermex/' \
+            "HermesMobile/Resources/HermesMobile.entitlements" > "${APP_ENTS}"
+          sed 's/\$(APP_GROUP_IDENTIFIER)/group.no.gior.hermex/' \
+            "HermesShareExtension/Resources/HermesShareExtension.entitlements" > "${SHARE_ENTS}"
           EXT="${APP}/PlugIns"
           if [[ -d "${EXT}" ]]; then
             for entry in "${EXT}"/*.appex; do
-              codesign --force --sign - --entitlements \
-                "HermesShareExtension/Resources/HermesShareExtension.entitlements" "${entry}"
+              case "$(basename "${entry}")" in
+                HermesShareExtension.appex)
+                  codesign --force --sign - --entitlements "${SHARE_ENTS}" "${entry}"
+                  ;;
+                HermesLiveActivityWidget.appex)
+                  # The widget target declares no entitlements file of its own.
+                  codesign --force --sign - "${entry}"
+                  ;;
+                *)
+                  echo "unexpected extension: ${entry}" >&2
+                  exit 1
+                  ;;
+              esac
             done
           fi
-          codesign --force --sign - --entitlements \
-            "HermesMobile/Resources/HermesMobile.entitlements" "${APP}"
+          codesign --force --sign - --entitlements "${APP_ENTS}" "${APP}"
 
       - name: Fail closed on provisioning profiles and identity drift
         run: |
@@ -92,6 +111,15 @@ jobs:
           BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "${APP}/Info.plist")"
           if [[ "${BUNDLE_ID}" != "no.gior.hermex" ]]; then
             echo "unexpected bundle identifier: ${BUNDLE_ID}" >&2
+            exit 1
+          fi
+          SIGNED_ENTS="$(codesign -d --entitlements - "${APP}" 2>/dev/null || true)"
+          if ! printf '%s' "${SIGNED_ENTS}" | grep -q 'group.no.gior.hermex'; then
+            echo "app-group entitlement missing from the signed app" >&2
+            exit 1
+          fi
+          if printf '%s' "${SIGNED_ENTS}" | grep -q '\$('; then
+            echo "unresolved build variable in signed entitlements" >&2
             exit 1
           fi
 
