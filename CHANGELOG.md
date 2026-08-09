@@ -1,13 +1,19 @@
 # Changelog
 
-Notable changes to Hermex. Version headings correspond to App Store releases;
-unreleased changes accumulate at the top. Format follows
+Notable changes to the Hermex fork. After the fork identity epoch, version headings
+correspond to tagged SideStore release artifacts that pass every distribution gate;
+unreleased fork changes accumulate at the top. Format follows
 [Keep a Changelog](https://keepachangelog.com/) with Added / Changed / Fixed /
 Security sections per release.
 
 ## [Unreleased]
 
-## [1.5.0] - TBA
+## Inherited predecessor planning history — not a Hermex fork release
+
+The unshipped `1.5.0` section below predates the fork identity epoch. It is retained only
+as inherited planning provenance and cannot select, name, or authorize a fork artifact.
+
+### [1.5.0] - inherited / TBA
 
 ### Added
 - Kanban boards: browse cards by status column, view card detail with comments

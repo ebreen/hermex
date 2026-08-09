@@ -4,18 +4,29 @@ How the engineering skills should consume this repo's domain documentation when 
 
 ## Layout
 
-This is a single-context repo: Hermex is one native iOS app with related app extension targets, tests, release docs, and one shared product vocabulary.
+This repository contains multiple bounded contexts. The native iOS client, Kanban integration,
+and fork-owned Improvements domain share one product but keep distinct authority and lifecycle
+rules.
 
-When present, use:
+Use:
 
-- `CONTEXT.md` at the repo root for domain vocabulary and project concepts.
-- `docs/adr/` for architectural decision records.
+- required `CONTEXT.md` at the repository root for canonical domain vocabulary and project
+  concepts;
+- `docs/improvements-contract.md` is canonical and normative for Improvements authority,
+  lifecycle, consent, scheduling, and handoff rules;
+- `PROJECT_SPEC.md` is subordinate to the canonical contract and summarizes approved product
+  scope; and
+- `docs/adr/` for architectural decision records when present.
 
-There is currently no required `CONTEXT.md` or `docs/adr/` directory. If these files do not exist, proceed silently. Do not suggest creating them upfront; producer skills such as `grill-with-docs` can create them lazily when domain terms or decisions are clarified.
+`CONTEXT.md` is required and must remain consistent with the Improvements contract. The
+`docs/adr/` directory is optional. If an ADR exists, treat it as authority within its stated
+scope and date; do not infer that a missing ADR removes the canonical contract.
 
 ## Consumer Rules
 
-Before making architecture, diagnosis, TDD, or issue-writing decisions, read the relevant domain docs if they exist.
+Before making architecture, diagnosis, TDD, or issue-writing decisions, read both required domain
+documents. If either required document is missing, or if active guidance contradicts it, report the
+drift and stop the affected domain work. Do not proceed silently.
 
 When output names a domain concept in an issue title, refactor proposal, hypothesis, or test name, use the term as defined in `CONTEXT.md`. Do not drift to synonyms the glossary explicitly avoids.
 

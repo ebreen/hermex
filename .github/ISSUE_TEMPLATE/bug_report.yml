@@ -2,6 +2,14 @@ name: Bug report
 description: Something in the app is broken or behaving unexpectedly
 labels: ["bug", "needs-triage"]
 body:
+  - type: checkboxes
+    id: public-privacy
+    attributes:
+      label: Public issue privacy
+      description: GitHub issues and attachments are public. Remove private or identifying data before submitting. Security vulnerabilities must use the private process in SECURITY.md.
+      options:
+        - label: I removed credentials, authorization headers, private server URLs, prompts, transcripts, Memory excerpts, and other personal data.
+          required: true
   - type: textarea
     id: steps
     attributes:
@@ -31,7 +39,7 @@ body:
     id: app-version
     attributes:
       label: App version / commit
-      description: TestFlight build number, or the commit you built from source.
+      description: SideStore artifact version/build plus source commit, or the commit you built locally.
     validations:
       required: true
   - type: input
@@ -44,8 +52,8 @@ body:
   - type: input
     id: server-version
     attributes:
-      label: hermes-webui server version
-      description: Settings → server info in the app, or the upstream tag/commit you deployed.
+      label: Hermex WebUI fork commit
+      description: The full commit from `WEBUI_FORK_TESTED_SHA` and, when relevant, the paired Hermes Agent commit.
     validations:
       required: true
   - type: dropdown
@@ -64,6 +72,6 @@ body:
     id: screenshots
     attributes:
       label: Screenshots or screen recordings
-      description: Visual evidence helps a lot. Drag and drop to attach.
+      description: Attachments are public. Redact private URLs, account details, prompts, transcripts, Memory, notifications, and other identifying data before uploading.
     validations:
       required: false

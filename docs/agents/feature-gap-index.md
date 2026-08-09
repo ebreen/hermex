@@ -97,7 +97,7 @@ sub-paths of a group. Do not reorder casually.
 | `/api/workspace/` | roadmap | P3 | write | Workspace Management |
 | `/api/file/` | roadmap | P4 | write | File Editing / Management — owner-deferred |
 | `/api/folder/` | roadmap | P4 | write | File Editing / Management — owner-deferred |
-| `/api/terminal/` | roadmap | P4 | exec | Terminal — owner-deferred; App Store/safety-sensitive |
+| `/api/terminal/` | roadmap | P4 | exec | Terminal — owner-deferred; security- and safety-sensitive |
 | `/api/commands/exec` | roadmap | P4 | exec | Plugin command exec — owner-deferred |
 | `/api/gateway/` | roadmap | P5 | read | Gateway / Messaging Bridge |
 | `/api/updates/` | roadmap | P5 | admin | Server Updates |

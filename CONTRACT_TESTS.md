@@ -1,8 +1,71 @@
 # Contract Test Readiness
 
-Hermex is tested against `hermes-webui` tag `v0.51.85`, peeled commit `f1d399b437c1ca7fe4b6d2093aebe334c32f34a3`.
+Inherited Hermex API behavior was tested against upstream `hermes-webui` tag `v0.51.85`,
+peeled commit `f1d399b437c1ca7fe4b6d2093aebe334c32f34a3`.
 
-The machine-readable pin is `UPSTREAM_TESTED_SHA`. Any future contract test runner must clone or check out upstream at that exact SHA unless the pin is intentionally updated after manual verification.
+`UPSTREAM_TESTED_SHA` is the machine-readable inherited-compatibility pin. At the issue #14
+bootstrap baseline, the intended fork repository name was `ebreen/hermes-webui`, and it had not
+been created. Issue [#45](https://github.com/ebreen/hermex/issues/45) creates and verifies it, then
+records its tested commit in `WEBUI_FORK_TESTED_SHA`. Until then, server implementation remains
+blocked. A contract runner tests the fork first and consults upstream only for unchanged inherited
+behavior.
+
+When `WEBUI_FORK_TESTED_SHA` becomes non-empty, the trusted workflow performs an unauthenticated
+fixed-host fetch from `github.com/ebreen/hermes-webui.git` and requires `FETCH_HEAD` to
+equal the pin. It passes no token, checks out no fork files, and executes no fork script. An absent,
+malformed, private, missing, or unreachable pin fails before `Trusted Contract Gate` can pass.
+
+## Trusted Improvements Validator
+
+`.github/workflows/contract-ci.yml` uses `pull_request_target` only as a read-only validation
+boundary. It checks out the trusted base validator separately, treats the pull-request merge
+tree as inert data, and never executes candidate code. The inert candidate checkout alone uses
+`allow-unsafe-pr-checkout: true` so fork-originated PR merge refs can be read; it persists no
+credentials. The base workflow requires `tests` to be a Git tree and
+`tests/test_fork_contract.py` to be a regular `100644` blob, extracts that blob with `git cat-file`,
+and compares its bytes with the base validator. Filesystem checks separately reject a symlink in
+the validator path or any lexical ancestor. `Trusted Contract Gate` is the branch-protection check
+for this boundary.
+
+The validator also carries two base-relative one-way identity ratchets. One covers inherited Apple
+Team and bundle/app-group/source-fallback values. The other covers inherited runtime owner URLs,
+the predecessor URL scheme, and the old Share/Live Activity suffixes. Both scan regular content,
+binary lines, paths, tracked `__pycache__` paths, and symlink targets. Because the identity tokens
+are folded into bytecode, trusted Python runs with bytecode generation disabled: both the ordinary
+`Improvements contract` job in `pr-ci.yml` and the trusted `contract-ci.yml` validator set
+`PYTHONDONTWRITEBYTECODE=1`, and every local bootstrap run must set it too. The exact base multiset is the maximum: the base-relative
+ratchet permits deletion but rejects copying, movement, or reintroduction. A separate atomic-state
+gate accepts only the exact issue #14 quarantine or the complete canonical issue #15 replacement;
+a partial migration fails. This lets issue #15 remove the quarantined identity without locking it in
+place or permitting a half-migrated build.
+
+Issue #14 is the one-time bootstrap. GitHub cannot run a new `pull_request_target` workflow until
+that workflow exists on the default branch, so the issue #14 pull request cannot receive its own
+trusted check. Its bootstrap gate is the complete local suite, Actionlint, exact-diff scans, the
+ordinary read-only PR workflow, and independent exact-SHA review. After merge, require
+`Trusted Contract Gate` before any later pull request can merge.
+
+The bootstrap also adds the fork privacy notice at the future `master` URL used by the app. That
+URL is expected to return `404` before issue #14 reaches `master`; this is not waivable for a
+release. Immediately after merge, verify unauthenticated `2xx` responses and expected fork content
+for both the configured privacy and support URLs before identity or artifact work continues.
+
+An ordinary pull request must not change `tests/test_fork_contract.py` or any protected workflow's
+exact-byte SHA-256 digest. Blank lines and comments are included because a comment inside `run: |`
+can break a shell continuation. Use this trust-root update procedure only when the validator itself
+must change:
+
+1. Open a dedicated trust-root pull request containing only the validator, protected workflows,
+   their executable digests, tests, and this procedure. Do not combine product code or secrets.
+2. Run the old and replacement validators against the candidate tree. Prove each new poison goes
+   RED before its fix, then run the exact parsed workflow steps locally.
+3. Freeze the commit and obtain independent exact-SHA review of the full trust-root diff. A green
+   candidate-owned workflow is not approval.
+4. Merge only the reviewed SHA with an explicit administrator bypass of `Trusted Contract Gate`;
+   do not disable the workflow or weaken repository permissions for other pull requests.
+5. Verify the new default-branch workflow and digest immediately, then open a harmless canary pull
+   request. The canary pull request must receive both `Trusted Contract Gate` and `CI Gate` before
+   normal development resumes.
 
 ## Advance Policy
 
@@ -128,15 +191,19 @@ Upload checks:
 
 The full v1 target should:
 
-1. Clone `nesquena/hermes-webui`.
-2. Check out the SHA in `UPSTREAM_TESTED_SHA`.
-3. Start upstream in Docker with a disposable workspace and password.
-4. Run an XCTest or command-line Swift contract harness against the local upstream base URL.
+1. Clone `ebreen/hermes-webui` and check out the SHA in `WEBUI_FORK_TESTED_SHA`.
+2. Run the fork's full suite with the compatible Hermes Agent SHA recorded by issue #45.
+3. Start the canonical fork in Docker with a disposable workspace and password.
+4. Run an XCTest or command-line Swift contract harness against the local canonical fork base URL.
 5. Exercise read-only endpoints first.
 6. Create one disposable session for mutating endpoints, then run branch/truncate/rename/pin/archive/move/delete checks only against that disposable session.
 7. Assert each JSON response decodes through the app's tolerant `Codable` models.
 8. Verify SSE event decoding from a controlled stream fixture or a short disposable chat turn.
 9. Run on pull requests and nightly.
+
+For inherited compatibility, run the same relevant endpoint harness separately against
+`nesquena/hermes-webui` at `UPSTREAM_TESTED_SHA`. That run cannot validate Improvements or
+replace the canonical fork gate.
 
 Until that target exists, the existing mock tests and this endpoint matrix are the readiness gate for request shape drift inside the iOS client.
 
