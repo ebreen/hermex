@@ -39,9 +39,17 @@ struct SharedImport: Equatable {
 }
 
 enum HermesShareDraft {
+    /// Effective app-group identifier for the current install: the
+    /// SideStore-remapped value when present, the canonical build-time
+    /// identifier otherwise. A malformed or ambiguous SideStore remapping
+    /// fails loudly rather than silently writing to the wrong container.
     static var appGroupIdentifier: String {
-        Bundle.main.object(forInfoDictionaryKey: "HermesAppGroupIdentifier") as? String
-            ?? "group.no.gior.hermex"
+        do {
+            return try HermesAppGroupResolver.effectiveAppGroupIdentifier()
+        } catch {
+            assertionFailure("Unresolvable app group: \(error)")
+            return HermesAppGroupResolver.canonicalIdentifier
+        }
     }
 
     static let pendingDraftFileName = "pending-share-draft.json"
