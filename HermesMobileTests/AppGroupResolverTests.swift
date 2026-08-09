@@ -99,6 +99,41 @@ final class AppGroupResolverTests: XCTestCase {
         assertUnrelated(["\(canonical)evil.\(teamIdentifier)"])
     }
 
+    func testMixedALTAppGroupsWithEmptyEntryFailsClosed() {
+        assertUnrelated([
+            "\(canonical).\(teamIdentifier)",
+            "",
+        ])
+    }
+
+    func testMixedALTAppGroupsWithCanonicalPrefixCollisionFailsClosed() {
+        assertUnrelated([
+            "\(canonical).\(teamIdentifier)",
+            "group.no.gior.hermexevil.TEAM999",
+        ])
+    }
+
+    func testMixedALTAppGroupsWithReversedSyntheticEntryFailsClosed() {
+        assertUnrelated([
+            "\(canonical).\(teamIdentifier)",
+            "group.altstore.3F2A91C0-D5E6-4B7A-9C1E-2F8A0B6D4E5F.\(canonical)",
+        ])
+    }
+
+    func testMixedALTAppGroupsWithWellFormedUnrelatedGroupFailsClosed() {
+        assertUnrelated([
+            "\(canonical).\(teamIdentifier)",
+            "group.example.unrelated.TEAM999",
+        ])
+    }
+
+    func testMixedALTAppGroupsWithMalformedRelatedEntryFailsClosed() {
+        assertUnrelated([
+            "\(canonical).\(teamIdentifier)",
+            "\(canonical).",
+        ])
+    }
+
     func testEmptyTeamComponentIsRejected() {
         assertUnrelated(["\(canonical)."])
     }
