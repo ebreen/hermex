@@ -29,12 +29,14 @@ reference and its own history rather than copying or redefining those systems.
 
 At the issue #14 bootstrap baseline, the intended future repository name was
 `ebreen/hermes-webui`, and that fork had not been created. Issue
-[#45](https://github.com/ebreen/hermex/issues/45) creates and verifies it from current
-upstream. Its full tested commit is recorded in `WEBUI_FORK_TESTED_SHA`; until that file contains a
+[#45](https://github.com/ebreen/hermex/issues/45) created and verified it from current
+upstream. Its full tested commit is recorded in `WEBUI_FORK_TESTED_SHA`. Until that file contains a
 real 40-character fork commit and the fork repository exists, no server implementation slice may
-start. A non-empty pin passes only after the trusted workflow performs an unauthenticated fixed-host
+start; now that the pin is recorded and the fork repository exists
+(`https://github.com/ebreen/hermes-webui`), server implementation slices may start from the pinned
+commit. The pin passes only after the trusted workflow performs an unauthenticated fixed-host
 fetch from `github.com/ebreen/hermes-webui.git` and proves `FETCH_HEAD` equals that pin. It
-passes no token and executes no fork script. After that gate, the authenticated running fork is the
+passes no token and executes no fork script. The authenticated running fork is the
 final wire arbiter, then its version-matched source and tests. The
 https://github.com/nesquena/hermes-webui repository remains a read-only inherited-compatibility
 and upstream-sync input, never the authority for fork-owned Improvements behavior.

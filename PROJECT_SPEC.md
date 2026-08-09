@@ -44,8 +44,8 @@ The phone is not the compute plane. The phone is the control plane and review su
 The server owns execution. The app owns mobile interaction quality.
 
 ### 1.5 Canonical server and upstream — quick facts
-- Intended fork repository at the issue #14 baseline: `ebreen/hermes-webui` (not created; issue #45 owns creation and verification)
-- Tested fork commit: the full SHA in `WEBUI_FORK_TESTED_SHA` (created by issue #45 before server implementation)
+- Fork repository (created and verified by issue #45): https://github.com/ebreen/hermes-webui
+- Tested fork commit: the full SHA in `WEBUI_FORK_TESTED_SHA` (issue #45 recorded it before server implementation)
 - Inherited upstream: https://github.com/nesquena/hermes-webui
 - Language: Python 3 (server), HTML/CSS/vanilla JS (existing browser client)
 - License: MIT
@@ -821,7 +821,7 @@ Ordinary product decisions are autonomous. Only an active release issue may requ
 
 ## 15. References
 
-- Intended fork repository at the issue #14 baseline: `ebreen/hermes-webui` (not created; issue #45 owns creation and verification)
+- Fork repository (created and verified by issue #45): https://github.com/ebreen/hermes-webui
 - Tested canonical fork commit: `WEBUI_FORK_TESTED_SHA`
 - Upstream repo: https://github.com/nesquena/hermes-webui
 - Upstream `api/routes.py`: https://github.com/nesquena/hermes-webui/blob/master/api/routes.py
