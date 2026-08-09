@@ -45,8 +45,12 @@ jobs:
             -clonedSourcePackagesDirPath .swiftpm-cache
           RESOLVED="HermesMobile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
           [[ -f "${RESOLVED}" ]]
+          if ! git ls-files --error-unmatch -- "${RESOLVED}" >/dev/null 2>&1; then
+            echo "Package.resolved is not committed; commit the generated lock." >&2
+            exit 1
+          fi
           if [[ -n "$(git status --porcelain -- "${RESOLVED}")" ]]; then
-            echo "Package.resolved is missing or drifts from the resolved graph; commit the generated lock." >&2
+            echo "Package.resolved drifts from the resolved graph; commit the generated lock." >&2
             exit 1
           fi
 
@@ -145,8 +149,8 @@ jobs:
           SHORT_SOURCE="$(git rev-parse --short=8 HEAD)"
           FULL_SOURCE="$(git rev-parse HEAD)"
           MANIFEST="${IPA%.ipa}-manifest.txt"
-          XCODE="$(xcodebuild -version | head -1)"
-          TOOLCHAIN="$(xcodebuild -version | tail -1)"
+          XCODE="$(/usr/bin/xcrun --show-sdk-version)"
+          TOOLCHAIN="$(xcode-select -p)"
           {
             echo "artifact=${IPA}"
             echo "source_commit=${FULL_SOURCE}"

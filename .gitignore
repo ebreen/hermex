@@ -8,9 +8,7 @@ build/
 
 # Swift Package Manager
 .build/
-Package.resolved
 .swiftpm/
-
 # macOS
 .DS_Store
 
