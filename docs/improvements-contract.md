@@ -575,7 +575,8 @@ side effect. An ambiguous transition becomes `outcome_uncertain`; reconciliation
 the Card's authoritative Status before retry can continue.
 
 Before that start preview is shown, the server reads the authoritative Card and binds its native
-target version, Board, Status, title/body, assignee, workspace, dependencies, skills, tools, and
+target version, Board, Status, title/body, assignee, workspace, dependencies, skills, tools, Goal
+mode, retry limits, and
 runtime fields into the preview hash. Confirmation authorizes an idempotent `prepare_target` step
 under the Handoff lease, not a blind dispatch. That step uses native compare-and-set against the
 confirmed target version, requires the Card still to be the same `triage` target, and atomically

@@ -144,4 +144,4 @@ V1 is being delivered through dependency-linked issues from the [canonical map](
 
 MIT — see [LICENSE](LICENSE).
 
-Hermex is an independent fork built on the upstream [hermes-webui](https://github.com/nesquena/hermes-webui) project and is not affiliated with its maintainers. Apple and SideStore are not affiliated with this project.
+Hermex is an independent fork built on the upstream [hermes-webui](https://github.com/nesquena/hermes-webui) project and is not affiliated with its maintainers. The native app derives from [uzairansaruzi/hermex](https://github.com/uzairansaruzi/hermex); that repository remains a read-only compatibility input. Apple and SideStore are not affiliated with this project.

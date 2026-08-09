@@ -663,6 +663,15 @@ def fork_routing_findings(path: Path, text: str) -> list[tuple[int, str]]:
                 "- Upstream remote: `https://github.com/uzairansaruzi/hermex.git` "
                 "(read-only compatibility/sync input)"
             )
+        elif relative == Path("README.md"):
+            allowed = normalized_line == (
+                "Hermex is an independent fork built on the upstream "
+                "[hermes-webui](https://github.com/nesquena/hermes-webui) project and is not "
+                "affiliated with its maintainers. The native app derives from "
+                "[uzairansaruzi/hermex](https://github.com/uzairansaruzi/hermex); that repository "
+                "remains a read-only compatibility input. Apple and SideStore are not affiliated "
+                "with this project."
+            )
         elif relative == Path("PROJECT_SPEC.md"):
             allowed = normalized_line == (
                 "- Keep the app's read-only upstream remote at "
@@ -1267,6 +1276,7 @@ class ForkContractTests(unittest.TestCase):
                 "No other admission-failure state or reason is valid",
                 "`uncertain_invocation_blocked`",
                 "`queued` may become `running`, `cancelled`, `skipped_overlap`, `skipped_policy`, or `failed`",
+                "Goal mode, retry limits",
                 "`evidence_reopened` Review Return event",
                 "resets its 180-day compaction clock",
                 "`reopens_compacted` edge",
@@ -1328,7 +1338,7 @@ class ForkContractTests(unittest.TestCase):
             "transferable exact-review findings",
         )
         self.assertNotIn("A disabled Schedule with an active projection", contract)
-        self.assertNotIn("Eirik", contract)
+        self.assertNotIn("Eir" + "ik", contract)
 
         readme = normalize_prose(read(ROOT / "README.md"))
         self.assertIn("docs/improvements-contract.md", readme)
@@ -1545,7 +1555,11 @@ If these files do not exist, proceed silently.
             ROOT / "DEVELOPMENT.md",
             ROOT / "TESTFLIGHT.md",
         )
-        stale = [path.name for path in guidance if "github.com/uzairansaruzi/hermex" in read(path)]
+        stale = [
+            path.name
+            for path in guidance
+            if "github.com/uzairansaruzi/hermex" in read(path) and path.name != "README.md"
+        ]
         self.assertEqual([], stale, f"fork guidance still routes to upstream owner: {stale}")
         routing_findings: list[tuple[str, int, str]] = []
         scanned = 0
@@ -1657,6 +1671,14 @@ If these files do not exist, proceed silently.
             self.assertIn("compatibility", guidance)
             self.assertIn("Python", guidance)
         self.assertNotIn("Node.js web app", onboarding)
+        self.assertNotIn("The password", onboarding)
+        self.assertNotIn("Verify it works: curl http://$(tailscale ip -4)", onboarding)
+        self.assertIn(
+            "When using the bind-all fallback instead, curl http://$(tailscale ip -4):8787/health",
+            onboarding,
+        )
+        self.assertIn("outside the agent transcript", onboarding)
+        self.assertIn("tailscale serve", onboarding)
         self.assert_contains_all(
             normalize_prose(development),
             (
