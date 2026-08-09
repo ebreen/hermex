@@ -49,7 +49,8 @@ enum HermesShareDraft {
         if resolved == nil {
             assertionFailure("Unresolvable app group; using canonical fallback")
         }
-        return resolved ?? "group.no.gior.hermex"
+        return resolved
+            ?? "group.no.gior.hermex"
     }
 
     static let pendingDraftFileName = "pending-share-draft.json"
