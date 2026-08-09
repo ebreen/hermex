@@ -8,17 +8,17 @@ enum OnboardingFlowPolicy {
     static let agentSetupPrompt = """
 Set up Hermes Web UI on this machine for access from my iPhone via Tailscale.
 
-Clone and install https://github.com/nesquena/hermes-webui — it's a Node.js web app. Install dependencies and start it on port 8787.
-Enable password authentication by setting the HERMES_WEBUI_PASSWORD environment variable. Generate a secure random password and save it — I'll need it for the iPhone app.
+Until the canonical Hermex WebUI fork is published, use https://github.com/nesquena/hermes-webui only as an inherited-feature compatibility fallback. It is a Python server. Follow its README to install dependencies and start it on port 8787.
+Enable password authentication by setting the HERMES_WEBUI_PASSWORD environment variable. Generate a secure random password, write it to a permission-restricted local file (for example ~/.hermes-webui-password with 600 permissions), and tell me the path to that file. Never print the password in your reply — I will retrieve it outside the agent transcript.
 Install Tailscale on this machine. Search the web for the correct install method for this OS if you're unsure. Authenticate to my Tailscale account — if this requires opening a URL or an auth key, tell me exactly what to do.
 Make the WebUI reachable over Tailscale:
 - Try tailscale serve --bg 8787 first (gives HTTPS + nice hostname).
 - If Tailscale Serve is disabled on my tailnet, fall back: bind the server to 0.0.0.0 instead of localhost so it listens on the tailnet interface. Before doing this, confirm password auth is active — never expose an unauthenticated WebUI.
 Set up auto-start appropriate for this OS so the WebUI survives reboots.
-Verify it works: curl http://$(tailscale ip -4):8787/health should return a success response.
+Verify it works: when Tailscale Serve succeeded, curl the HTTPS MagicDNS URL reported by `tailscale serve status` with /health appended. When using the bind-all fallback instead, curl http://$(tailscale ip -4):8787/health.
 Reply with:
 - The exact server URL I enter in Hermex
-- The password
+- The path to the password file (not the password itself)
 - Any setup steps I still need to do on my iPhone
 Do not use Cloudflare. Optimize for Tailscale + iPhone.
 """

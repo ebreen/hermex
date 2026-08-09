@@ -1,30 +1,32 @@
-# Hermex — iOS App Project Specification
+# Hermex — Project Specification
 
-**Status:** v0.4 spec — revised pre-polish plan with a glass-forward native mobile UI direction
+**Status:** v0.5 spec — fork-owned server authority plus native mobile delivery
 **Author:** Project owner + planning assistant
-**Target:** Native iOS client for the [`nesquena/hermes-webui`](https://github.com/nesquena/hermes-webui) Python server
+**Target:** Hermex iOS plus the planned `ebreen/hermes-webui` fork tracked by [issue #45](https://github.com/ebreen/hermex/issues/45), inherited from [`nesquena/hermes-webui`](https://github.com/nesquena/hermes-webui)
 **Audience:** A coding agent tasked with building the app, plus the human owner reviewing it
 
 ---
 
 ## 0. How to use this document
 
-You (the coding agent) are building a native iOS app called **Hermex** in App Store Connect. The Xcode target remains `HermesMobile`; the iPhone home-screen display name is `Hermex`. You are NOT modifying the upstream `nesquena/hermes-webui` Python server in this project. You are building a separate Swift/SwiftUI iOS application that talks to that server over HTTPS.
+You (the coding agent) are building **Hermex**: a native SwiftUI iOS client plus product-owned capabilities in the canonical WebUI fork. The Xcode target remains `HermesMobile`; the home-screen display name remains `Hermex`. Generic Hermes systems stay native, while fork-owned bounded contexts such as Improvements are implemented server-first and projected to iOS.
+
+For Improvements, [`docs/improvements-contract.md`](docs/improvements-contract.md) is normative and `CONTEXT.md` defines canonical language. The WebUI fork is the server system of record; iOS keeps only a replaceable, read-only-offline projection.
 
 Treat each section's checkboxes as your work plan. After every milestone, update the `## Progress log` at the bottom.
 
-If anything in this spec is ambiguous, **stop and ask the human owner before guessing.** Do not invent endpoints — verify them against the running server (see §6).
+Resolve ordinary product ambiguity autonomously from the selected issue and canonical contracts. Request human input only for unknowable identity, credentials, or irreversible external actions. Never invent endpoints — verify them against the running canonical fork (see §6).
 
 ---
 
 ## 1. Project summary
 
 ### 1.1 What we're building
-A native iOS app (SwiftUI, iOS 18+, iPhone only) that lets the user drive a self-hosted Hermes AI agent from their phone. The user runs the `hermes-webui` Python server on a machine they control and connects from the phone via Cloudflare Tunnel (or Tailscale).
+A native iOS app (SwiftUI, iOS 18+, iPhone only) and fork-owned WebUI capabilities that let the user drive and improve a self-hosted Hermes AI agent from their phone. The user runs the canonical WebUI fork on a machine they control and connects from the phone via Cloudflare Tunnel (or Tailscale).
 
 ### 1.2 What it is NOT
 - ❌ Not a webview wrapper around the existing browser UI.
-- ❌ Not a port of the Python server to iOS (impossible due to App Store sandboxing).
+- ❌ Not a port of the Python server to iOS (incompatible with iOS sandboxing and platform constraints).
 - ❌ Not a hosted service — every user brings their own server.
 
 ### 1.3 Why it exists
@@ -41,13 +43,16 @@ The phone is not the compute plane. The phone is the control plane and review su
 
 The server owns execution. The app owns mobile interaction quality.
 
-### 1.5 Upstream project — quick facts
-- Repo: https://github.com/nesquena/hermes-webui
+### 1.5 Canonical server and upstream — quick facts
+- Intended fork repository at the issue #14 baseline: `ebreen/hermes-webui` (not created; issue #45 owns creation and verification)
+- Tested fork commit: the full SHA in `WEBUI_FORK_TESTED_SHA` (created by issue #45 before server implementation)
+- Inherited upstream: https://github.com/nesquena/hermes-webui
 - Language: Python 3 (server), HTML/CSS/vanilla JS (existing browser client)
 - License: MIT
 - Default port: `8787`
 - Default host: `127.0.0.1` (binds to `0.0.0.0` only when explicitly set)
-- Activity: very high — daily commits, 67+ open issues, 5,200+ stars, 660+ forks
+- Upstream counts and activity are volatile; verify the selected ref and API before compatibility
+  work. Stars, forks, issue counts, and recent activity are not release authority.
 - The server is essentially a thin `http.server.ThreadingHTTPServer` shell in `server.py` that delegates to `api/routes.py` (~3000 LOC of route handlers).
 - Real-time updates use **Server-Sent Events (SSE)**, not WebSockets.
 - Auth: optional HMAC-signed HTTP-only cookie set via `HERMES_WEBUI_PASSWORD` env var, with a `/login` page and 24h TTL.
@@ -58,17 +63,18 @@ The server owns execution. The app owns mobile interaction quality.
 
 | # | Decision | Value |
 |---|---|---|
-| 1 | v1 feature scope | **Expanded pre-polish scope** (login, sessions, chat with streaming, conversation actions, composer attachments/config, read-only tasks/skills/memory, limited usage analytics, workspace browser, file viewer with syntax highlighting, settings; **no push, no terminal, no file editing in v1**) |
+| 1 | v1 product scope | **Established mobile scope plus fork-owned Improvements** (login, sessions, chat with streaming, conversation actions, composer attachments/config, referenced tasks/skills/memory, limited usage analytics, workspace browser, file viewer with syntax highlighting, settings, and the contract-locked Improvements bounded context) |
 | 2 | Hosting models documented | **Cloudflare Tunnel (primary)** and **Tailscale (secondary)** |
-| 3 | Upstream strategy | **Pin to upstream tags** for v1; revisit forking later if API churn becomes painful |
+| 3 | Server authority | **The Hermex WebUI fork is canonical**; upstream tags are compatibility inputs, not product authority |
 | 4 | Auth method | **Password only** for v1 (no OAuth) |
 | 5 | Target | iOS 18+, iPhone only, portrait + landscape |
-| 6 | Distribution | **TestFlight first**, App Store later |
+| 6 | Distribution | **Apple-credential-free, ad-hoc entitlement-seeded SideStore IPA**; SideStore replaces signatures downstream and CI holds no Apple credentials |
 | 7 | Push notifications | **Skip for v1** |
 | 8 | Terminal feature | **Skip for v1** |
 | 9 | Offline behavior | **Read-only cache** of session list and recent messages |
-| 10 | App name | **Hermex** in App Store Connect; iPhone display name **Hermex**; Xcode target remains `HermesMobile` |
-| 11 | Apple Developer account | **Enrolled** — Team ID `6GYD9C9N6R`; bundle ID `com.uzairansar.hermesmobile`; SKU `hermes-mobile-ios` |
+| 10 | App identity | Product/display name **Hermex**; application ID `no.gior.hermex`; app group `group.no.gior.hermex`; Xcode target remains `HermesMobile` |
+| 11 | Signing boundary | No Apple signing secret, certificate, provisioning profile, or App Store Connect key in CI or the repository |
+| 12 | Improvements contract | [`docs/improvements-contract.md`](docs/improvements-contract.md) governs language, records, authority, consent, sync, and side effects |
 
 ---
 
@@ -114,7 +120,7 @@ This is a design direction, not a dependency. Do not add third-party UI packages
 │   Keychain (auth token)  │                                                │ cloudflared
 │   SwiftData (cache)      │                                                ▼
 └──────────────────────────┘                                   ┌────────────────────────────┐
-                                                               │  hermes-webui (Python)     │
+                                                               │  Hermex WebUI fork         │
                                                                │  127.0.0.1:8787 on macOS,  │
                                                                │  managed by launchd        │
                                                                └────────────┬───────────────┘
@@ -133,7 +139,7 @@ This is a design direction, not a dependency. Do not add third-party UI packages
 
 ## 4. Required reading before coding
 
-Read these from the upstream repo (in this order) and summarize key takeaways in your progress log:
+Read these from the canonical fork checkout (in this order) and summarize key takeaways in your progress log. Compare inherited paths with upstream only when checking compatibility or drift:
 
 1. `README.md` — overall product picture
 2. `server.py` — request lifecycle, auth check, SSE
@@ -144,9 +150,12 @@ Read these from the upstream repo (in this order) and summarize key takeaways in
 7. `api/workspace.py` — file listing/reading endpoints
 8. `ARCHITECTURE.md` — narrative reference
 
-Also note: this repo uses a pinned, read-only upstream clone at `.codex-tmp/hermes-webui/` (clone it if missing: `git clone https://github.com/nesquena/hermes-webui .codex-tmp/hermes-webui`). **Read from that pinned copy first** when convenient. Cross-check against GitHub master only when you need to confirm something changed after the pin.
+The canonical server checkout is the `ebreen/hermes-webui` fork at the exact full commit in
+`WEBUI_FORK_TESTED_SHA`. That file must exist and contain a real 40-character fork commit before
+any server implementation slice begins. This repo may also use a pinned, read-only upstream
+clone at `.codex-tmp/hermes-webui/` (clone it if missing: `git clone https://github.com/nesquena/hermes-webui .codex-tmp/hermes-webui`). It is a compatibility reference only. Fork-owned source and its API contract take precedence; upstream is consulted to understand inherited behavior and drift.
 
-When in doubt about behavior, hit your running server with `curl` and inspect the JSON. **The wire format is the source of truth — not docs.**
+For deployed behavior, hit the running canonical fork with `curl` and inspect the JSON. The running fork is the final wire-format arbiter, while normative product invariants remain locked in their canonical contract documents.
 
 ---
 
@@ -166,7 +175,7 @@ When in doubt about behavior, hit your running server with `curl` and inspect th
 | Testing | XCTest + a tiny URLProtocol-based mock server | No third-party test framework |
 | Linting | SwiftLint (optional, recommended) | Run in build phase |
 
-**Do NOT add other dependencies without asking.**
+Do not add other dependencies unless the selected issue explicitly changes this locked stack and records the rationale.
 
 ---
 
@@ -271,7 +280,11 @@ There is no verified full `/insights` dashboard REST endpoint in the pinned upst
 - Timeframe filtering is local to the fetched session metadata. Label this as **Usage Analytics** rather than claiming full parity with the CLI/WebUI `/insights` command.
 
 ### 6.8 Endpoints we deliberately skip in v1
-Terminal (`/api/terminal/*`), cron create/edit/delete/run/pause/resume, skills save/delete, memory write/edit, profile create/delete, file editing/deletion/rename/create, OAuth, approvals, clarify prompts. Architect the code so these can slot in later (use a `Feature` enum or similar).
+The native legacy v1 surface deliberately omits Terminal (`/api/terminal/*`) and OAuth. Generic Cron jobs remain mutable through the inherited Tasks surface (`/api/crons/create`, `/api/crons/update`, `/api/crons/delete`, `/api/crons/run`, `/api/crons/pause`, `/api/crons/resume`) as native Hermes records; see §10.1. Improvements never reuses generic Cron records as Dream Schedule entities. Dream projections are server-owned and routed only through the authenticated admission adapter defined in `docs/improvements-contract.md` §6; the app cannot create, edit, or delete them directly. Improvements can retrieve bounded Memory excerpts only under its canonical consent contract and never takes ownership of Memory. Architect optional surfaces with a `Capability` enum or similar.
+
+### 6.9 Improvements
+
+[`docs/improvements-contract.md`](docs/improvements-contract.md) locks the Improvements domain and wire invariants before endpoint implementation. Implement the authoritative WebUI fork first, then project it to iOS. Do not reuse generic Cron, Session, Profile, Project, Memory, or Kanban records as Improvements entities; reference their stable native IDs through Context Sources and Handoffs.
 
 ---
 
@@ -348,8 +361,8 @@ HermesMobile/
 Each phase ends in a working, committable state. Run on the simulator after every phase.
 
 ### Phase 0 — Setup (½ day)
-- [x] Create new GitHub repo (ask owner for the name; default `hermes-mobile`).
-- [x] Initialize Xcode project: SwiftUI App, iOS 17, Swift 5.9+, name `HermesMobile`, initial placeholder bundle ID later replaced by `com.uzairansar.hermesmobile`.
+- [x] Create the `hermex` GitHub repository.
+- [x] Initialize Xcode project: SwiftUI App, iOS 17, Swift 5.9+, name `HermesMobile`; canonical application identity is now `no.gior.hermex` (source/config migration is a separate implementation slice).
 - [x] Add this `PROJECT_SPEC.md` to the repo root.
 - [x] Add SwiftPM dependencies: LDSwiftEventSource, swift-markdown-ui, Splash, Highlightr, KeychainAccess.
 - [x] Add `.gitignore` (Xcode template), commit.
@@ -425,7 +438,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - [x] Clear cache button.
 
 ### Phase 8 — Conversation actions (2–3 days)
-**Classification:** required before polish/TestFlight.
+**Classification:** required before polish/distribution.
 
 #### 8.1 Session long-press options
 - **User-facing goal:** Press and hold a session row to open native options: pin/unpin, move to project, archive/restore, duplicate, delete.
@@ -458,7 +471,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Risks/open questions:** Long responses should not block UI while speech is active. Regenerating an older response can discard a large part of the transcript, so the confirmation copy must be explicit.
 
 ### Phase 9 — Composer configuration, attachments, and defaults (3–5 days)
-**Classification:** required before polish/TestFlight.
+**Classification:** required before polish/distribution.
 
 #### 9.1 Composer `+` menu
 - **User-facing goal:** Add a `+` button in the bottom composer that opens Attach File and Photos. Workspace, profile, model, and reasoning controls live in the composer control row/sheets. Camera capture is deferred from the current v1 scope until privacy manifest and physical-device validation are complete.
@@ -499,7 +512,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Persistence/cache impact:** Command metadata can be kept in memory for the composer session. Do not persist server command metadata unless a later offline UX requires it.
 - **Tests:** Command parsing, matching, sub-argument loading for models/personalities/reasoning, unsupported-command fallback, and send interception for no-echo commands.
 - **Manual simulator test plan:** Type `/`, filter commands, select `/model`, select `/reasoning`, type an unknown command, try a CLI-only command, and confirm normal non-command messages still send unchanged.
-- **Risks/open questions:** Some WebUI commands are browser/terminal/theme/voice specific and may not make sense in the native app. Do not expose destructive or server-environment commands until their behavior is verified and the owner approves the mobile UX.
+- **Boundary:** Some WebUI commands are browser/terminal/theme/voice specific and may not make sense in the native app. Do not expose destructive or server-environment commands until their behavior is verified and a selected safety contract defines the mobile UX.
 
 **Phase 9.4 implementation plan (v1.0 — saved for reference):**
 
@@ -565,7 +578,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 **Unsupported with friendly inline message:** `/terminal`, `/theme`, `/voice`, `/yolo`, `/skill`.
 
 ### Phase 10 — Read-only server panels (2–3 days)
-**Classification:** required before polish/TestFlight.
+**Classification:** required before polish/distribution.
 
 #### 10.1 Tasks page
 - **User-facing goal:** Add a Tasks row/button on the Sessions screen. Tapping it opens a read-only scheduled jobs page with job details and active status.
@@ -575,7 +588,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Persistence/cache impact:** No offline cache in v1; show normal network error state.
 - **Tests:** Cron list/status/output decoding and date formatting.
 - **Manual simulator test plan:** Open Tasks, refresh, open a job, confirm active/running status if any job is running, and confirm recent output appears.
-- **Risks/open questions:** v1 is read-only. Do not expose create/edit/run/pause/resume even though upstream endpoints exist.
+- **Risks/open questions:** The Tasks page ships create/edit/delete/run/pause/resume against the inherited generic Cron endpoints. Keep those mutations on native Hermes records and never let them touch Improvements Dream projections, which are server-owned and admission-routed (see `docs/improvements-contract.md` §6).
 
 #### 10.2 Skills page
 - **User-facing goal:** Add a Skills row/button on the Sessions screen. Tapping it opens all skills sorted by category; tapping a skill opens its detail.
@@ -595,10 +608,10 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Persistence/cache impact:** No offline cache in v1.
 - **Tests:** Missing notes/profile decoding, mtime formatting, markdown rendering.
 - **Manual simulator test plan:** Open Memory, verify My Notes and User Profile content, verify empty states if either file is empty/missing.
-- **Risks/open questions:** v1 is read-only. Do not expose `/api/memory/write` until explicitly approved.
+- **Boundary:** This screen reads the native Memory system. Improvements uses only bounded, consented excerpts and never mutates native Memory.
 
 ### Phase 11 — Limited usage analytics (1–2 days)
-**Classification:** required before polish/TestFlight, but limited scope.
+**Classification:** required before polish/distribution, but limited scope.
 
 - **User-facing goal:** Add an Insights row/button on the Sessions screen that opens a usage analytics dashboard with a timeframe picker.
 - **Upstream API/server contract to verify:** No full `/insights` REST endpoint is available in the pinned upstream source. Use `/api/sessions` token/cost fields and optional `/api/session/usage` per-session refresh.
@@ -621,12 +634,12 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - [x] VoiceOver labels for all interactive elements, including new context menus and server panels.
 - [x] Privacy strings for Photos/file import, microphone, and speech recognition where required. Camera remains deferred and is not declared.
 - [x] Privacy manifest (`PrivacyInfo.xcprivacy`) — declares no tracking, no developer-collected data, and required-reason `UserDefaults` access for app-only preferences.
-- [ ] Crash reporting? **Skip for v1** unless owner wants Firebase Crashlytics.
+- [x] Crash reporting: **Skip for v1**; a later selected issue must change the privacy and dependency contract before adding it.
 
 #### 12.1 Sessions and Settings glass polish
 - **User-facing goal:** Overhaul the Sessions screen and Settings page so they feel visually consistent with the glass-forward chat/composer direction (§2b).
 - **iOS UI changes:** Rework spacing, row density, toolbar placement, glass surfaces, empty states, Settings grouping, and navigation affordances while keeping existing Hermes actions and accessibility labels intact.
-- **Model/networking changes:** None expected. This is a UI polish pass unless the owner explicitly approves additional behavior.
+- **Model/networking changes:** None expected. This is a UI-only polish pass; behavior changes belong in a separate selected issue.
 - **Tests:** Existing sessions/settings tests should continue passing. Add focused view model tests only if behavior changes.
 - **Manual simulator test plan:** Compare Sessions, Chat, and Settings in light/dark mode; verify session create/open/search/actions still work; verify settings sign-out, default model, theme, cache, and server health actions still work.
 
@@ -649,7 +662,7 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 #### 12.4 Composer voice input
 - **User-facing goal:** The microphone button in the composer should dictate text into the draft instead of being inert.
 - **iOS UI changes:** Implement the existing mic affordance with recording/listening state, clear stop/cancel behavior, and visible error or permission guidance. Transcribed text should land in the composer draft for user review before sending.
-- **Model/networking changes:** Prefer native iOS Speech/AVFoundation APIs if feasible. Do not add third-party dependencies without explicit approval. Keep all server chat behavior unchanged; voice input only populates text.
+- **Model/networking changes:** Prefer native iOS Speech/AVFoundation APIs. A third-party dependency requires a selected issue that changes the locked stack and records why. Keep all server chat behavior unchanged; voice input only populates text.
 - **Persistence/cache impact:** Do not persist audio. Draft text follows existing composer state.
 - **Tests:** Permission/error state unit tests if the voice controller is abstracted; draft update tests for completed transcription where practical.
 - **Manual simulator/device test plan:** Verify permission prompt, dictate a short sentence, edit the transcribed draft, send it, cancel recording, and test denied-permission guidance. Full microphone verification likely needs a physical device.
@@ -664,15 +677,13 @@ Each phase ends in a working, committable state. Run on the simulator after ever
 - **Manual simulator/device test plan:** Start a response, background the app, wait for completion, confirm local notification appears, tap it, and verify the app returns to Hermes. Confirm no notification appears for foreground completion or cancelled streams.
 - **Risks/open questions:** Spec decision remains “no push notifications in v1.” This item is local iOS notification only and must be clearly scoped that way. The app uses only a finite iOS background task when notifications are enabled; it still does not keep streams alive indefinitely. Notification payloads include the `session_id` for future exact-session routing, but broad navigation refactoring was intentionally deferred.
 
-### Phase 13 — TestFlight prep (½ day)
-- [x] **Owner creates Apple Developer account** ($99/yr).
-- [x] Configure signing in Xcode for Team ID `6GYD9C9N6R`.
-- [x] Create App Store Connect app record: `Hermex`, bundle ID `com.uzairansar.hermesmobile`, SKU `hermes-mobile-ios`.
-- [x] Answer export compliance: `None of the algorithms mentioned above`; repo declares `ITSAppUsesNonExemptEncryption = NO`.
-- [x] Add internal TestFlight path for the owner first.
-- [x] Document the install/release process in `DEVELOPMENT.md`.
-- [x] Add CI/manual GitHub Actions upload workflow after the first repo-clean TestFlight setup commit.
-- [ ] Add external testers after owner verifies an internal build; first external build requires Beta App Review.
+### Phase 13 — Apple-credential-free SideStore package prep (½ day)
+- [ ] Align source/config identity to `no.gior.hermex` and app group `group.no.gior.hermex` in the dedicated identity migration slice.
+- [ ] Produce a deterministic SideStore-ready IPA from a clean checkout: archive with Apple signing disabled, then apply only local ad-hoc signatures carrying concrete entitlement intent.
+- [ ] Verify archive structure, application identity, entitlements, privacy manifest, and dependency notices without Apple credentials.
+- [ ] Publish checksums and build metadata beside the Apple-credential-free artifact.
+- [ ] Document SideStore import and downstream user signing in `DEVELOPMENT.md`.
+- [ ] Keep Apple signing certificates, provisioning profiles, account keys, and private deployment credentials out of CI and the repository.
 
 **Total estimate: ~7–8 weeks of focused part-time work after the pre-polish scope expansion.**
 
@@ -711,7 +722,7 @@ Document it as the recommended path.
 3. Find the server's tailnet IP with `tailscale ip -4`.
 4. In Hermex, enter `http://<tailnet-ip>:8787` and the password.
 
-**Caveat for the iOS app:** Tailscale exposes the server over plain HTTP, which iOS App Transport Security blocks by default. The app supports this in development by adding an ATS exception for tailnet IPs in `Info.plist`. For App Store submission, document that **Cloudflare Tunnel is the recommended setup** because it provides real TLS — App Review will flag a blanket ATS exception.
+**Caveat for the iOS app:** Tailscale exposes the server over plain HTTP, which iOS App Transport Security blocks by default. Hermex permits plain HTTP only for the `100.64.0.0/10` tailnet range. Keep that exception narrow for SideStore distribution; do not add a blanket ATS exception. **Cloudflare Tunnel remains the recommended setup** because it provides real TLS.
 
 **Pros:** zero config, encrypted via WireGuard, no public exposure.
 **Cons:** must install Tailscale on both ends; plain HTTP requires ATS exception.
@@ -722,20 +733,20 @@ Document it as the recommended path.
 
 | # | Risk | Mitigation |
 |---|---|---|
-| 1 | **Upstream API has no stability guarantees.** It's the internal API for the bundled web UI. | Pin to a known-good upstream tag; document it in README; tolerant `Codable` with optional fields. |
-| 2 | **Project moves fast** (commits daily). | Set a calendar reminder every 2 weeks to re-test against latest tag and bump if green. Any local upstream checkout may drift from GitHub if pulled/edited — verify with `git status` there before assuming a behavior is upstream. |
+| 1 | **Inherited API behavior has no stability guarantee.** It is an internal API for the bundled web UI. | Pin and test the canonical fork commit; compare inherited paths with a pinned upstream commit; use tolerant `Codable` only for genuinely additive fields. |
+| 2 | **Upstream moves fast** (commits daily). | Review drift weekly and before starting a large slice in an isolated checkout, merge deliberately into the fork, and advance `WEBUI_FORK_TESTED_SHA` only after the fork passes. Verify every local checkout with `git status` and `git log -1`. |
 | 3 | **Auth uses cookies**, not bearer tokens. | Use `URLSession`'s `HTTPCookieStorage` correctly. Don't try to bridge to `Authorization: Bearer`. |
 | 4 | **CSRF check on POSTs.** Server inspects `Origin`/`Referer` against `Host`. | Send neither header from native client → server treats as curl-equivalent and allows. |
 | 5 | **SSE not WebSocket.** | Use LDSwiftEventSource. Handle heartbeat comment lines. |
 | 6 | **Cloudflare ~100s idle timeout on free plan.** | 30s server heartbeats keep streams alive; gaps >100s with no events will cut the connection. Reconnect logic must handle this. |
-| 7 | **App Store review for "remote shell" apps** can be sensitive. | Position as "mobile client for your own developer agent server." Prior art: Blink Shell, Working Copy, Termius. |
-| 8 | **TestFlight release automation can publish unreviewed work too easily.** | Use short feature branches and only upload owner-verified `master` builds to internal TestFlight. Promote selected builds to external testers manually. |
+| 7 | **A sideloaded remote-agent client can expose powerful server actions.** | Keep explicit confirmation and server-authoritative safety boundaries for every write or execution surface. |
+| 8 | **Artifact automation can publish unreviewed work too easily.** | Use short issue branches; publish an ad-hoc entitlement-seeded SideStore IPA only from a verified release commit, with checksums and no Apple signing credentials. |
 | 9 | Server may return new SSE event types we don't handle. | Default case in event-decoding switch logs and ignores — never crash. |
 | 10 | Long agent runs may exceed iOS background time when app is backgrounded. | Don't try to keep streams alive in background for v1. On foreground, reconnect via `/api/chat/stream/status`. |
 | 11 | **The server is typically a personal machine.** If it is asleep, off, or offline, the app shows network errors. | Document in onboarding: "If you can't connect, check that your server machine is awake and your tunnel is running." Add a clear error message that distinguishes "tunnel down" (DNS resolves, connection refused) from "machine asleep" (timeout) where possible. |
 | 12 | **A local upstream checkout might be ahead of, behind, or have local modifications relative to GitHub master.** | When reading code from a local checkout, run `git status` and `git log -1` there first to know what version of the API is actually being tested against. Record that SHA in the progress log. |
 | 13 | **Edit/regenerate actions rewrite conversation history.** | Use `/api/session/truncate` only after an explicit confirmation whenever later messages will be discarded. Reload the session after mutation before continuing. |
-| 14 | **Photo/camera attachments add privacy review surface.** | Add only Apple's native pickers/camera APIs, include clear Info.plist usage strings, and verify behavior on device before TestFlight. |
+| 14 | **Photo/camera attachments add privacy review surface.** | Add only Apple's native pickers/camera APIs, include clear Info.plist usage strings, and verify behavior on device before distribution. |
 | 15 | **Limited analytics is not full `/insights` parity.** | Label Phase 11 as session-based usage analytics and do not invent an upstream insights endpoint. Replace with a server endpoint later if upstream adds one. |
 
 ---
@@ -751,35 +762,36 @@ This is the long-term maintenance plan. Implement the basics in v1.
 - [ ] Never crash on unknown JSON fields.
 
 ### 11.2 In the iOS repo
-- [ ] Add a GitHub Action (`.github/workflows/upstream-watch.yml`) that runs daily:
+- [x] Keep the GitHub Action (`.github/workflows/upstream-watch.yml`) that runs weekly:
   - Clones latest `nesquena/hermes-webui` master.
   - Diffs `api/routes.py` vs the SHA last marked "tested" in `UPSTREAM_TESTED_SHA` file.
   - If diff non-empty, opens an issue: "Upstream API drift — review needed" with the diff inline.
-- [ ] Add a "contract test" target in Xcode: spins up upstream via Docker in CI and hits each endpoint we use, asserting the JSON shape decodes. Run on every PR + nightly.
-  - **Note:** CI uses Docker because a native server setup (e.g. launchd) isn't reproducible in CI. The contract tests pin the same upstream SHA the maintainer validates against locally.
+- [ ] Add a contract-test target that starts the canonical fork commit from `WEBUI_FORK_TESTED_SHA` in CI and exercises every supported inherited and fork-owned endpoint. Run it on every relevant PR and nightly.
+  - **Note:** CI uses an isolated reproducible server checkout rather than a developer's native service. Upstream is a separate inherited-compatibility comparison against `UPSTREAM_TESTED_SHA`; it cannot satisfy the canonical product gate.
 
 ### 11.3 Cadence
-- Bi-weekly: the maintainer pulls the latest upstream in their server checkout, restarts the server, runs the app against it, and reports any breakage.
-- Tag a "tested SHA" in the iOS repo when a build passes. That's what CI's contract tests pin to.
-- Hot-fix path: if upstream introduces a breaking change, pin recommended server version in README and tell users to downgrade until app is updated.
+- Keep the app's read-only upstream remote at https://github.com/uzairansaruzi/hermex. Inspect app-upstream and inherited server drift weekly and before starting a large slice.
+- Use isolated sync branches. Review and merge selected server changes into the canonical fork, then run the app and contract suite against that fork.
+- Advance `WEBUI_FORK_TESTED_SHA` only after the exact fork commit passes. Keep `UPSTREAM_TESTED_SHA` as inherited-compatibility evidence, never product authority.
+- Hot-fix path: if an upstream change breaks inherited behavior, keep the known-good canonical fork pin and defer that upstream merge until compatibility is restored.
 
 ---
 
 ## 12. Definition of done for v1
 
 The app is "v1 done" when:
-- [ ] An internal TestFlight tester can install it and, given their server URL and password, can: log in, see their sessions, open a session, use session/message action menus, send a message with configured composer options and attachments, watch the response stream, browse workspace files, view a file, open read-only tasks/skills/memory, and view limited session-based usage analytics.
-- [ ] All §8 pre-TestFlight phases 0–12 complete.
+- [ ] A SideStore user can replace the CI ad-hoc signatures and install the IPA downstream and, given their server URL and password, can: log in, see their sessions, open a session, use session/message action menus, send a message with configured composer options and attachments, watch the response stream, browse workspace files, view a file, open referenced tasks/skills/memory, and view limited session-based usage analytics.
+- [ ] All §8 pre-distribution phases 0–12 complete.
 - [ ] Zero crashes in 30 minutes of normal use on iPhone 13 or newer running iOS 18+.
 - [ ] README documents Cloudflare Tunnel (primary) and Tailscale (alternative) setup end-to-end.
-- [ ] Contract tests pass against the upstream tag pinned in `UPSTREAM_TESTED_SHA`.
+- [ ] Contract tests must pass against the canonical fork commit pinned in `WEBUI_FORK_TESTED_SHA`. Upstream is a separate inherited-compatibility comparison and cannot substitute for the fork gate.
 - [x] No third-party dependencies beyond the locked list in §5.
 
 ---
 
 ## 13. Future / post-v1 ideas
 
-These are useful directions, not approved v1 scope. Before implementing any item here, confirm the owner wants it, check whether it changes App Store/privacy/security posture, and verify any required upstream API behavior instead of guessing.
+These are useful directions outside the locked v1 scope. Implement one only through a selected issue, make reversible product decisions autonomously, check distribution/privacy/security posture, and verify required fork API behavior instead of guessing.
 
 - **Share extension:** Accept URLs/text from Safari, Notes, Mail, Files, Photos, and similar apps, then open Hermes with a draft or import screen. Start with URL/text before richer files/images/PDFs.
 - **Live Activities:** Show glanceable status for long-running Hermes responses on the Lock Screen / Dynamic Island. Do not stream every token; show coarse status, elapsed time, and completion.
@@ -790,25 +802,27 @@ These are useful directions, not approved v1 scope. Before implementing any item
 - **Offline/cache strategy:** Decide how much transcript/workspace context should live on-device, whether extra encryption is needed beyond iOS defaults, and whether Settings needs "Clear local cache" or sensitive-session exclusions.
 - **Chat maintainability:** Continue optional focused extraction slices for `ChatView`, `ChatViewModel`, and composer/services after behavior is locked down. Keep these refactors small, test-backed, and behavior-preserving.
 - **Cloudflare Access login flow:** If the owner later puts Cloudflare Access in front of the server, design an iOS authentication flow deliberately instead of bolting it onto password auth.
-- **Dangerous admin/write actions:** Terminal, file editing/deletion, cron mutation, memory writes, skill edits, and profile create/delete are v2+ only if the mobile safety UX is explicit and owner-approved.
+- **Dangerous admin actions:** Terminal and additional generic file-editing surfaces are v2+ only through a dedicated safety contract. Native Memory remains source-owned; Improvements may retrieve only consented excerpts.
 
 ---
 
-## 14. Open questions for the human owner
+## 14. Resolved identity and external release inputs
 
-Stop and ask before guessing:
+Ordinary product decisions are autonomous. Only an active release issue may require the human-supplied identity, credentials, or irreversible publication choices listed here.
 
-1. **Repo name** for the new iOS project. ~~Default suggestion: `hermes-mobile`.~~ **Answered: `hermes-mobile`**.
-2. **Bundle ID** — **Answered:** `com.uzairansar.hermesmobile`.
-3. **App icon / branding** — **Answered:** owner supplied light and dark Hermes icon assets for v1; App Store Connect name is `Hermex`.
-4. **Crash reporting** — Firebase Crashlytics or skip for v1?
-5. **Privacy policy URL** — required for App Store. Owner needs to provide one (a simple GitHub Pages page is fine).
-6. **Default Server URL** — **Answered for current builds:** leave the field empty and show placeholder text reading `https://hermes.yourdomain.com`; the owner enters their URL once.
+1. **Repo name:** `hermex`.
+2. **Application ID:** `no.gior.hermex`; **app group:** `group.no.gior.hermex`.
+3. **App icon / branding:** owner-supplied light and dark Hermex icon assets; product/display name `Hermex`.
+4. **Crash reporting:** skipped unless a selected issue changes the privacy/dependency contract.
+5. **Privacy policy URL:** an external release input; never fabricate it or commit account credentials.
+6. **Default Server URL:** leave the field empty and show `https://hermes.yourdomain.com`; each user supplies their own URL.
 
 ---
 
 ## 15. References
 
+- Intended fork repository at the issue #14 baseline: `ebreen/hermes-webui` (not created; issue #45 owns creation and verification)
+- Tested canonical fork commit: `WEBUI_FORK_TESTED_SHA`
 - Upstream repo: https://github.com/nesquena/hermes-webui
 - Upstream `api/routes.py`: https://github.com/nesquena/hermes-webui/blob/master/api/routes.py
 - Upstream `server.py`: https://github.com/nesquena/hermes-webui/blob/master/server.py
@@ -861,7 +875,8 @@ documentation intentionally omits Kanban internals, so Hermex makes no version-r
 promise for this feature. Compatibility is capability-based and must be revalidated
 after a material upstream bridge change.
 
-The canonical rationale and evidence are:
+The inherited historical rationale and evidence from the predecessor repository are listed
+below for traceability; they are not current fork authority:
 
 - [Inventory the upstream Kanban domain and API contract](https://github.com/uzairansaruzi/hermex/issues/140)
 - [Map Kanban integration constraints in Hermex](https://github.com/uzairansaruzi/hermex/issues/141)

@@ -2,7 +2,8 @@
 
 Thanks for your interest in contributing! This document covers local setup,
 running tests, code signing for contributors, and the PR workflow. Please also
-read the [Code of Conduct](CODE_OF_CONDUCT.md).
+read the [Code of Conduct](CODE_OF_CONDUCT.md). Improvements changes must follow
+the canonical [`docs/improvements-contract.md`](docs/improvements-contract.md).
 
 ## Local setup
 
@@ -10,31 +11,44 @@ read the [Code of Conduct](CODE_OF_CONDUCT.md).
   deployment target is iOS 18).
 - Clone the repo and open `HermesMobile.xcodeproj`. Dependencies resolve
   automatically via Swift Package Manager — the dependency list is locked in
-  `PROJECT_SPEC.md`; do not add new ones without maintainer approval.
+  `PROJECT_SPEC.md`; add one only through a selected issue that changes the
+  locked stack and records why.
 - Build and run the **`HermesMobile`** scheme on an iPhone simulator
   (`iPhone 17` is the reference device; any recent iPhone simulator works).
 - To actually use the app you need your own
-  [hermes-webui](https://github.com/nesquena/hermes-webui) server — the app is
-  a client only. See the [README](README.md#you-need-your-own-server) for
+  Hermex-compatible WebUI fork. The fork is canonical for product-owned server
+  capabilities; upstream [`hermes-webui`](https://github.com/nesquena/hermes-webui)
+  remains an inherited-compatibility input. See the
+  [README](README.md#making-the-server-reachable) for
   reachable-server options (Cloudflare Tunnel, reverse proxy, Tailscale, or
   `http://localhost:8787` for simulator-only testing).
 
 ## Running tests
 
-The full XCTest suite is the repo's green bar — it must pass before any PR:
+The standard-library documentation/authority lock is the cheap first check and
+runs for every PR, including documentation-only changes:
+
+```zsh
+python3 -m unittest tests/test_fork_contract.py -v
+```
+
+The full XCTest suite is the repo's green bar for changes to app, build, test, or
+workflow code:
 
 ```zsh
 xcodebuild test -project HermesMobile.xcodeproj -scheme HermesMobile -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
 If that simulator name isn't installed, pick a nearby iPhone from
-`xcrun simctl list devices available`. The same suite runs in CI on every pull
-request with code signing disabled, so forks get green CI without any secrets.
+`xcrun simctl list devices available`. CI runs the same suite with code signing
+disabled when a pull request changes non-documentation paths; docs-only pull requests run only
+the standard-library contract lock. Forks therefore get green CI without signing secrets.
 
 ## Code signing for contributors
 
-The project's committed signing identity (`DEVELOPMENT_TEAM`, bundle IDs)
-belongs to the maintainer. **Never edit `project.pbxproj` to sign with your own
+The product identity is `Hermex`, application ID `no.gior.hermex`, and app group
+`group.no.gior.hermex`. Source/config alignment is handled by its dedicated
+identity issue. **Never edit `project.pbxproj` merely to sign with your own
 team** — override locally instead:
 
 1. Create `Config/Local.xcconfig` (it is gitignored, so it never lands in a PR):
@@ -59,25 +73,27 @@ testing breaks Keychain entitlements — use a normally-signed build for that
 
 ## What PRs we welcome (and what we don't)
 
-Bug fixes, test coverage, and focused improvements are always welcome. For
-anything larger than a small fix, **open an issue first and wait for a
-maintainer nod before writing code** — it protects your time as much as the
-review queue. Drive-by rewrites, reformat-the-world diffs, and unannounced
-architecture overhauls will be closed without detailed review.
+Bug fixes, test coverage, and focused Improvements are welcome. Start anything
+larger than a small fix from a selected issue and make reversible product
+decisions autonomously within the canonical contracts. Human input is reserved
+for unknowable identity, credentials, or irreversible external actions.
+Drive-by rewrites, reformat-the-world diffs, and unscoped architecture overhauls
+will be closed without detailed review.
 
 Keep each PR to **one logical change** with a reviewable diff. If a change is
 independently useful, it deserves its own PR.
 
 ## App bug or server bug?
 
-Hermex is a thin client over [hermes-webui](https://github.com/nesquena/hermes-webui),
-so a fair share of apparent app bugs are really server bugs. Before filing a
-bug here, reproduce it in the hermes-webui **web UI** against the same server:
+Hermex spans native iOS and its canonical WebUI fork, so apparent app bugs may
+come from either projection or server authority. Before filing a bug, reproduce
+it in the fork's **web UI** against the same server:
 
-- **Breaks in the web UI too** → it's a server bug. File it
-  [upstream](https://github.com/nesquena/hermes-webui/issues); if the app
-  should still handle it more gracefully, open an issue here that links the
-  upstream ticket (we track those with the `upstream-change` label).
+- **Breaks in the web UI too** → file it in the canonical WebUI fork. Until issue
+  [#45](https://github.com/ebreen/hermex/issues/45) initializes that repository, record
+  the blocker on #45 instead. If the behavior is inherited unchanged, also link the relevant
+  [upstream](https://github.com/nesquena/hermes-webui/issues) ticket and use the
+  `upstream-change` label.
 - **Only breaks in the app** → file it here with the bug-report form.
 
 ## PR workflow
@@ -91,9 +107,14 @@ bug here, reproduce it in the hermes-webui **web UI** against the same server:
    [`AGENTS.md`](AGENTS.md)):
    - **Tolerant decoding:** every `Codable` model uses optionals for fields the
      server might add or rename — never crash on unknown fields.
-   - **Never invent API endpoints or JSON shapes** — verify against the pinned
-     upstream `hermes-webui` source or your own running server.
-   - **No new third-party dependencies** without approval.
+   - **Never invent API endpoints or JSON shapes** — verify the running fork,
+     then version-matched fork source/docs; use upstream only for inherited
+     compatibility.
+   - **No new third-party dependencies** unless the selected issue explicitly
+     changes the locked stack and records why.
+   - **Improvements authority:** follow
+     [`docs/improvements-contract.md`](docs/improvements-contract.md); server
+     versions win and iOS remains read-only offline.
 4. **Run the full test suite** (command above) and make sure it passes.
 5. **Open a PR** against `master` using the PR template — link the issue with
    `Fixes #<number>`, describe what changed and how you tested it. CI must be
@@ -104,12 +125,13 @@ bug here, reproduce it in the hermes-webui **web UI** against the same server:
    itself built with coding agents, so it's normal context for review — not a
    gate.
 
-`master` is the protected release-candidate branch. Releases and TestFlight
-uploads (`.github/workflows/*-testflight.yml`) are maintainer-only operations —
-contributors never need App Store Connect access.
+`master` is the release-candidate branch. Protection is external repository state;
+query GitHub before relying on branch protection. Distribution will produce an
+Apple-credential-free, ad-hoc entitlement-seeded SideStore IPA. Contributors and CI never need Apple signing
+certificates, provisioning profiles, App Store Connect keys, or private
+deployment credentials; downstream users/installers provide signing.
 
 ## Questions
 
-Ask in [GitHub Discussions](https://github.com/uzairansaruzi/hermex/discussions)
-if something here is unclear or wrong — docs fixes are welcome contributions
-too.
+Open a [GitHub issue](https://github.com/ebreen/hermex/issues/new/choose) if
+something here is unclear or wrong — docs fixes are welcome contributions too.

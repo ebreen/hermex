@@ -4,8 +4,10 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for issue 
 
 ## Repository
 
-- GitHub repo: `uzairansaruzi/hermex`
-- Remote: `https://github.com/uzairansaruzi/hermex.git`
+- GitHub repo: `ebreen/hermex`
+- Remote: `https://github.com/ebreen/hermex.git`
+- Upstream remote: `https://github.com/uzairansaruzi/hermex.git` (read-only compatibility/sync input)
+- Inspect app-upstream drift weekly and before starting a large slice. Integrate it only through a reviewed `upstream-sync/YYYY-MM-DD` branch.
 
 Infer the repo from `git remote -v` when possible; `gh` does this automatically when run inside the clone.
 
@@ -33,7 +35,7 @@ GitHub Issues are the work queue; pull requests are the review and merge record.
 - Use the PR for review: GitHub/Copilot review, CI, external agent review, and human comments should live there when possible.
 - Address PR review comments by triaging them first; do not blindly accept automated review feedback.
 - Merge into `master` only after validation passes, review feedback is resolved, and the human approves.
-- Keep `master` buildable because it is the internal TestFlight candidate branch.
+- Keep `master` buildable because it is the SideStore release-candidate branch.
 
 ## Upstream Parity Tracking
 

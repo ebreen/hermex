@@ -86,8 +86,11 @@ final class OnboardingFlowTests: XCTestCase {
 
         XCTAssertTrue(prompt.contains("hermes-webui"))
         XCTAssertTrue(prompt.contains("HERMES_WEBUI_PASSWORD"))
+        XCTAssertTrue(prompt.contains("Never print the password in your reply"))
         XCTAssertTrue(prompt.contains("tailscale serve --bg 8787"))
-        XCTAssertTrue(prompt.contains("curl http://$(tailscale ip -4):8787/health"))
+        XCTAssertTrue(prompt.contains("tailscale serve status"))
+        XCTAssertTrue(prompt.contains("When using the bind-all fallback instead, curl http://$(tailscale ip -4):8787/health"))
+        XCTAssertFalse(prompt.contains("Verify it works: curl http://$(tailscale ip -4):8787/health"))
         XCTAssertTrue(prompt.contains("Do not use Cloudflare. Optimize for Tailscale + iPhone."))
         XCTAssertTrue(prompt.contains("Hermex"))
     }

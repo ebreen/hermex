@@ -1,0 +1,124 @@
+# Trusted contract validation for pull requests.
+#
+# SECURITY BOUNDARY: pull_request_target supplies the workflow and validator
+# from the trusted base commit. The candidate tree is data only. Never execute
+# a script, build, action, or hook from the candidate checkout in this job.
+
+name: Trusted Contract CI
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: trusted-contract-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: Trusted Contract Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: validator
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Check out candidate as inert data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          path: candidate
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+
+      - name: Validate candidate with trusted test manifest
+        run: |
+          set -euo pipefail
+          mapfile -t tests_entries < <(
+            git -C "${GITHUB_WORKSPACE}/candidate" ls-tree -d HEAD -- tests
+          )
+          [[ "${#tests_entries[@]}" -eq 1 ]]
+          read -r tests_mode tests_type tests_oid tests_path <<< "${tests_entries[0]}"
+          [[ "${tests_mode}" == "040000" ]]
+          [[ "${tests_type}" == "tree" ]]
+          [[ "${tests_path}" == "tests" ]]
+
+          mapfile -t validator_entries < <(
+            git -C "${GITHUB_WORKSPACE}/candidate" ls-tree HEAD -- tests/test_fork_contract.py
+          )
+          [[ "${#validator_entries[@]}" -eq 1 ]]
+          read -r validator_mode validator_type validator_oid validator_path <<< "${validator_entries[0]}"
+          [[ "${validator_mode}" == "100644" ]]
+          [[ "${validator_type}" == "blob" ]]
+          [[ "${validator_path}" == "tests/test_fork_contract.py" ]]
+          candidate_validator="${RUNNER_TEMP}/candidate-test_fork_contract.py"
+          git -C "${GITHUB_WORKSPACE}/candidate" cat-file blob "${validator_oid}" \
+            > "${candidate_validator}"
+          if ! cmp -s "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" \
+            "${candidate_validator}"; then
+            echo "The trusted contract validator changed; use the documented trust-root update procedure." >&2
+            exit 1
+          fi
+          rm -f -- "${candidate_validator}"
+          expected_count=25
+          actual_count=$(
+            PYTHONDONTWRITEBYTECODE=1 \
+              HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
+              HERMEX_CONTRACT_BASE_ROOT="${GITHUB_WORKSPACE}/validator" \
+              python3 - "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" <<'PY'
+          import importlib.util
+          import sys
+          import unittest
+
+          path = sys.argv[1]
+          spec = importlib.util.spec_from_file_location("trusted_fork_contract", path)
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load trusted contract validator")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          print(unittest.defaultTestLoader.loadTestsFromModule(module).countTestCases())
+          PY
+          )
+          if [[ "${actual_count}" != "${expected_count}" ]]; then
+            echo "Trusted validator manifest mismatch: expected ${expected_count}, found ${actual_count}." >&2
+            exit 1
+          fi
+          PYTHONDONTWRITEBYTECODE=1 \
+            HERMEX_CONTRACT_ROOT="${GITHUB_WORKSPACE}/candidate" \
+            HERMEX_CONTRACT_BASE_ROOT="${GITHUB_WORKSPACE}/validator" \
+            python3 "${GITHUB_WORKSPACE}/validator/tests/test_fork_contract.py" -v
+
+          pin_file="${GITHUB_WORKSPACE}/candidate/WEBUI_FORK_TESTED_SHA"
+          if [[ -e "${pin_file}" || -L "${pin_file}" ]]; then
+            [[ -f "${pin_file}" ]]
+            [[ ! -L "${pin_file}" ]]
+            webui_pin="$(tr -d '\r\n' < "${pin_file}")"
+            if [[ -n "${webui_pin}" ]]; then
+              [[ "${webui_pin}" =~ ^[0-9a-f]{40}$ ]]
+              verify_dir="$(mktemp -d)"
+              trap 'rm -rf -- "${verify_dir}"' EXIT
+              git -C "${verify_dir}" init --quiet
+              if ! GIT_TERMINAL_PROMPT=0 git -C "${verify_dir}" fetch --quiet --depth=1 --no-tags \
+                "https://github.com/ebreen/hermes-webui.git" "${webui_pin}"; then
+                echo "WEBUI_FORK_TESTED_SHA does not resolve to a public fork commit." >&2
+                exit 1
+              fi
+              [[ "$(git -C "${verify_dir}" rev-parse FETCH_HEAD)" == "${webui_pin}" ]]
+              [[ "$(git -C "${verify_dir}" cat-file -t FETCH_HEAD)" == "commit" ]]
+              rm -rf -- "${verify_dir}"
+              trap - EXIT
+            fi
+          fi

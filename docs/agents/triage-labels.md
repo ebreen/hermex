@@ -24,7 +24,7 @@ Apply `needs-manual-validation` sparingly: only when automated tests genuinely c
 
 | Label | Combines with | Meaning |
 | --- | --- | --- |
-| `upstream-change` | any triage role | The root cause is in hermes-webui/hermes-agent, not this app. Link the upstream issue on the ticket. As a client repo, a chunk of incoming bugs are really server bugs. |
+| `upstream-change` | any triage role | The root cause is in upstream `hermes-webui`/`hermes-agent` code, not in fork-owned behavior. Link the upstream issue on the ticket. Server-rooted defects in fork-owned server behavior are not upstream issues: record them on [issue #45](https://github.com/ebreen/hermex/issues/45) until `ebreen/hermes-webui` exists, then file them in that repository. |
 
 > **Why no `needs-response` label?** It was considered ("maintainer replied, waiting on reporter") and judged redundant: `needs-info` already means the ball is in the reporter's court. Keep `needs-info` as the single waiting-on-reporter label.
 

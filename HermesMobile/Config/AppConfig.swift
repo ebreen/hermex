@@ -1,8 +1,8 @@
 import Foundation
 
 enum AppConfig {
-    static let privacyPolicyURL = URL(staticString: "https://www.uzairansar.com/hermes-mobile/privacy")
-    static let supportURL = URL(staticString: "https://www.uzairansar.com/hermes-mobile")
+    static let privacyPolicyURL = URL(staticString: "https://github.com/ebreen/hermex/blob/master/PRIVACY.md")
+    static let supportURL = URL(staticString: "https://github.com/ebreen/hermex/issues")
 }
 
 extension URL {
