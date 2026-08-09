@@ -39,8 +39,30 @@ struct SharedImport: Equatable {
 }
 
 enum HermesShareDraft {
+    enum PendingImportAttempt: Equatable {
+        case none
+        case ready(SharedImport)
+        case unavailable
+    }
+
+    /// Effective app-group identifier for the current install: the
+    /// SideStore-remapped value when present, the configured build-time
+    /// identifier otherwise. A malformed or ambiguous SideStore remapping
+    /// throws rather than silently writing to an arbitrary container.
     static var appGroupIdentifier: String {
-        Bundle.main.object(forInfoDictionaryKey: "HermesAppGroupIdentifier") as? String
+        get throws {
+            try resolvedAppGroupIdentifier()
+        }
+    }
+
+    /// Production resolution seam with an injectable Info.plist for tests.
+    static func resolvedAppGroupIdentifier(
+        infoDictionary: [String: Any]? = Bundle.main.infoDictionary
+    ) throws -> String {
+        let resolved: String? = try HermesAppGroupResolver.effectiveAppGroupIdentifier(
+            infoDictionary: infoDictionary
+        )
+        return resolved
             ?? "group.no.gior.hermex"
     }
 
@@ -74,7 +96,37 @@ enum HermesShareDraft {
     }
 
     static func containerURL(fileManager: FileManager = .default) -> URL? {
-        fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
+        guard let appGroupIdentifier = try? HermesShareDraft.appGroupIdentifier else {
+            return nil
+        }
+        return fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
+    }
+
+    static func pendingImportAttempt(
+        infoDictionary: [String: Any]? = Bundle.main.infoDictionary,
+        fileManager: FileManager = .default
+    ) -> PendingImportAttempt {
+        let appGroupIdentifier: String
+        do {
+            appGroupIdentifier = try resolvedAppGroupIdentifier(infoDictionary: infoDictionary)
+        } catch {
+            return .unavailable
+        }
+
+        guard let directory = fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupIdentifier
+        ) else {
+            return .unavailable
+        }
+
+        do {
+            guard let sharedImport = try loadPendingImport(from: directory, fileManager: fileManager) else {
+                return .none
+            }
+            return .ready(sharedImport)
+        } catch {
+            return .unavailable
+        }
     }
 
     static func draftText(textSnippets: [String], urls: [URL]) -> String {

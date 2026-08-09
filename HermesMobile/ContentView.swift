@@ -5,6 +5,7 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(ResponseCompletionNotifications.isEnabledKey) private var isResponseCompletionNotificationsEnabled = false
     @State private var pendingSharedImport: SharedImport?
+    @State private var isShareStorageUnavailablePresented = false
     @State private var pendingDeepLinkedSessionID: String?
     @State private var pendingNewChatRequest: NewChatRequest?
     @State private var didCheckInitialPendingShare = false
@@ -38,6 +39,11 @@ struct ContentView: View {
                 // #248: the foreground pass stays silent — the in-session completion
                 // paths own notifications while the app is alive.
                 Task { await reconcileOrphanedLiveActivities(notifiesOnCompletion: false) }
+            }
+            .alert("Shared storage unavailable", isPresented: $isShareStorageUnavailablePresented) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Please try sharing again.")
             }
     }
 
@@ -119,16 +125,14 @@ struct ContentView: View {
     }
 
     private func importPendingSharedDraftIfAvailable() {
-        guard let directory = HermesShareDraft.containerURL() else {
-            return
-        }
-
-        do {
-            if let sharedImport = try HermesShareDraft.loadPendingImport(from: directory) {
-                pendingSharedImport = sharedImport
-            }
-        } catch {
+        switch HermesShareDraft.pendingImportAttempt() {
+        case .ready(let sharedImport):
+            pendingSharedImport = sharedImport
+        case .none:
+            break
+        case .unavailable:
             pendingSharedImport = nil
+            isShareStorageUnavailablePresented = true
         }
     }
 }

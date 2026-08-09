@@ -204,6 +204,29 @@ final class AppIntentNewChatInProfileTests: XCTestCase {
         XCTAssertFalse(cache.save([]), "clearing an already-empty cache is not a change")
     }
 
+    func testCacheWithoutSharedDefaultsReportsUnavailableLoadAttempt() {
+        let attempt = ProfileEntityCache(defaults: nil).loadEntitiesAttempt()
+
+        guard case .unavailable = attempt else {
+            return XCTFail("missing shared defaults must be unavailable, not an available empty cache")
+        }
+    }
+
+    func testCachedFallbackMapsUnavailableStorageToTypedActionableError() {
+        let attempt = ProfileEntityCache(defaults: nil).loadEntitiesAttempt()
+
+        XCTAssertThrowsError(try ProfileEntityProvider.cachedEntities(from: attempt)) { error in
+            guard let typedError = error as? ProfileEntityProviderError else {
+                return XCTFail("expected ProfileEntityProviderError, got \(error)")
+            }
+            XCTAssertEqual(typedError, .sharedStorageUnavailable)
+            XCTAssertEqual(
+                typedError.localizedDescription,
+                String(localized: "Shared storage is unavailable. Please try again.")
+            )
+        }
+    }
+
     /// A `ProfileEntityCache` backed by a throwaway `UserDefaults` suite so tests never touch
     /// the real app-group cache.
     private func makeIsolatedCache() -> (ProfileEntityCache, String, UserDefaults) {
