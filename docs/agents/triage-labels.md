@@ -45,3 +45,5 @@ Apply `needs-manual-validation` sparingly: only when automated tests genuinely c
 | `area:networking` | Connectivity, ATS, tunnels, Tailscale |
 
 If the GitHub repository does not yet have these labels, create them before applying them.
+
+Canary verification commit for issue #30 branch protection.
