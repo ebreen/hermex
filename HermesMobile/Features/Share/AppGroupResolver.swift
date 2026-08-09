@@ -45,8 +45,11 @@ enum HermesAppGroupResolver {
             // A normal Xcode/local build has no SideStore remapping.
             return canonicalIdentifier
         }
-        guard let groups = rawGroups as? [String], !groups.isEmpty else {
+        guard let groups = rawGroups as? [String] else {
             throw Error.malformedSideStoreGroups
+        }
+        if groups.isEmpty {
+            throw Error.unrelatedSideStoreGroups
         }
         let matching = groups.filter { $0.hasSuffix(canonicalIdentifier) }
         guard matching.count == 1 else {
