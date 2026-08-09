@@ -27,7 +27,7 @@ CANONICAL_DOCS = (
     ROOT / "CONTRIBUTING.md",
 )
 AGENT_GUIDANCE = tuple(sorted((ROOT / "docs" / "agents").glob("*.md")))
-PR_CI_EXECUTABLE_SHA256 = "7a00facbc3ad85a86af1495372b18bd40c1b8030137e16437c934526ed70c191"
+PR_CI_EXECUTABLE_SHA256 = "05609045c481858d7ca1fe483db52f11d72ec88fc061f3165ea94c48c307e2ec"
 CONTRACT_CI_EXECUTABLE_SHA256 = "962889f05c30f363ef5d75eb28f3e9dc64375da95dd8687b4d13b465442e1d23"
 UPSTREAM_WATCH_EXECUTABLE_SHA256 = "8b107d6ea011acbf886751b1827fcbd95762dcf29445d1660174c3ad256def8a"
 PROTECTED_WORKFLOW_SHA256 = {
@@ -754,7 +754,7 @@ def contract_job_bypass_findings(job: str) -> list[str]:
     """Return conditions that can let the contract job or validator step skip."""
     findings = workflow_job_shape_findings(
         job,
-        allowed_root_keys={"name", "runs-on", "timeout-minutes", "outputs", "steps"},
+        allowed_root_keys={"name", "runs-on", "timeout-minutes", "env", "outputs", "steps"},
         job_name="contract",
         expected_active_steps=2,
     )
@@ -834,6 +834,8 @@ def contract_job_bypass_findings(job: str) -> list[str]:
         "    name: Improvements contract\n"
         "    runs-on: ubuntu-latest\n"
         "    timeout-minutes: 5\n"
+        "    env:\n"
+        "      PYTHONDONTWRITEBYTECODE: '1'\n"
         "    outputs:\n"
         "      validated: ${{ steps.validate.outputs.validated }}\n"
         "    steps:\n"
@@ -1172,6 +1174,11 @@ class ForkContractTests(unittest.TestCase):
             "submission, and again between bounded batches.",
             raw_contract,
         )
+        self.assertNotRegex(
+            raw_contract,
+            r"idempotency key\. A\s+A `defer_elapsed`",
+            "doubled article before the defer_elapsed return rule",
+        )
         contract = normalize_prose(raw_contract)
         self.assert_contains_all(
             contract,
@@ -1258,6 +1265,8 @@ class ForkContractTests(unittest.TestCase):
                 "must not reject a candidate by itself",
                 "records `skipped_policy` and exactly one closed reason code",
                 "No other admission-failure state or reason is valid",
+                "`uncertain_invocation_blocked`",
+                "`queued` may become `running`, `cancelled`, `skipped_overlap`, `skipped_policy`, or `failed`",
                 "`evidence_reopened` Review Return event",
                 "resets its 180-day compaction clock",
                 "`reopens_compacted` edge",
@@ -2359,6 +2368,8 @@ If these files do not exist, proceed silently.
                 'metadata.get("changed_files")',
                 'record.get("status")',
                 'record.get("previous_filename")',
+                'if status in ("renamed", "copied"):',
+                'f"{status} record {index} has no valid previous_filename"',
                 "if len(records) != expected:",
                 "docs_only.fullmatch(path)",
             ),
@@ -2368,6 +2379,7 @@ If these files do not exist, proceed silently.
         self.assertRegex(contract_job, r"(?m)^    name: Improvements contract$")
         self.assertRegex(contract_job, r"(?m)^    runs-on: ubuntu-latest$")
         self.assertIn("    outputs:\n      validated: ${{ steps.validate.outputs.validated }}", contract_job)
+        self.assertIn("    env:\n      PYTHONDONTWRITEBYTECODE: '1'", contract_job)
         self.assertIn("        id: validate", contract_job)
         self.assertIn("          expected_count=25", contract_job)
         self.assertIn("Contract test manifest mismatch", contract_job)

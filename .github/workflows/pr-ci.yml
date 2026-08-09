@@ -81,9 +81,9 @@ jobs:
                   fail(f"record {index} has an invalid status: {status!r}")
               paths.append(filename)
               previous = record.get("previous_filename")
-              if status == "renamed":
+              if status in ("renamed", "copied"):
                   if not isinstance(previous, str) or not previous or "\x00" in previous:
-                      fail(f"renamed record {index} has no valid previous_filename")
+                      fail(f"{status} record {index} has no valid previous_filename")
                   paths.append(previous)
               elif previous is not None:
                   fail(f"non-renamed record {index} unexpectedly has previous_filename")
@@ -111,6 +111,8 @@ jobs:
     name: Improvements contract
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
     steps:

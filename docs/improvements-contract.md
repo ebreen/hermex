@@ -88,7 +88,8 @@ explainable. The sole user-visible exception is the explicit permanent Subject p
   transaction revokes it with reason `superseded`. Renewal never rewrites a terminal Grant.
 - Dream Schedule: `paused` ↔ `enabled`; validation or drift may move either to `degraded`;
   repair returns it to `paused`; `paused` or `degraded` may become terminal `archived`.
-- Dream Cycle: `queued` may become `running`, `cancelled`, `skipped_overlap`, or `skipped_policy`; `running`
+- Dream Cycle: `queued` may become `running`, `cancelled`, `skipped_overlap`, `skipped_policy`, or
+  `failed` when its lease expires before any invocation marker; `running`
   becomes one of the other terminal Cycle results. Terminal Cycles never reopen or rewrite.
 - Proposal review: `new` may become `reviewing`; a new append-only Decision may project any
   non-purged Proposal to `accepted`, `deferred`, `rejected`, or `dismissed`. Dismissal and
@@ -101,7 +102,7 @@ explainable. The sole user-visible exception is the explicit permanent Subject p
   `deferred`. When the Subject is restored to `paused`, restoration reconciliation atomically
   appends the deterministic `defer_elapsed` event for each overdue, unsuperseded Defer Decision,
   transitions its Proposal to `reviewing`, and marks that event complete exactly once. Repeated
-  reconciliation and restart replay use the Defer Decision ID as the event idempotency key. A
+  reconciliation and restart replay use the Defer Decision ID as the event idempotency key.
   A `defer_elapsed` Review Return never increments unread, accepts, creates a Handoff, or starts
   work. The separate `evidence_reopened` behavior is defined in §6.
   Proposal has no `archived`, `abandoned`, or `implemented` review state; those words belong to
@@ -311,7 +312,9 @@ configuration validation records `skipped_policy` and exactly one closed reason 
 `source_revoked`, `profile_unavailable`, `workdir_unavailable`, `toolset_unavailable`,
 `skill_unavailable`, `budget_invalid`, `retry_not_permitted`, `dependency_unavailable`,
 `provider_unavailable`, `grant_missing`, `grant_expired`, `grant_revoked`,
-`grant_scope_mismatch`, or `configuration_invalid`. It performs zero retrieval or provider egress.
+`grant_scope_mismatch`, `configuration_invalid`, or `uncertain_invocation_blocked`.
+The last code covers a fire that finds the Subject blocked by an unresolved uncertain
+invocation. Every `skipped_policy` fire performs zero retrieval or provider egress.
 No other admission-failure state or reason is valid. A losing or policy-blocked fire never queues a
 backlog. Native collapsed catch-up creates at most one `catch_up` Cycle after downtime and advances to the next
 future occurrence; it never replays every missed interval. Pausing stops future recurrence only.

@@ -30,8 +30,10 @@ for this boundary.
 The validator also carries two base-relative one-way identity ratchets. One covers inherited Apple
 Team and bundle/app-group/source-fallback values. The other covers inherited runtime owner URLs,
 the predecessor URL scheme, and the old Share/Live Activity suffixes. Both scan regular content,
-binary lines, paths, tracked `__pycache__` paths, and symlink targets; trusted Python runs with
-bytecode generation disabled. The exact base multiset is the maximum: the base-relative
+binary lines, paths, tracked `__pycache__` paths, and symlink targets. Because the identity tokens
+are folded into bytecode, trusted Python runs with bytecode generation disabled: both the ordinary
+`Improvements contract` job in `pr-ci.yml` and the trusted `contract-ci.yml` validator set
+`PYTHONDONTWRITEBYTECODE=1`, and every local bootstrap run must set it too. The exact base multiset is the maximum: the base-relative
 ratchet permits deletion but rejects copying, movement, or reintroduction. A separate atomic-state
 gate accepts only the exact issue #14 quarantine or the complete canonical issue #15 replacement;
 a partial migration fails. This lets issue #15 remove the quarantined identity without locking it in
