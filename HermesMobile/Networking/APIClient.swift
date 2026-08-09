@@ -9,6 +9,13 @@ actor APIClient {
     /// cross-origin host (#277). `nonisolated` so tests can drive the exact
     /// delegate the client installs; it is immutable and `Sendable`.
     nonisolated let redirectHeaderStripper: CrossOriginHeaderStripper
+    /// Opaque identity for this APIClient instance. It is never used as a
+    /// credential or serialized into a request.
+    nonisolated let apiClientID: UUID
+    /// Cookie identity is authoritative for the initializer branch: omitted
+    /// sessions always use the shared cookie store; injected sessions are
+    /// isolated unless a caller supplies a stable opaque token.
+    nonisolated let cookieContextID: CatalogCookieContextID
     /// Sessions this client created (vs. ones a caller injected). A `URLSession`
     /// built with a delegate keeps a strong reference to it and to itself until
     /// invalidated, so we tear these down in `deinit` to avoid leaking them — many
@@ -21,14 +28,22 @@ actor APIClient {
     /// Internal, not private, because the upload and transcribe extensions build
     /// their multipart requests by hand and need the same header injection (#61).
     let customHeaderProvider: @Sendable () -> [CustomHeader]
+    let catalogTelemetrySink: (any CatalogTelemetrySink)?
 
     init(
         baseURL: URL,
         session: URLSession? = nil,
         publicMediaSession: URLSession? = nil,
-        customHeaderProvider: @escaping @Sendable () -> [CustomHeader] = { CustomHeaderStore.shared.snapshot() }
+        customHeaderProvider: @escaping @Sendable () -> [CustomHeader] = { CustomHeaderStore.shared.snapshot() },
+        cookieContextID: CatalogCookieContextID? = nil,
+        catalogTelemetrySink: (any CatalogTelemetrySink)? = nil
     ) {
         self.baseURL = baseURL
+        self.apiClientID = UUID()
+        self.cookieContextID = session == nil
+            ? .shared
+            : (cookieContextID ?? .injected(UUID()))
+        self.catalogTelemetrySink = catalogTelemetrySink
         self.customHeaderProvider = customHeaderProvider
 
         // One redirect guard shared by both sessions (same origin + same header
@@ -133,6 +148,36 @@ actor APIClient {
     ) async throws -> Data {
         let encodedBody = try body.map { try encoder.encode($0) }
         return try await sendData(endpoint: endpoint, method: method, encodedBody: encodedBody)
+    }
+
+    /// Actor-local recursive wire decoding. Only immutable catalog projections
+    /// leave this actor; the recursive wire values remain implementation-local.
+    func decodeCatalogBaseSnapshot(
+        data: Data,
+        metadata: CatalogEventMetadata
+    ) throws -> CatalogBaseSnapshot {
+        let response = try decode(ModelsResponse.self, from: data)
+        return CatalogBaseSnapshot(
+            metadata: metadata,
+            groups: response.catalogGroups,
+            defaultModel: response.defaultModel,
+            activeProvider: response.activeProvider
+        )
+    }
+
+    /// Actor-local live decoding and merge. The input and output are Sendable
+    /// projections; the recursive response never crosses the actor boundary.
+    func decodeCatalogLiveSnapshot(
+        data: Data,
+        baseGroups: [ModelCatalogGroup],
+        metadata: CatalogEventMetadata
+    ) throws -> CatalogLiveSnapshot {
+        let response = try decode(ModelsLiveResponse.self, from: data)
+        return CatalogLiveSnapshot(
+            metadata: metadata,
+            groups: baseGroups.mergingLiveModels(from: response),
+            provider: response.normalizedProvider
+        )
     }
 
     func sendData(
