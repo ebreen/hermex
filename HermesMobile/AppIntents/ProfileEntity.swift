@@ -51,33 +51,51 @@ extension ProfileEntity {
 /// *outside* the live app (e.g. while you configure a Shortcut, possibly before the app has
 /// launched), so it can't assume a logged-in session: it tries a fresh server fetch, then
 /// falls back to the profiles the app cached on its last foreground load — so the picker is
-/// still populated when the background fetch can't authenticate. Both paths degrade to an
-/// empty list rather than throwing, which the system renders as an empty picker (#339).
+/// still populated when the background fetch can't authenticate. If shared storage is
+/// unavailable, the typed provider error is surfaced instead of silently rendering an empty
+/// picker (#339).
 struct ProfileEntityQuery: EntityQuery {
     func entities(for identifiers: [ProfileEntity.ID]) async throws -> [ProfileEntity] {
         let wanted = Set(identifiers)
-        return await ProfileEntityProvider.currentEntities().filter { wanted.contains($0.id) }
+        return try await ProfileEntityProvider.currentEntities().filter { wanted.contains($0.id) }
     }
 
     func suggestedEntities() async throws -> [ProfileEntity] {
-        await ProfileEntityProvider.currentEntities()
+        try await ProfileEntityProvider.currentEntities()
+    }
+}
+
+enum ProfileEntityProviderError: LocalizedError, Equatable {
+    case sharedStorageUnavailable
+
+    var errorDescription: String? {
+        String(localized: "Shared storage is unavailable. Please try again.")
     }
 }
 
 /// Resolves the current profile list for App Intents, live-first with a cached fallback.
 /// Kept separate from the `EntityQuery` so the fetch/cache policy is reusable (e.g. by #8).
 enum ProfileEntityProvider {
-    static func currentEntities() async -> [ProfileEntity] {
+    static func currentEntities() async throws -> [ProfileEntity] {
         // A successful fetch always mirrors into the cache: a non-empty result is stored and
         // returned, while an empty result clears the cache (the server genuinely has no
         // profiles) so a stale list can't linger. A *failed* fetch (nil) leaves the cache
-        // untouched, so a transient network/auth blip falls back to the last-known profiles
-        // instead of emptying the picker.
+        // untouched, so a transient network/auth blip falls back to the last-known profiles.
         if let live = try? await fetchLiveProfiles() {
             ProfileEntityCache.shared.save(live)
-            if !live.isEmpty { return live.compactMap(ProfileEntity.init) }
+            let entities = live.compactMap(ProfileEntity.init)
+            if !entities.isEmpty { return entities }
         }
-        return ProfileEntityCache.shared.loadEntities()
+        return try cachedEntities(from: ProfileEntityCache.shared.loadEntitiesAttempt())
+    }
+
+    static func cachedEntities(from attempt: ProfileEntityCache.LoadAttempt) throws -> [ProfileEntity] {
+        switch attempt {
+        case .available(let entities):
+            return entities
+        case .unavailable:
+            throw ProfileEntityProviderError.sharedStorageUnavailable
+        }
     }
 
     /// Best-effort live fetch against the saved server. Returns `[]` (not an error) when no
@@ -142,6 +160,11 @@ enum ProfileEntityProvider {
 /// (and #8's widgets, which run out-of-process) can populate their picker without a live,
 /// authenticated server call. The app refreshes this on every foreground profiles load.
 struct ProfileEntityCache {
+    enum LoadAttempt {
+        case available([ProfileEntity])
+        case unavailable
+    }
+
     static let shared = ProfileEntityCache()
 
     private let defaults: UserDefaults?
@@ -185,7 +208,17 @@ struct ProfileEntityCache {
     }
 
     func loadEntities() -> [ProfileEntity] {
-        loadCached().map(\.entity)
+        guard case .available(let entities) = loadEntitiesAttempt() else {
+            return []
+        }
+        return entities
+    }
+
+    func loadEntitiesAttempt() -> LoadAttempt {
+        guard defaults != nil else {
+            return .unavailable
+        }
+        return .available(loadCached().map(\.entity))
     }
 
     private func loadCached() -> [CachedProfile] {
