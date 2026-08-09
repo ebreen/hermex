@@ -7,5 +7,5 @@ sessionDefaults:
   scheme: "HermesMobile"
   configuration: "Debug"
   simulatorName: "iPhone 17"
-  bundleId: "com.uzairansar.hermesmobile"
+  bundleId: "no.gior.hermex"
 sentryDisabled: true

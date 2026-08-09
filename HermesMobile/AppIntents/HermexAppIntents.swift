@@ -2,7 +2,7 @@ import AppIntents
 import Foundation
 
 /// Bridges App Intents (which run outside the SwiftUI view tree) into the app's existing
-/// deep-link router. An intent writes a `hermes-agent://…` URL here; `ContentView` observes
+/// deep-link router. An intent writes a `hermex://…` URL here; `ContentView` observes
 /// `pendingDeepLink` and feeds it through the same `handleOpenURL` path as an external URL,
 /// so intent navigation reuses the share/session deep-link plumbing rather than inventing a
 /// parallel one (issue #337). A shared singleton is the standard bridge because the intent
