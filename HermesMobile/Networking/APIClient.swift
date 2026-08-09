@@ -11,11 +11,11 @@ actor APIClient {
     nonisolated let redirectHeaderStripper: CrossOriginHeaderStripper
     /// Opaque identity for this APIClient instance. It is never used as a
     /// credential or serialized into a request.
-    let apiClientID: UUID
+    nonisolated let apiClientID: UUID
     /// Cookie identity is authoritative for the initializer branch: omitted
     /// sessions always use the shared cookie store; injected sessions are
     /// isolated unless a caller supplies a stable opaque token.
-    let cookieContextID: CatalogCookieContextID
+    nonisolated let cookieContextID: CatalogCookieContextID
     /// Sessions this client created (vs. ones a caller injected). A `URLSession`
     /// built with a delegate keeps a strong reference to it and to itself until
     /// invalidated, so we tear these down in `deinit` to avoid leaking them — many

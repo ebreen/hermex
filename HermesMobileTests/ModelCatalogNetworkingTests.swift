@@ -563,17 +563,17 @@ private final class IsolatedCatalogURLProtocolFixture: @unchecked Sendable {
         install { request in
             switch request.url?.path {
             case "/api/profiles":
-                return Self.jsonResponse(
+                return try Self.jsonResponse(
                     #"{"profiles":[{"name":"default","isActive":true}],"active":"default","single_profile_mode":true}"#,
                     for: request
                 )
             case "/api/models":
-                return Self.jsonResponse(
+                return try Self.jsonResponse(
                     #"{"groups":[{"provider_id":"openai","name":"OpenAI","models":[{"id":"gpt-5","label":"GPT-5","nested":{"ignored":[1,true,null]}}],"extra_models":[{"id":"gpt-4o","label":"GPT-4o"}]}],"default_model":"gpt-5","active_provider":"openai"}"#,
                     for: request
                 )
             case "/api/models/live":
-                return Self.jsonResponse(
+                return try Self.jsonResponse(
                     #"{"provider":"openai","models":[{"id":"gpt-5-mini","label":"GPT-5 Mini","nested":{"ignored":true}}],"count":1}"#,
                     for: request
                 )
