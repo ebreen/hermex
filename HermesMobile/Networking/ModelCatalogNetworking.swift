@@ -127,7 +127,7 @@ enum CatalogCacheState: Equatable, Sendable {
     case coldFailed(CatalogFailureCategory)
 }
 
-enum CatalogFailureCategory: Equatable, Sendable {
+enum CatalogFailureCategory: Error, Equatable, Sendable {
     case profileUnavailable
     case profileSwitchRejected
     case profileMismatch
