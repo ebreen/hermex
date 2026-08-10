@@ -8,7 +8,7 @@ actor APIClient {
     /// process Set-Cookie or attach cookies when a custom URLProtocol is in
     /// use (Apple CustomHTTPProtocol caveat), so the reader carries the
     /// cookie itself (Hermex #19 §19).
-    private var sessionCookie: String?
+    var sessionCookie: String?
     let publicMediaSession: URLSession
     /// The redirect guard wired into both default sessions. Strips the user's
     /// custom headers when the server redirects a same-origin request to a
