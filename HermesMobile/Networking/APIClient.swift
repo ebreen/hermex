@@ -3,6 +3,12 @@ import Foundation
 actor APIClient {
     let baseURL: URL
     let session: URLSession
+    /// Session-bound login cookie captured at login time and attached
+    /// explicitly to follow-up requests. The URL loading system does not
+    /// process Set-Cookie or attach cookies when a custom URLProtocol is in
+    /// use (Apple CustomHTTPProtocol caveat), so the reader carries the
+    /// cookie itself (Hermex #19 §19).
+    var sessionCookie: String?
     let publicMediaSession: URLSession
     /// The redirect guard wired into both default sessions. Strips the user's
     /// custom headers when the server redirects a same-origin request to a
@@ -96,11 +102,26 @@ actor APIClient {
     }
 
     func login(password: String) async throws -> LoginResponse {
-        try await send(
+        // The URL loading system does not process Set-Cookie from responses
+        // delivered by a custom URLProtocol (Apple CustomHTTPProtocol caveat),
+        // so the login cookie is stored into the session's cookie storage
+        // explicitly. This keeps the session-bound profile authority working
+        // for follow-up requests (Hermex #19 §19) with any session.
+        let (data, response) = try await sendDataReturningResponse(
             endpoint: .login,
             method: "POST",
-            body: LoginRequest(password: password)
+            encodedBody: try encoder.encode(LoginRequest(password: password))
         )
+        if let setCookie = response.value(forHTTPHeaderField: "Set-Cookie") {
+            sessionCookie = setCookie
+                .split(separator: ";")
+                .first?
+                .trimmingCharacters(in: .whitespaces)
+            if let cookie = HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": setCookie], for: baseURL).first {
+                session.configuration.httpCookieStorage?.setCookie(cookie)
+            }
+        }
+        return try decode(LoginResponse.self, from: data)
     }
 
     func logout() async throws -> LoginResponse {
