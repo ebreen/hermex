@@ -855,6 +855,116 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertEqual(delegate.finishCount, 1)
     }
 
+    // MARK: - Slice 1 (#18): run identity model and connection callback fencing
+
+    // A replacement run for the SAME stream ID is a new logical generation: the
+    // run identity changes even though the stream ID does not. The first
+    // connection is callback index 0; the replacement is a second connection.
+    @MainActor
+    func testSameStreamIDReplacementCreatesNewLogicalGeneration() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        coordinator.start(streamID: "stream-123")
+        let firstIdentity = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(firstIdentity.streamID, "stream-123")
+        XCTAssertEqual(firstIdentity.logicalGeneration, 1)
+
+        // Replacement run with the SAME stream ID: new logical generation, not a
+        // continuation of the first run.
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+        XCTAssertEqual(replacementIdentity.streamID, "stream-123")
+        XCTAssertEqual(replacementIdentity.logicalGeneration, firstIdentity.logicalGeneration + 1)
+        XCTAssertNotEqual(replacementIdentity, firstIdentity)
+    }
+
+    // A token delivered through the OLD connection's retained callback (index 0)
+    // must not mutate the replacement run: no delegate/transcript append, and
+    // the replacement's identity and active stream survive untouched.
+    @MainActor
+    func testOldConnectionTokenCannotMutateReplacementRun() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        // Connection 0: first run for the stream.
+        coordinator.start(streamID: "stream-123")
+        // Connection 1: replacement run with the SAME stream ID.
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+
+        streamClient.emit(.token("stale token"), fromConnection: 0)
+
+        XCTAssertTrue(delegate.tokens.isEmpty)
+        XCTAssertEqual(coordinator.runIdentity, replacementIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(delegate.finishCount, 0)
+    }
+
+    // A late terminal `.done` from the OLD connection must not finalize the
+    // replacement: no delegate done, no completed-response callback, no Live
+    // Activity end, no finish, and the replacement run stays active.
+    @MainActor
+    func testLateOldConnectionDoneCannotFinalizeReplacementRun() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+
+        streamClient.emit(.done(DoneStreamEvent()), fromConnection: 0)
+
+        XCTAssertTrue(delegate.donePayloads.isEmpty)
+        XCTAssertTrue(delegate.completedNeedsTranscriptRefreshValues.isEmpty)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertEqual(delegate.finishCount, 0)
+        XCTAssertEqual(coordinator.runIdentity, replacementIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+    }
+
+    // A callback retained from a DIFFERENT session's connection (different
+    // stream ID) is fenced before any delegate mutation: the token never reaches
+    // the transcript and the current run is untouched.
+    @MainActor
+    func testCallbackFromWrongSessionIsIgnoredBeforeDelegateMutation() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        // Connection 0: a run in one session context.
+        coordinator.start(streamID: "stream-123")
+        // Connection 1: a different session's run (different stream ID).
+        coordinator.start(streamID: "stream-other")
+        let currentIdentity = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(currentIdentity.streamID, "stream-other")
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+
+        streamClient.emit(.token("cross-session token"), fromConnection: 0)
+
+        XCTAssertTrue(delegate.tokens.isEmpty)
+        XCTAssertEqual(coordinator.runIdentity, currentIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-other")
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertEqual(delegate.finishCount, 0)
+    }
+
     @MainActor
     private func makeCoordinator(
         streamClient: CoordinatorSpySSEStreamingClient? = nil,
@@ -1043,21 +1153,39 @@ private final class CoordinatorSpySSEStreamingClient: SSEStreamingClient {
     private(set) var startedURLs: [URL] = []
     private(set) var stopCount = 0
     private(set) var lastEventID: String?
-    private var onEvent: (@MainActor (SSEEvent) -> Void)?
+    // Slice 1 (#18): every connection retains its own callback, keyed by
+    // connection index (0 = first `start`). The fencing tests deliver events
+    // through an OLD connection's retained callback to prove the coordinator
+    // fences it before mutating the replacement run.
+    private var callbacksByConnectionIndex: [Int: @MainActor (SSEEvent) -> Void] = [:]
+
+    /// Index of the most recently started connection, or -1 before any start.
+    private(set) var latestConnectionIndex = -1
 
     func start(url: URL, onEvent: @escaping @MainActor (SSEEvent) -> Void) {
         startedURLs.append(url)
         lastEventID = nil
-        self.onEvent = onEvent
+        latestConnectionIndex += 1
+        callbacksByConnectionIndex[latestConnectionIndex] = onEvent
     }
 
     func stop() {
         stopCount += 1
     }
 
+    /// Compatibility accessor: delivers to the CURRENT (most recent) connection's
+    /// retained callback — the behavior all pre-Slice-1 tests rely on.
     func emit(_ event: SSEEvent, lastEventID: String? = nil) {
         self.lastEventID = lastEventID
-        onEvent?(event)
+        callbacksByConnectionIndex[latestConnectionIndex]?(event)
+    }
+
+    /// Delivers through the callback retained for a specific connection index
+    /// (0 = first connection). Used by the Slice 1 fencing tests to simulate a
+    /// late event arriving from an old connection.
+    func emit(_ event: SSEEvent, fromConnection connectionIndex: Int, lastEventID: String? = nil) {
+        self.lastEventID = lastEventID
+        callbacksByConnectionIndex[connectionIndex]?(event)
     }
 }
 
