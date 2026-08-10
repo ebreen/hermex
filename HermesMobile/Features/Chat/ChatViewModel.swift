@@ -208,8 +208,10 @@ private extension CatalogEvent {
             return metadata
         case let .failed(metadata, _, _):
             return metadata
-        case let .base(snapshot), let .live(snapshot):
-            return snapshot.metadata
+        case let .base(baseSnapshot):
+            return baseSnapshot.metadata
+        case let .live(liveSnapshot):
+            return liveSnapshot.metadata
         case .state:
             return nil
         }
