@@ -1459,8 +1459,10 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         // legitimate and is excluded: it published before the epoch advanced.
         events.contains { event in
             switch event {
-            case .base(let snapshot), .live(let snapshot):
-                return snapshot.metadata.operationID == operationID
+            case .base(let baseSnapshot):
+                return baseSnapshot.metadata.operationID == operationID
+            case .live(let liveSnapshot):
+                return liveSnapshot.metadata.operationID == operationID
             case .liveFailed(let metadata, _), .failed(let metadata, _, _), .finished(let metadata), .cancelled(let metadata), .contextReset(let metadata):
                 return metadata.operationID == operationID
             case .contextVerified, .state:
