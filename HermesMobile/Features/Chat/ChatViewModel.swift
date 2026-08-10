@@ -754,19 +754,30 @@ final class ChatViewModel {
     }
 
     /// Refreshes the model catalog when a picker opens: refetch `/api/models`
-    /// (so the sheet stops pinning the chat-load-time snapshot), then overlay
-    /// the active provider's live list from `/api/models/live`. Failures are
-    /// silent by design — the picker keeps whatever it already shows.
+    /// through the Networking compatibility lease (so the sheet stops pinning
+    /// the chat-load-time snapshot), then overlay the active provider's live
+    /// list from `/api/models/live`. Failures are silent by design — the
+    /// picker keeps whatever it already shows. An epoch-advanced envelope (a
+    /// profile switch raced this refresh) is discarded before state mutation.
     func refreshModelCatalogForPickerOpen() async {
-        if let response = try? await client.models() {
-            let groups = response.catalogGroups
+        if let envelope = try? await client.compatibilityModels(operationID: UUID(), operationGeneration: 1),
+           await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
+            let groups = envelope.value.groups
             if !groups.isEmpty {
                 modelCatalogGroups = groups
             }
         }
 
-        if let live = try? await client.modelsLive() {
-            modelCatalogGroups = modelCatalogGroups.mergingLiveModels(from: live)
+        if let live = try? await client.compatibilityModelsLive(operationID: UUID(), operationGeneration: 1),
+           await client.acceptsCompatibilityEpoch(gateEpoch: live.gateEpoch, gateKey: live.gateKey) {
+            // The live compatibility snapshot merges onto an empty base in
+            // this fencing slice, so an empty result keeps the cached groups;
+            // the coordinator-owned neutral surface (Slice 3/4) carries the
+            // full merged projection.
+            let liveGroups = live.value.groups
+            if !liveGroups.isEmpty {
+                modelCatalogGroups = liveGroups
+            }
         }
     }
 
