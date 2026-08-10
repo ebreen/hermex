@@ -70,45 +70,58 @@ struct ChatComposerConfigLoader {
         var configurationError: Error?
 
         do {
-            let profilesResponse = try await client.profiles()
-            state.profileOptions = profilesResponse.profiles ?? []
-            state.isSingleProfileMode = profilesResponse.singleProfileMode ?? false
-            state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                ?? Self.nonEmpty(profilesResponse.active)
-                ?? profilesResponse.effectiveDefaultProfileName
+            // Raw profile read under the Networking compatibility lease (issue
+            // #16 Slice 1). An epoch-advanced result (a concurrent profile
+            // switch) is discarded before it can mutate state; the next
+            // configuration load reconciles.
+            var selectedProfile: ProfileSummary?
+            let profilesEnvelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
+            if await client.acceptsCompatibilityEpoch(gateEpoch: profilesEnvelope.gateEpoch, gateKey: profilesEnvelope.gateKey) {
+                let profilesResponse = profilesEnvelope.value
+                state.profileOptions = profilesResponse.profiles ?? []
+                state.isSingleProfileMode = profilesResponse.singleProfileMode ?? false
+                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
+                    ?? Self.nonEmpty(profilesResponse.active)
+                    ?? profilesResponse.effectiveDefaultProfileName
 
-            if let sessionProfile = Self.nonEmpty(state.currentProfile),
-               Self.nonEmpty(profilesResponse.active) != sessionProfile {
-                let switchResponse = try await client.switchProfile(name: sessionProfile)
-                state.profileOptions = switchResponse.profiles ?? state.profileOptions
-                state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? sessionProfile
-                state.currentProfile = state.selectedProfileName
+                if let sessionProfile = Self.nonEmpty(state.currentProfile),
+                   Self.nonEmpty(profilesResponse.active) != sessionProfile {
+                    let switchResponse = try await client.switchProfile(name: sessionProfile)
+                    state.profileOptions = switchResponse.profiles ?? state.profileOptions
+                    state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? sessionProfile
+                    state.currentProfile = state.selectedProfileName
 
-                if state.currentWorkspace == nil {
-                    state.currentWorkspace = Self.nonEmpty(switchResponse.defaultWorkspace)
+                    if state.currentWorkspace == nil {
+                        state.currentWorkspace = Self.nonEmpty(switchResponse.defaultWorkspace)
+                    }
+
+                    if state.currentModel == nil {
+                        state.currentModel = Self.nonEmpty(switchResponse.defaultModel)
+                    }
                 }
 
+                selectedProfile = Self.profileSummary(
+                    matching: state.selectedProfileName,
+                    in: state.profileOptions
+                )
                 if state.currentModel == nil {
-                    state.currentModel = Self.nonEmpty(switchResponse.defaultModel)
+                    state.currentModel = Self.nonEmpty(selectedProfile?.model)
                 }
             }
 
-            let selectedProfile = Self.profileSummary(
-                matching: state.selectedProfileName,
-                in: state.profileOptions
-            )
-            if state.currentModel == nil {
-                state.currentModel = Self.nonEmpty(selectedProfile?.model)
-            }
-
-            let modelsResponse = try await client.models()
-            state.modelCatalogGroups = modelsResponse.catalogGroups
-            if state.currentModel == nil {
-                state.currentModel = modelsResponse.defaultModel
-            }
-            if Self.nonEmpty(state.currentModelProvider) == nil {
-                state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
-                    ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
+            // Base catalog under the same shared compatibility lease; an
+            // epoch-advanced result is discarded before state mutation.
+            let modelsEnvelope = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
+            if await client.acceptsCompatibilityEpoch(gateEpoch: modelsEnvelope.gateEpoch, gateKey: modelsEnvelope.gateKey) {
+                let modelsResponse = modelsEnvelope.value
+                state.modelCatalogGroups = modelsResponse.groups
+                if state.currentModel == nil {
+                    state.currentModel = modelsResponse.defaultModel
+                }
+                if Self.nonEmpty(state.currentModelProvider) == nil {
+                    state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
+                        ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
+                }
             }
 
             // Scope the query to the session's resolved model/provider so the
