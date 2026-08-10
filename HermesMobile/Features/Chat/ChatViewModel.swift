@@ -195,6 +195,27 @@ enum ActiveStreamRecoveryState: Equatable {
     case reconnecting
 }
 
+private extension CatalogEvent {
+    /// Operation metadata carried by every event except readiness
+    /// transitions (`.state`).
+    var catalogMetadata: CatalogEventMetadata? {
+        switch self {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata),
+             let .contextReset(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot), let .live(snapshot):
+            return snapshot.metadata
+        case .state:
+            return nil
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class ChatViewModel {
@@ -343,6 +364,16 @@ final class ChatViewModel {
         )
     }
     private(set) var isLoadingComposerConfiguration = false
+    /// Slice 3: the coordinator-owned catalog surface. When present, composer
+    /// configuration loads consume its ordered stream and picker opens route
+    /// through it (cache-first).
+    private let modelCatalogCoordinator: ChatModelCatalogCoordinator?
+    @ObservationIgnored private var catalogMonitorTask: Task<Void, Never>?
+    /// Readiness of the coordinator-owned catalog; `.loading` drives the
+    /// composer's model loading indicator.
+    private(set) var catalogCacheState: CatalogCacheState = .cold
+    private(set) var catalogFailureCategory: CatalogFailureCategory?
+    var isLoadingModels: Bool { catalogCacheState == .loading }
     private(set) var isUpdatingComposerConfiguration = false
     private(set) var composerConfigurationErrorMessage: String?
     var pendingAttachments: [PendingAttachment] { attachmentCoordinator.pendingAttachments }
@@ -468,6 +499,7 @@ final class ChatViewModel {
         listenAudioSession: (any ListenAudioSessionControlling)? = nil,
         listenRemoteControlCenter: (any ListenRemoteControlControlling)? = nil,
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
+        modelCatalogCoordinator: ChatModelCatalogCoordinator? = nil,
         userDefaults: UserDefaults = .standard
     ) {
         sessionID = session.sessionId
@@ -508,13 +540,29 @@ final class ChatViewModel {
         self.listenPlaybackSpeed = ListenPlaybackSpeed.stored(in: userDefaults)
         self.serverTTSAudioPlayerFactory = serverTTSAudioPlayerFactory
             ?? { try ServerTTSAudioPlayer(data: $0) }
+        self.modelCatalogCoordinator = modelCatalogCoordinator
         displayTitle = Self.displayTitle(from: session.title)
         self.streamCoordinator.attach(delegate: self)
         self.pendingActionCoordinator.delegate = self
         self.attachmentCoordinator.delegate = self
+
+        if let modelCatalogCoordinator {
+            // One ordered monitor subscription (Slice 3): applies only Sendable
+            // catalog events after authoritative coordinator/gate
+            // revalidation. The stream never retains the VM (weak self;
+            // deinit cancels the monitor task synchronously).
+            catalogMonitorTask = Task { [weak self] in
+                let stream = await modelCatalogCoordinator.subscribe()
+                for await event in stream {
+                    guard let self else { return }
+                    await self.applyCatalogEvent(event, from: modelCatalogCoordinator)
+                }
+            }
+        }
     }
 
     deinit {
+        catalogMonitorTask?.cancel()
         backgroundPollTask?.cancel()
         pendingStreamingScrollTriggerTask?.cancel()
         pendingStreamingContentFlushTask?.cancel()
@@ -736,15 +784,36 @@ final class ChatViewModel {
             needsComposerConfigurationReload = false
 
             let initialState = composerConfigurationState
-            let result = await ChatComposerConfigLoader(client: client)
+            let result: ChatComposerConfigLoadResult
+            if let modelCatalogCoordinator {
+                // Slice 3: the coordinator is the single catalog authority.
+                // The loader consumes its ordered stream (no direct profile/
+                // switch/models request); the VM monitor applies catalog events
+                // after authoritative revalidation. Subscribe before opening
+                // so no event is missed.
+                let catalogStream = await modelCatalogCoordinator.subscribe()
+                await modelCatalogCoordinator.openPicker()
+                result = await ChatComposerConfigLoader(
+                    client: client,
+                    catalogEvents: catalogStream,
+                    onCatalogReady: { @MainActor _ in }
+                )
                 .loadConfiguration(from: initialState)
+            } else {
+                result = await ChatComposerConfigLoader(client: client)
+                    .loadConfiguration(from: initialState)
+            }
 
-            guard composerConfigurationState == initialState else {
+            // Early catalog publication (groups and catalog-derived model/
+            // provider defaults) must not trigger the full reload loop:
+            // compare only the non-catalog configuration.
+            guard composerConfigurationState.nonCatalogReloadFingerprint
+                == initialState.nonCatalogReloadFingerprint else {
                 needsComposerConfigurationReload = true
                 continue
             }
 
-            applyComposerConfigurationState(result.state)
+            applyComposerConfigurationState(result.state, preservingSelectionFrom: initialState)
 
             if let error = result.configurationError {
                 lastError = error
@@ -760,6 +829,11 @@ final class ChatViewModel {
     /// picker keeps whatever it already shows. An epoch-advanced envelope (a
     /// profile switch raced this refresh) is discarded before state mutation.
     func refreshModelCatalogForPickerOpen() async {
+        if let modelCatalogCoordinator {
+            await modelCatalogCoordinator.openPicker()
+            return
+        }
+
         if let envelope = try? await client.compatibilityModels(operationID: UUID(), operationGeneration: 1),
            await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
             let groups = envelope.value.groups
@@ -800,10 +874,20 @@ final class ChatViewModel {
         )
     }
 
-    private func applyComposerConfigurationState(_ state: ChatComposerConfigState) {
+    private func applyComposerConfigurationState(
+        _ state: ChatComposerConfigState,
+        preservingSelectionFrom initialState: ChatComposerConfigState
+    ) {
+        // Preserve an explicit model/provider selection made during the load:
+        // the loader defaults only when the field was nil, so a mid-load pick
+        // must win over a stale loader default (Slice 3).
+        if currentModel == initialState.currentModel {
+            currentModel = state.currentModel
+        }
+        if currentModelProvider == initialState.currentModelProvider {
+            currentModelProvider = state.currentModelProvider
+        }
         currentWorkspace = state.currentWorkspace
-        currentModel = state.currentModel
-        currentModelProvider = state.currentModelProvider
         currentProfile = state.currentProfile
         selectedProfileName = state.selectedProfileName
         selectedReasoningEffort = state.selectedReasoningEffort
@@ -815,6 +899,47 @@ final class ChatViewModel {
         workspaceSuggestions = state.workspaceSuggestions
         profileOptions = state.profileOptions
         isSingleProfileMode = state.isSingleProfileMode
+    }
+
+    /// Cache-first picker open routed through the coordinator (Slice 3): a
+    /// fresh cache publishes without refresh, a stale cache publishes and
+    /// coalesces one refresh, and an explicit retry forces a refresh.
+    func openModelPicker() async {
+        guard let modelCatalogCoordinator else {
+            await refreshModelCatalogForPickerOpen()
+            return
+        }
+        await modelCatalogCoordinator.openPicker()
+    }
+
+    /// Applies one catalog event after authoritative revalidation. The VM
+    /// must not trust its last applied event: `accepts` rechecks the
+    /// process-global gate epoch and the current operation generation before
+    /// any event lands in MainActor state after an await.
+    private func applyCatalogEvent(_ event: CatalogEvent, from coordinator: ChatModelCatalogCoordinator) async {
+        guard let metadata = event.catalogMetadata else {
+            if case let .state(cacheState) = event {
+                catalogCacheState = cacheState
+            }
+            return
+        }
+
+        guard await coordinator.accepts(metadata) else { return }
+
+        switch event {
+        case .contextReset:
+            modelCatalogGroups = []
+        case let .base(snapshot):
+            modelCatalogGroups = snapshot.groups
+            catalogFailureCategory = nil
+        case let .live(snapshot):
+            modelCatalogGroups = snapshot.groups
+            catalogFailureCategory = nil
+        case let .failed(_, _, category), let .liveFailed(_, category):
+            catalogFailureCategory = category
+        case .contextVerified, .finished, .cancelled, .state:
+            break
+        }
     }
 
     func refreshApprovalBypassState() async {
