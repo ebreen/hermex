@@ -27,10 +27,18 @@ CANONICAL_DOCS = (
     ROOT / "CONTRIBUTING.md",
 )
 AGENT_GUIDANCE = tuple(sorted((ROOT / "docs" / "agents").glob("*.md")))
-PR_CI_EXECUTABLE_SHA256 = "05609045c481858d7ca1fe483db52f11d72ec88fc061f3165ea94c48c307e2ec"
+PR_CI_EXECUTABLE_SHA256 = "8827169d0192a57ab17cf17da65f491dae1ce8c61b0a3a774c56a8e4040ac78a"
 CONTRACT_CI_EXECUTABLE_SHA256 = "962889f05c30f363ef5d75eb28f3e9dc64375da95dd8687b4d13b465442e1d23"
 UPSTREAM_WATCH_EXECUTABLE_SHA256 = "8b107d6ea011acbf886751b1827fcbd95762dcf29445d1660174c3ad256def8a"
 IPA_TRACER_EXECUTABLE_SHA256 = "49a061d32e120074cdcea291a8b53854c5de4c91e722e79ed4b09f81afa1589b"
+FOCUSED_TEST_CLASSES = (
+    "MarkdownLargeContentTests",
+    "MarkdownMathRendererTests",
+    "StreamingMarkdownSupportTests",
+    "StreamingTextFadeTests",
+    "MessageActionContextTests",
+    "TranscriptMediaParserTests",
+)
 PROTECTED_WORKFLOW_SHA256 = {
     "contract-ci.yml": CONTRACT_CI_EXECUTABLE_SHA256,
     "ipa-tracer.yml": IPA_TRACER_EXECUTABLE_SHA256,
@@ -862,6 +870,42 @@ def contract_job_bypass_findings(job: str) -> list[str]:
     return findings
 
 
+def focused_invocation_findings(test_job: str) -> list[str]:
+    """Return ways the Build and Test job can drop, weaken, or reorder the #17 focused cases."""
+    findings: list[str] = []
+    focused_name = "Run focused issue #17 cases"
+    full_suite_name = "Test without building"
+    step_names = re.findall(r"(?m)^      - name: ([^\n]+)$", test_job)
+    if step_names.count(focused_name) != 1:
+        findings.append("Build and Test job must have exactly one focused #17 step")
+        return findings
+    if full_suite_name not in step_names:
+        findings.append("Build and Test job must keep the full-suite step")
+        return findings
+    if not (step_names.index(focused_name) < step_names.index(full_suite_name)):
+        findings.append("focused #17 step must run before the full-suite step in the same job")
+    focused_match = re.search(
+        rf"(?ms)^      - name: {re.escape(focused_name)}\n.*?(?=^      - name:|\Z)",
+        test_job,
+    )
+    if focused_match is None:
+        findings.append("focused #17 step block is missing")
+        return findings
+    focused_step = focused_match.group(0)
+    for key in ("if:", "continue-on-error:", "shell:", "working-directory:"):
+        if re.search(rf"(?m)^        {re.escape(key)}", focused_step):
+            findings.append(f"focused #17 step contains forbidden key `{key}`")
+    if "|| true" in focused_step or re.search(r"(?m)^\s*exit 0\s*$", focused_step):
+        findings.append("focused #17 step contains an explicit success bypass")
+    if "xcodebuild test-without-building" not in focused_step:
+        findings.append("focused #17 step must invoke xcodebuild test-without-building")
+    for test_class in FOCUSED_TEST_CLASSES:
+        flag = f"-only-testing:HermesMobileTests/{test_class}"
+        if flag not in focused_step:
+            findings.append(f"focused #17 step is missing required case: {flag}")
+    return findings
+
+
 def required_workflow_gate_findings(workflow: str) -> list[str]:
     """Return ways the required contract or path-correlated build gate can become inert."""
     findings: list[str] = []
@@ -985,6 +1029,9 @@ def required_workflow_gate_findings(workflow: str) -> list[str]:
     for snippet in required:
         if snippet not in gate_job:
             findings.append(f"gate is missing required check: {snippet}")
+
+    test_job = active_workflow_job(active, "test")
+    findings.extend(focused_invocation_findings(test_job))
     return findings
 
 
@@ -2454,6 +2501,21 @@ If these files do not exist, proceed silently.
         self.assertIn('if [[ "${{ needs.test.result }}" != "skipped" ]]; then', gate_job)
         self.assertNotIn("continue-on-error: true", gate_job)
         self.assertIn("          retention-days: 14", workflow)
+
+        test_job = active_workflow_job(workflow, "test")
+        self.assertIn("      - name: Run focused issue #17 cases", test_job)
+        for test_class in FOCUSED_TEST_CLASSES:
+            self.assertIn(
+                f"-only-testing:HermesMobileTests/{test_class}",
+                test_job,
+                f"Build and Test job is missing focused case: {test_class}",
+            )
+        self.assertLess(
+            test_job.index("      - name: Run focused issue #17 cases"),
+            test_job.index("      - name: Test without building"),
+            "focused #17 cases must run before the full suite in the same job",
+        )
+        self.assertEqual([], focused_invocation_findings(test_job))
         self.assertEqual(PR_CI_EXECUTABLE_SHA256, executable_workflow_sha256(workflow))
         self.assertEqual([], required_workflow_gate_findings(workflow))
 
