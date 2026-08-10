@@ -1,4 +1,5 @@
 import AppIntents
+// Canary: trust-root digest verification marker (issue #17).
 import Foundation
 
 /// An App Intents value standing in for a server profile, so an intent can take "which
