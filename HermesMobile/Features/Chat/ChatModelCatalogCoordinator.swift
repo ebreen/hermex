@@ -316,8 +316,18 @@ actor ChatModelCatalogCoordinator {
             // base/live/failed events must match.
             let contextKey: CatalogContextKey
             switch metadata.identity {
-            case let .verified(key): contextKey = key
-            case let .provisional(key): contextKey = key
+            case let .verified(key):
+                contextKey = key
+            case let .provisional(key):
+                // The provisional operation key carries the requested profile;
+                // the resolved active profile comes from the verified context.
+                contextKey = CatalogContextKey(
+                    gateKey: key.gateKey,
+                    apiClientID: key.apiClientID,
+                    authGeneration: key.authGeneration,
+                    activeProfile: context.activeProfile,
+                    gateEpoch: key.startingGateEpoch
+                )
             }
             currentOperation?.verifiedContextKey = contextKey
             currentOperation?.profileContext = context
