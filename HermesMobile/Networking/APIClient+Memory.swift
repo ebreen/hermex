@@ -31,11 +31,14 @@ extension APIClient {
 
         // With a custom URLProtocol the URL loading system does not attach
         // stored cookies automatically (Apple CustomHTTPProtocol caveat), so
-        // the session-bound login cookie is attached explicitly from the
-        // session's cookie storage (Hermex #19 §19).
-        if let cookieStorage = session.configuration.httpCookieStorage,
-           let cookies = cookieStorage.cookies(for: request.url ?? baseURL),
-           !cookies.isEmpty {
+        // the session-bound login cookie is attached explicitly. The cookie
+        // captured at login time is authoritative; the session's cookie
+        // storage is a secondary source (Hermex #19 §19).
+        if let sessionCookie {
+            request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+        } else if let cookieStorage = session.configuration.httpCookieStorage,
+                  let cookies = cookieStorage.cookies(for: request.url ?? baseURL),
+                  !cookies.isEmpty {
             let cookieHeader = cookies
                 .map { "\($0.name)=\($0.value)" }
                 .joined(separator: "; ")

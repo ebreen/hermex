@@ -3,6 +3,12 @@ import Foundation
 actor APIClient {
     let baseURL: URL
     let session: URLSession
+    /// Session-bound login cookie captured at login time and attached
+    /// explicitly to follow-up requests. The URL loading system does not
+    /// process Set-Cookie or attach cookies when a custom URLProtocol is in
+    /// use (Apple CustomHTTPProtocol caveat), so the reader carries the
+    /// cookie itself (Hermex #19 §19).
+    private var sessionCookie: String?
     let publicMediaSession: URLSession
     /// The redirect guard wired into both default sessions. Strips the user's
     /// custom headers when the server redirects a same-origin request to a
@@ -106,9 +112,14 @@ actor APIClient {
             method: "POST",
             encodedBody: try encoder.encode(LoginRequest(password: password))
         )
-        if let setCookie = response.value(forHTTPHeaderField: "Set-Cookie"),
-           let cookie = HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": setCookie], for: baseURL).first {
-            session.configuration.httpCookieStorage?.setCookie(cookie)
+        if let setCookie = response.value(forHTTPHeaderField: "Set-Cookie") {
+            sessionCookie = setCookie
+                .split(separator: ";")
+                .first?
+                .trimmingCharacters(in: .whitespaces)
+            if let cookie = HTTPCookie.cookies(withResponseHeaderFields: ["Set-Cookie": setCookie], for: baseURL).first {
+                session.configuration.httpCookieStorage?.setCookie(cookie)
+            }
         }
         return try decode(LoginResponse.self, from: data)
     }
