@@ -681,7 +681,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
     func testFourEntryLRUEvictsOnlyCompletedOldestContext() async throws {
         let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
-        let harness = makeHarness(completedContextLimit: 4, clock: { clock.now() })
+        let harness = makeHarness(clock: { clock.now() }, completedContextLimit: 4)
         let subscriber = await makeSubscriber(harness.coordinator)
 
         let profiles = ["profile-a", "profile-b", "profile-c", "profile-d", "profile-e"]
