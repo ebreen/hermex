@@ -296,7 +296,15 @@ actor ChatModelCatalogCoordinator {
         case let .provisional(key):
             guard key == op.operationKey, key.startingGateEpoch == authoritativeEpoch else { return }
         case let .verified(key):
-            guard key == op.verifiedContextKey, key.gateEpoch == authoritativeEpoch else { return }
+            // `.contextVerified` is the fence's write site: it carries the
+            // context key that later events must match. Exempt it from
+            // key-equality (the key is unknown until this very event); only
+            // the epoch authority is checked here.
+            if case .contextVerified = event {
+                guard key.gateEpoch == authoritativeEpoch else { return }
+            } else {
+                guard key == op.verifiedContextKey, key.gateEpoch == authoritativeEpoch else { return }
+            }
         }
 
         switch event {
@@ -394,7 +402,7 @@ actor ChatModelCatalogCoordinator {
             currentOperation?.isTerminal = true
             currentOperation?.pendingLive = nil
             publish(.failed(metadata, phase, category))
-            if let contextKey = op.verifiedContextKey, cache[contextKey] != nil {
+            if let contextKey = op.verifiedContextKey ?? visibleContextKey, cache[contextKey] != nil {
                 publishCachedRows(for: contextKey, metadata: metadata)
                 setState(.staleFailed)
             } else {
