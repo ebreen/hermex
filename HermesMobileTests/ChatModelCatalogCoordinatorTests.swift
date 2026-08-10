@@ -680,11 +680,16 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
     // MARK: - LRU cache policy
 
     func testFourEntryLRUEvictsOnlyCompletedOldestContext() async throws {
-        let harness = makeHarness(completedContextLimit: 4)
+        let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let harness = makeHarness(completedContextLimit: 4, clock: { clock.now() })
         let subscriber = await makeSubscriber(harness.coordinator)
 
         let profiles = ["profile-a", "profile-b", "profile-c", "profile-d", "profile-e"]
         for (index, profile) in profiles.enumerated() {
+            // Advance past the freshness window so each open takes the
+            // stale-refresh path and starts a provider call (a fresh hit
+            // would republish the cache without calling the provider).
+            clock.advance(by: 300)
             await harness.coordinator.openPicker()
             await harness.provider.waitForCallCount(index + 1)
             completeOperation(
@@ -703,6 +708,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
         // Five completed contexts against a four-entry limit: the oldest
         // (profile-a) must be evicted, so its next open refetches.
+        clock.advance(by: 300)
         await harness.coordinator.openPicker()
         await harness.provider.waitForCallCount(6)
         XCTAssertEqual(harness.provider.callCount(), 6, "the oldest completed context is evicted and must refetch")
