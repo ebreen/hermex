@@ -118,6 +118,7 @@ enum Endpoint {
     case kanbanRemoveDependency(KanbanDependencyMutationRequest)
     case memory
     case memoryWrite
+    case memoryRaw(source: MemoryRawSource, sessionID: String?)
     case skills
     case skillContent(name: String, file: String?)
     case toggleSkill
@@ -359,6 +360,8 @@ enum Endpoint {
             return "/api/memory"
         case .memoryWrite:
             return "/api/memory/write"
+        case .memoryRaw:
+            return "/api/memory/raw"
         case .skills:
             return "/api/skills"
         case .skillContent:
@@ -518,6 +521,14 @@ enum Endpoint {
             var items = [URLQueryItem(name: "name", value: name)]
             if let file {
                 items.append(URLQueryItem(name: "file", value: file))
+            }
+            return items
+        case let .memoryRaw(source, sessionID):
+            var items = [URLQueryItem(name: "source", value: source.wireValue)]
+            // A session_id is only meaningful for the project_context selector
+            // and is never sent for the other fixed sources (#19).
+            if source == .projectContext, let sessionID {
+                items.append(URLQueryItem(name: "session_id", value: sessionID))
             }
             return items
         default:
