@@ -309,7 +309,16 @@ actor ChatModelCatalogCoordinator {
 
         switch event {
         case let .contextVerified(metadata, context):
-            guard case let .verified(contextKey) = metadata.identity else { return }
+            // Production emits `.contextVerified` with provisional identity
+            // (catalogProvisionalMetadata, ModelCatalogNetworking.swift:867);
+            // scripted tests may use verified. Either way this event is the
+            // fence's write site: it establishes the context key that later
+            // base/live/failed events must match.
+            let contextKey: CatalogContextKey
+            switch metadata.identity {
+            case let .verified(key): contextKey = key
+            case let .provisional(key): contextKey = key
+            }
             currentOperation?.verifiedContextKey = contextKey
             currentOperation?.profileContext = context
             if let visible = visibleContextKey, visible != contextKey {

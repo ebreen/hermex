@@ -124,6 +124,10 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             operationGeneration: call.operationGeneration
         )
 
+        // Production always emits `.contextVerified` before base/live children
+        // (ModelCatalogNetworking.swift:990), so the verified context key is
+        // established before the out-of-order live arrives.
+        call.continuation.yield(.contextVerified(metadata, makeProfileContext(activeProfile: "default")))
         // Out-of-order live arrives first: it must be buffered, never published
         // as a live-only snapshot.
         call.continuation.yield(.live(makeLiveSnapshot(metadata: metadata, groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5-mini"])], provider: "openai")))
@@ -460,7 +464,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             return false
         })
         let freshIndex = try XCTUnwrap(events.firstIndex { event in
-            if case let .base(snapshot) = event, snapshot.groups.map(\.id) != ["openai"] { return true }
+            if case let .base(snapshot) = event, snapshot.groups.flatMap(\.models).map(\.id) == ["gpt-5", "gpt-4o"] { return true }
             return false
         })
         XCTAssertLessThan(staleIndex, freshIndex, "stale rows are published before the refresh lands")
