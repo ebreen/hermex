@@ -1056,8 +1056,13 @@ struct SettingsView: View {
         }
 
         do {
-            let catalog = try await client.models()
-            defaultModel = catalog.defaultModel
+            // Base catalog under the Networking compatibility lease (issue #16
+            // Slice 1); an epoch-advanced result is discarded before state
+            // mutation.
+            let catalog = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
+            if await client.acceptsCompatibilityEpoch(gateEpoch: catalog.gateEpoch, gateKey: catalog.gateKey) {
+                defaultModel = catalog.value.defaultModel
+            }
         } catch {
             // Non-fatal: default model is optional info
             defaultModel = nil
@@ -1066,9 +1071,12 @@ struct SettingsView: View {
         isLoadingDefaultModel = false
 
         do {
-            let profiles = try await client.profiles()
-            defaultProfileName = profiles.effectiveDefaultProfileName
-            defaultProfileDisplayName = profiles.displayName(for: defaultProfileName)
+            let profilesEnvelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
+            if await client.acceptsCompatibilityEpoch(gateEpoch: profilesEnvelope.gateEpoch, gateKey: profilesEnvelope.gateKey) {
+                let profiles = profilesEnvelope.value
+                defaultProfileName = profiles.effectiveDefaultProfileName
+                defaultProfileDisplayName = profiles.displayName(for: defaultProfileName)
+            }
         } catch {
             // Non-fatal: default profile is optional info
             defaultProfileName = nil
