@@ -31,6 +31,14 @@ struct ChatStreamLoadPreparation: Equatable {
     let shouldPrepareSuspendedStreamResume: Bool
 }
 
+/// Identity of one logical run of a chat stream. A replacement run for the
+/// same stream ID is a new logical generation: the identity changes even
+/// though the stream ID does not (#18 Slice 1).
+struct ChatRunIdentity: Equatable {
+    let streamID: String
+    let logicalGeneration: Int
+}
+
 @MainActor
 protocol ChatStreamCoordinatorDelegate: AnyObject {
     var streamCoordinatorSessionID: String? { get }
@@ -103,6 +111,17 @@ final class ChatStreamCoordinator {
     // double-finalized (PR #266 review #2).
     private var runGeneration = 0
 
+    /// The current logical run identity, or nil while no run is active.
+    /// Derived from the active stream ID and the run-generation counter so it
+    /// stays consistent with every start/finalize transition. Each connection
+    /// captures its own identity at creation; a callback whose captured
+    /// identity no longer matches this value is fenced before any mutation
+    /// (#18 Slice 1).
+    var runIdentity: ChatRunIdentity? {
+        guard let activeStreamID else { return nil }
+        return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
+    }
+
     init(
         client: APIClient,
         streamClient: SSEStreamingClient,
@@ -144,6 +163,7 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
+        let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
         activeStreamID = streamID
         isConnectionSuspended = false
         if replayAfterSeq == nil {
@@ -161,7 +181,14 @@ final class ChatStreamCoordinator {
                 replayAfterSeq: replayAfterSeq
             )
         ) { [weak self] event in
-            self?.handle(event)
+            // Connection-generation fencing (#18 Slice 1): every connection
+            // captures the identity of the run it was opened for. A callback
+            // delivered by a superseded connection (older logical generation,
+            // or a different stream's run) returns BEFORE any delegate,
+            // live-activity, transcript, or terminal mutation — a late event
+            // from an old connection can never mutate the replacement run.
+            guard let self, self.runIdentity == connectionIdentity else { return }
+            self.handle(event)
         }
         delegate?.streamCoordinatorStartAuxiliaryMonitoring()
     }
