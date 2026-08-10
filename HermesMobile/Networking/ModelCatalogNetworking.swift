@@ -1303,11 +1303,12 @@ private final class CatalogBaseGroupsBox: @unchecked Sendable {
     }
 }
 
-/// Weak task handle so an operation-level gate registration can synchronously
-/// cancel the stream task without capturing it during its own initialization.
+/// Strong task handle so an operation-level gate registration can synchronously
+/// cancel the stream task. The box is owned by the stream task itself, so the
+/// handle never outlives the task; there is no retain cycle to break with weak.
 private final class CatalogTaskCancellationBox: @unchecked Sendable {
     private let lock = NSLock()
-    private weak var task: Task<Void, Never>?
+    private var task: Task<Void, Never>?
 
     func attach(_ task: Task<Void, Never>) {
         lock.lock()
