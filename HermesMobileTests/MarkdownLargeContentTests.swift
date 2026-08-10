@@ -354,15 +354,15 @@ final class MarkdownLargeContentTests: XCTestCase {
         )
 
         // Fixture B: CR/LF split across the append boundary. Logical-line counts are NOT
-        // additive across the split (CRLF is one line ending: 2 + 1 != 2); UTF-8 stays additive.
+        // additive across the split (CRLF is one line ending: 2 + 2 != 2); UTF-8 stays additive.
         let crlfIdentity = MarkdownStreamIdentity(opaqueValue: "slice-a-append-crlf")
         let crPriorSource = "alpha\r"
         let lfAppendedSource = "\nbeta"
         let crlfCombinedSource = "alpha\r\nbeta"
         XCTAssertEqual(lockedLineCount(of: crPriorSource), 2)
-        XCTAssertEqual(lockedLineCount(of: lfAppendedSource), 1)
+        XCTAssertEqual(lockedLineCount(of: lfAppendedSource), 2)
         XCTAssertEqual(lockedLineCount(of: crlfCombinedSource), 2)
-        XCTAssertNotEqual(2 + 1, lockedLineCount(of: crlfCombinedSource))
+        XCTAssertNotEqual(2 + 2, lockedLineCount(of: crlfCombinedSource))
         XCTAssertEqual(crPriorSource.utf8.count + lfAppendedSource.utf8.count, crlfCombinedSource.utf8.count)
 
         let crPrior = makeSnapshot(
@@ -586,7 +586,7 @@ final class MarkdownLargeContentTests: XCTestCase {
             ("\u{1F1F3}\u{1F1F4}", 3, 1, 1), // regional indicator pair
             ("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}", 4, 1, 1), // ZWJ family
             ("alpha\r", 5, 6, 2), // CR trailing separator
-            ("alpha\r\nbeta", 6, 11, 2), // CRLF is one line ending (CR/LF split across appends)
+            ("alpha\r\nbeta", 6, 10, 2), // CRLF is one line ending and one grapheme cluster (10 Characters, 11 UTF-8 bytes)
             ("line one\nline two\n", 7, 18, 3), // trailing LF counts a line
         ]
 
