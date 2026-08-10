@@ -7341,8 +7341,10 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertFalse(
             events.contains { event in
                 switch event {
-                case let .base(snapshot), let .live(snapshot):
-                    return snapshot.metadata.operationID == callA.operationID
+                case let .base(baseSnapshot):
+                    return baseSnapshot.metadata.operationID == callA.operationID
+                case let .live(liveSnapshot):
+                    return liveSnapshot.metadata.operationID == callA.operationID
                 case let .contextVerified(metadata, _),
                      let .liveFailed(metadata, _),
                      let .finished(metadata),
