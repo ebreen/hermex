@@ -251,13 +251,13 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertEqual(callers.count, 7, "Slice 0 permits seven legacy production callers")
 
         let expectedLocations: Set<String> = [
-            "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift:104",
-            "HermesMobile/Features/Chat/ChatViewModel.swift:761",
-            "HermesMobile/Features/Chat/ChatViewModel.swift:768",
-            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:199",
-            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:215",
-            "HermesMobile/Features/Settings/DefaultProfilePickerView.swift:458",
-            "HermesMobile/Features/Settings/SettingsView.swift:1059",
+            "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift:114",
+            "HermesMobile/Features/Chat/ChatViewModel.swift:763",
+            "HermesMobile/Features/Chat/ChatViewModel.swift:771",
+            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:200",
+            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:221",
+            "HermesMobile/Features/Settings/DefaultProfilePickerView.swift:468",
+            "HermesMobile/Features/Settings/SettingsView.swift:1062",
             "HermesMobile/Networking/APIClient+ServerPanels.swift:4",
             "HermesMobile/Networking/APIClient+ServerPanels.swift:11"
         ]
@@ -1479,7 +1479,13 @@ final class ModelCatalogNetworkingTests: XCTestCase {
     }
 
     private func legacyCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
-        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|func (models|modelsLive)\(\)"#)
+        // Slice 1 routing swapped the seven production typed calls for the
+        // Networking compatibility adapters one-for-one in the same files.
+        // The frozen inventory contract is count/location equality (nine
+        // matches: two compatibility definitions + seven production sites);
+        // it must never GROW. Slice 4 alone proves zero production typed
+        // callers and deletes the typed methods.
+        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|\.compatibilityModels(Live)?\([^)]*\)|func (models|modelsLive)\(\)"#)
         let appRoot = root.appendingPathComponent("HermesMobile", isDirectory: true)
         let fileManager = FileManager.default
         let relativePaths = (fileManager.subpaths(atPath: appRoot.path) ?? [])
