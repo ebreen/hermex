@@ -244,6 +244,176 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         XCTAssertNil(result.configurationError)
         XCTAssertTrue(result.state.isSingleProfileMode)
     }
+
+    @MainActor
+    func testCatalogPublicationPrecedesReasoningWhileUnrelatedOrderRemains() async throws {
+        let openRouterModel = "deepseek/deepseek-chat-v3-0324:free"
+        var requestPaths: [String] = []
+        // The reasoning response is held until the catalog-ready callback has
+        // fired: the loader must publish the parsed/defaulted catalog before
+        // it awaits reasoning (Slice 3).
+        let releaseReasoning = DispatchSemaphore(value: 0)
+        var reasoningResponseDelivered = false
+        var catalogReadyCount = 0
+        var catalogReadySnapshot: CatalogBaseSnapshot?
+        var readyContinuation: CheckedContinuation<Void, Never>?
+
+        let client = makeClient { request in
+            switch request.url?.path {
+            case "/api/profiles":
+                requestPaths.append("/api/profiles")
+                return apiTestJSONResponse("""
+                {
+                  "active": "default",
+                  "profiles": [
+                    {"name": "default", "is_active": true}
+                  ],
+                  "single_profile_mode": true
+                }
+                """, for: request)
+            case "/api/models":
+                requestPaths.append("/api/models")
+                return apiTestJSONResponse("""
+                {
+                  "default_model": "\(openRouterModel)",
+                  "active_provider": "openrouter",
+                  "groups": [
+                    {
+                      "name": "OpenRouter",
+                      "provider_id": "openrouter",
+                      "models": [
+                        {"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}
+                      ]
+                    }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                requestPaths.append("/api/models/live")
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [
+                    {"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}
+                  ]
+                }
+                """, for: request)
+            case "/api/reasoning":
+                XCTAssertEqual(releaseReasoning.wait(timeout: .now() + 5), .success)
+                requestPaths.append("/api/reasoning")
+                reasoningResponseDelivered = true
+                return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
+            case "/api/workspaces":
+                requestPaths.append("/api/workspaces")
+                return apiTestJSONResponse(#"{"workspaces": [{"path": "/tmp/workspace"}]}"#, for: request)
+            case "/api/commands":
+                requestPaths.append("/api/commands")
+                return apiTestJSONResponse(#"{"commands": [{"name": "status", "description": "Show status"}]}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        // The Slice 2 coordinator is the single catalog authority: its ordered
+        // stream carries the neutral base/live projections. The loader consumes
+        // that stream and must make no direct profile/switch request.
+        let gateKey = ProfileContextGateKey(
+            origin: NormalizedServerOrigin(
+                scheme: "https",
+                host: "loader-catalog-\(UUID().uuidString.lowercased()).test",
+                port: 443
+            ),
+            cookieContextID: CatalogCookieContextID.injected(UUID())
+        )
+        let coordinator = ChatModelCatalogCoordinator(
+            gateKey: gateKey,
+            apiClientID: UUID(),
+            authGeneration: 0,
+            provider: { requestedProfile, operationID, operationGeneration in
+                client.modelCatalogStream(
+                    requestedProfile: requestedProfile,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            },
+            configuration: ChatModelCatalogCoordinator.Configuration(
+                now: { Date(timeIntervalSince1970: 1_700_000_000) },
+                freshnessInterval: 300,
+                completedContextLimit: 4,
+                telemetrySink: nil
+            )
+        )
+
+        // Intended Slice 3 seam: a narrow @MainActor @Sendable onCatalogReady
+        // callback carrying only the Sendable base projection.
+        let loader = ChatComposerConfigLoader(
+            client: client,
+            catalogEvents: coordinator.subscribe(),
+            onCatalogReady: { @MainActor snapshot in
+                catalogReadyCount += 1
+                catalogReadySnapshot = snapshot
+                readyContinuation?.resume()
+                readyContinuation = nil
+            }
+        )
+
+        let loadTask = Task {
+            await loader.loadConfiguration(from: ChatComposerConfigState())
+        }
+        await coordinator.openPicker()
+
+        // Catalog-ready must be visible while the reasoning response is still
+        // held: publication precedes the reasoning await.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if catalogReadyCount > 0 {
+                continuation.resume()
+            } else {
+                readyContinuation = continuation
+            }
+        }
+        XCTAssertEqual(catalogReadyCount, 1, "onCatalogReady must fire exactly once")
+        XCTAssertEqual(catalogReadySnapshot?.defaultModel, openRouterModel)
+        XCTAssertFalse(
+            reasoningResponseDelivered,
+            "catalog must be published before the reasoning response is released"
+        )
+
+        releaseReasoning.signal()
+        let result = await loadTask.value
+
+        XCTAssertNil(result.configurationFailure)
+        XCTAssertEqual(result.state.profileOptions.map(\.name), ["default"])
+        XCTAssertEqual(result.state.selectedProfileName, "default")
+        XCTAssertTrue(result.state.isSingleProfileMode)
+        XCTAssertEqual(result.state.currentModel, openRouterModel)
+        XCTAssertEqual(result.state.currentModelProvider, "openrouter")
+        XCTAssertEqual(result.state.modelCatalogGroups.map(\.providerID), ["openrouter"])
+        XCTAssertEqual(result.state.selectedReasoningEffort, "medium")
+        XCTAssertEqual(result.state.workspaceSuggestions, ["/tmp/workspace"])
+        XCTAssertEqual(result.state.agentCommands.map(\.name), ["status"])
+
+        // Exactly one profiles/switch/base phase and no duplicate full load:
+        // the loader itself performs zero direct profile/switch calls.
+        XCTAssertEqual(requestPaths.filter { $0 == "/api/profiles" }.count, 1)
+        XCTAssertEqual(requestPaths.filter { $0 == "/api/profile/switch" }.count, 0)
+        XCTAssertEqual(requestPaths.first, "/api/profiles")
+        XCTAssertEqual(Set(requestPaths).count, requestPaths.count, "no duplicate request path in one load")
+        let catalogPaths: Set<String> = ["/api/models", "/api/models/live"]
+        let catalogIndexes = requestPaths.indices.filter { catalogPaths.contains(requestPaths[$0]) }
+        XCTAssertEqual(catalogIndexes.count, 2, "both neutral base and live projections arrive")
+        let reasoningIndex = try XCTUnwrap(requestPaths.firstIndex(of: "/api/reasoning"))
+        XCTAssertLessThan(
+            catalogIndexes.max() ?? 0,
+            reasoningIndex,
+            "both base/live projections precede reasoning"
+        )
+        XCTAssertEqual(
+            Array(requestPaths[reasoningIndex...]),
+            ["/api/reasoning", "/api/workspaces", "/api/commands"],
+            "reasoning → workspaces → commands order is preserved"
+        )
+    }
 }
 
 /// Pure gating logic for the composer reasoning-effort menu (issue #18):

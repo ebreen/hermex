@@ -7173,6 +7173,7 @@ final class ChatViewModelSendTests: XCTestCase {
         listenRemoteControlCenter: (any ListenRemoteControlControlling)? = nil,
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
         userDefaults: UserDefaults = .standard,
+        modelCatalogCoordinator: ChatModelCatalogCoordinator? = nil,
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
     ) throws -> ChatViewModel {
         MockURLProtocol.requestHandler = handler
@@ -7205,6 +7206,7 @@ final class ChatViewModelSendTests: XCTestCase {
             listenAudioSession: listenAudioSession ?? SpyListenAudioSession(),
             listenRemoteControlCenter: listenRemoteControlCenter ?? SpyListenRemoteControlCenter(),
             serverTTSAudioPlayerFactory: serverTTSAudioPlayerFactory,
+            modelCatalogCoordinator: modelCatalogCoordinator,
             userDefaults: userDefaults
         )
 
@@ -7226,6 +7228,226 @@ final class ChatViewModelSendTests: XCTestCase {
 
             try await Task.sleep(nanoseconds: 50_000_000)
         }
+    }
+
+    /// A profile switch advances the gate epoch while operation A's live
+    /// completion is still queued at the wire. Releasing the stale completion
+    /// afterwards must not reach VM state: the VM revalidates with
+    /// `await coordinator.accepts(eventMetadata)` before applying any event
+    /// after an await (Slice 3).
+    @MainActor
+    func testVMQueriesAuthoritativeEpochBeforeApply() async throws {
+        let gateKey = ProfileContextGateKey(
+            origin: NormalizedServerOrigin(
+                scheme: "https",
+                host: "vm-catalog-\(UUID().uuidString.lowercased()).test",
+                port: 443
+            ),
+            cookieContextID: CatalogCookieContextID.injected(UUID())
+        )
+        let apiClientID = UUID()
+        let provider = ScriptedCatalogProvider()
+        let coordinator = ChatModelCatalogCoordinator(
+            gateKey: gateKey,
+            apiClientID: apiClientID,
+            authGeneration: 0,
+            provider: provider.makeProvider(),
+            configuration: ChatModelCatalogCoordinator.Configuration(
+                now: { Date(timeIntervalSince1970: 1_700_000_000) },
+                freshnessInterval: 300,
+                completedContextLimit: 4,
+                telemetrySink: nil
+            )
+        )
+
+        // The VM's catalog phase consumes only the coordinator's ordered
+        // stream: any direct profile/switch/model request fails the fixture.
+        let viewModel = try makeViewModel(
+            modelCatalogCoordinator: coordinator,
+            handler: { request in
+                switch request.url?.path {
+                case "/api/reasoning":
+                    return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
+                case "/api/workspaces":
+                    return apiTestJSONResponse(#"{"workspaces": [{"path": "/tmp/workspace"}]}"#, for: request)
+                case "/api/commands":
+                    return apiTestJSONResponse(#"{"commands": []}"#, for: request)
+                default:
+                    XCTFail("VM catalog load must not issue a direct request: \(request.url?.path ?? "nil")")
+                    throw URLError(.badURL)
+                }
+            }
+        )
+
+        // A test-side subscriber sees exactly what the VM's monitor sees.
+        let stream = await coordinator.subscribe()
+        let collector = CatalogEventCollector()
+        let subscriberTask = Task { for await event in stream { collector.append(event) } }
+        defer { subscriberTask.cancel() }
+
+        // Operation A verifies under epoch 0 and publishes its base; its live
+        // completion stays queued.
+        let loadTask = Task { await viewModel.loadComposerConfiguration() }
+        await provider.waitForCallCount(1)
+        let callA = provider.call(0)
+        let metadataA = Self.verifiedCatalogMetadata(
+            gateKey: gateKey,
+            apiClientID: apiClientID,
+            activeProfile: "default",
+            gateEpoch: 0,
+            operationID: callA.operationID,
+            operationGeneration: callA.operationGeneration
+        )
+        callA.continuation.yield(.contextVerified(metadataA, Self.makeCatalogProfileContext(activeProfile: "default")))
+        callA.continuation.yield(.base(Self.makeCatalogBaseSnapshot(metadata: metadataA, groups: [Self.makeCatalogGroup(providerID: "openai", modelIDs: ["gpt-5"])], defaultModel: "gpt-5", activeProvider: "openai")))
+        await loadTask.value
+        XCTAssertEqual(viewModel.modelCatalogGroups.map(\.providerID), ["openai"])
+
+        // The profile switch completes (gate epoch advances); the picker
+        // reopens and operation B supersedes A under the new epoch.
+        try await advanceGateEpoch(gateKey: gateKey)
+        await viewModel.openModelPicker()
+        await provider.waitForCallCount(2)
+        let callB = provider.call(1)
+        let metadataB = Self.verifiedCatalogMetadata(
+            gateKey: gateKey,
+            apiClientID: apiClientID,
+            activeProfile: "work",
+            gateEpoch: 1,
+            operationID: callB.operationID,
+            operationGeneration: callB.operationGeneration
+        )
+
+        // Release operation A's stale completion now: it must never publish
+        // after the switch epoch, so neither coordinator nor VM applies it.
+        callA.continuation.yield(.live(Self.makeCatalogLiveSnapshot(metadata: metadataA, groups: [Self.makeCatalogGroup(providerID: "openai", modelIDs: ["gpt-5-mini"])], provider: "openai")))
+        callA.continuation.yield(.finished(metadataA))
+        callA.continuation.finish()
+
+        // The new context becomes visible: a context reset precedes its rows.
+        callB.continuation.yield(.contextVerified(metadataB, Self.makeCatalogProfileContext(activeProfile: "work")))
+        callB.continuation.yield(.base(Self.makeCatalogBaseSnapshot(metadata: metadataB, groups: [Self.makeCatalogGroup(providerID: "anthropic", modelIDs: ["claude-4"])], defaultModel: "claude-4", activeProvider: "anthropic")))
+        callB.continuation.yield(.live(Self.makeCatalogLiveSnapshot(metadata: metadataB, groups: [Self.makeCatalogGroup(providerID: "anthropic", modelIDs: ["claude-4-mini"])], provider: "anthropic")))
+        callB.continuation.yield(.finished(metadataB))
+        callB.continuation.finish()
+
+        await collector.waitUntil { event in
+            if case let .live(snapshot) = event, snapshot.metadata.operationID == callB.operationID { return true }
+            return false
+        }
+        try await waitUntil { viewModel.modelCatalogGroups.map(\.providerID) == ["anthropic"] }
+
+        let events = collector.snapshot()
+        XCTAssertFalse(
+            events.contains { event in
+                switch event {
+                case let .base(snapshot), let .live(snapshot):
+                    return snapshot.metadata.operationID == callA.operationID
+                case let .contextVerified(metadata, _),
+                     let .liveFailed(metadata, _),
+                     let .finished(metadata),
+                     let .cancelled(metadata),
+                     let .contextReset(metadata):
+                    return metadata.operationID == callA.operationID
+                case let .failed(metadata, _, _):
+                    return metadata.operationID == callA.operationID
+                case .state:
+                    return false
+                }
+            },
+            "no event from the superseded operation A may reach the VM after the switch epoch"
+        )
+        XCTAssertEqual(
+            viewModel.modelCatalogGroups.map(\.providerID),
+            ["anthropic"],
+            "the VM must not apply a stale base/live completion after the switch epoch"
+        )
+    }
+
+    private func advanceGateEpoch(gateKey: ProfileContextGateKey) async throws {
+        let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
+        let writerID = UUID()
+        let admission = try await gate.acquireWriter(operationID: writerID)
+        await gate.advanceEpoch(operationID: writerID)
+        await gate.releaseWriter(operationID: writerID, admission: admission)
+    }
+
+    private static func verifiedCatalogMetadata(
+        gateKey: ProfileContextGateKey,
+        apiClientID: UUID,
+        activeProfile: String,
+        gateEpoch: UInt64,
+        operationID: UUID,
+        operationGeneration: UInt64 = 1
+    ) -> CatalogEventMetadata {
+        CatalogEventMetadata(
+            identity: .verified(
+                CatalogContextKey(
+                    gateKey: gateKey,
+                    apiClientID: apiClientID,
+                    authGeneration: 0,
+                    activeProfile: activeProfile,
+                    gateEpoch: gateEpoch
+                )
+            ),
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private static func makeCatalogProfileContext(activeProfile: String) -> CatalogProfileContext {
+        CatalogProfileContext(
+            profiles: [
+                ProfileSummary(
+                    name: activeProfile,
+                    path: nil,
+                    isDefault: nil,
+                    isActive: true,
+                    gatewayRunning: nil,
+                    model: nil,
+                    provider: nil,
+                    hasEnv: nil,
+                    skillCount: nil
+                )
+            ],
+            activeProfile: activeProfile,
+            requestedProfile: nil,
+            singleProfileMode: true,
+            defaults: CatalogProfileDefaults(model: nil, workspace: nil),
+            switchResult: .notRequested
+        )
+    }
+
+    private static func makeCatalogGroup(providerID: String, modelIDs: [String]) -> ModelCatalogGroup {
+        ModelCatalogGroup(
+            id: providerID,
+            name: providerID,
+            providerID: providerID,
+            models: modelIDs.map { ModelCatalogOption(id: $0, displayName: $0, providerID: providerID) },
+            extraModels: []
+        )
+    }
+
+    private static func makeCatalogBaseSnapshot(
+        metadata: CatalogEventMetadata,
+        groups: [ModelCatalogGroup],
+        defaultModel: String?,
+        activeProvider: String?
+    ) -> CatalogBaseSnapshot {
+        CatalogBaseSnapshot(
+            metadata: metadata,
+            groups: groups,
+            defaultModel: defaultModel,
+            activeProvider: activeProvider
+        )
+    }
+
+    private static func makeCatalogLiveSnapshot(
+        metadata: CatalogEventMetadata,
+        groups: [ModelCatalogGroup],
+        provider: String?
+    ) -> CatalogLiveSnapshot {
+        CatalogLiveSnapshot(metadata: metadata, groups: groups, provider: provider)
     }
 
     private func runMainActorTest(
@@ -7568,6 +7790,119 @@ private final class SpySSEStreamingClient: SSEStreamingClient {
         onEvent?(event)
         if automaticallyFlushPendingStreamingContent {
             flushPendingStreamingContent?()
+        }
+    }
+}
+
+// MARK: - Slice 3 catalog revalidation harness (issue #16)
+
+/// One scripted catalog operation call: the coordinator supplies the
+/// operation identity; the test yields `CatalogNetworkEvent`s into the
+/// continuation, holding any completion it wants to queue.
+private struct ScriptedCatalogCall {
+    let requestedProfile: String?
+    let operationID: UUID
+    let operationGeneration: UInt64
+    let continuation: AsyncStream<CatalogNetworkEvent>.Continuation
+}
+
+/// Minimal scripted catalog provider for the VM revalidation test: every
+/// `openPicker` operation gets one continuation the test can yield to and
+/// hold. Mirrors the ChatModelCatalogCoordinatorTests harness.
+private final class ScriptedCatalogProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls: [ScriptedCatalogCall] = []
+    private var callWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+
+    func makeProvider() -> @Sendable (String?, UUID, UInt64) async -> AsyncStream<CatalogNetworkEvent> {
+        { [self] requestedProfile, operationID, operationGeneration in
+            AsyncStream { continuation in
+                register(
+                    requestedProfile: requestedProfile,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    continuation: continuation
+                )
+            }
+        }
+    }
+
+    private func register(
+        requestedProfile: String?,
+        operationID: UUID,
+        operationGeneration: UInt64,
+        continuation: AsyncStream<CatalogNetworkEvent>.Continuation
+    ) {
+        lock.lock()
+        calls.append(
+            ScriptedCatalogCall(
+                requestedProfile: requestedProfile,
+                operationID: operationID,
+                operationGeneration: operationGeneration,
+                continuation: continuation
+            )
+        )
+        let count = calls.count
+        let waiters = callWaiters.removeValue(forKey: count) ?? []
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if calls.count >= count {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            callWaiters[count, default: []].append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func call(_ index: Int) -> ScriptedCatalogCall {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls[index]
+    }
+}
+
+/// Continuation-gated ordered event collector for coordinator subscriptions.
+private final class CatalogEventCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [CatalogEvent] = []
+    private var waiters: [(predicate: (CatalogEvent) -> Bool, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func append(_ event: CatalogEvent) {
+        lock.lock()
+        events.append(event)
+        let satisfied = waiters.filter { $0.predicate(event) }
+        waiters = waiters.filter { !$0.predicate(event) }
+        lock.unlock()
+        for waiter in satisfied {
+            waiter.continuation.resume()
+        }
+    }
+
+    func snapshot() -> [CatalogEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    func waitUntil(_ predicate: @escaping (CatalogEvent) -> Bool) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if events.contains(where: predicate) {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append((predicate, continuation))
+            lock.unlock()
         }
     }
 }
