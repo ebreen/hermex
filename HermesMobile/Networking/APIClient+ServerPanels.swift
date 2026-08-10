@@ -86,11 +86,20 @@ extension APIClient {
         let operationID = UUID()
 
         // Cancel coordinator-owned readers so their leases drain before the
-        // POST. Readers that never registered a cancellation hook are
-        // unaffected; the exclusive lease below still waits for them to unwind.
-        let heldReaders = await gate.snapshot().heldReaders
-        for readerID in heldReaders {
-            await gate.cancel(operationID: readerID)
+        // POST. Re-snapshot after every round: a reader admitted between the
+        // snapshot and its cancels must be cancelled by the next round, so a
+        // held compatibility read can never slip through uncancelled. The
+        // loop is bounded so pathological reader churn cannot spin forever;
+        // readers that slip in after the last round are still unwound by the
+        // exclusive lease below, which waits for every held reader.
+        var drainRounds = 0
+        var heldReaders = await gate.snapshot().heldReaders
+        while !heldReaders.isEmpty && drainRounds < 8 {
+            for readerID in heldReaders {
+                await gate.cancel(operationID: readerID)
+            }
+            heldReaders = await gate.snapshot().heldReaders
+            drainRounds += 1
         }
 
         // The exclusive writer lease. A canceled writer throws here and never

@@ -308,13 +308,15 @@ final class CatalogGateTicket: @unchecked Sendable {
 
     /// Synchronous cancellation: the only side effect is resuming a pending
     /// waiter with CancellationError. Never awaits and never hops to an actor.
+    /// Idempotent: the onCancel hook can fire before the operation runs (and
+    /// therefore before the continuation is attached), and attach() re-invokes
+    /// this path for a ticket already marked cancelled — the continuation is
+    /// drained exactly once, so no waiter can park. serve() clears the
+    /// continuation under the lock first, so a late cancelPending never
+    /// double-resumes an admitted waiter.
     func cancelPending() {
         lock.lock()
-        guard state == .queued else {
-            lock.unlock()
-            return
-        }
-        state = .cancelled
+        if state == .queued { state = .cancelled }
         let continuation = self.continuation
         self.continuation = nil
         lock.unlock()
@@ -513,7 +515,14 @@ actor ProfileContextGate {
     }
 
     private func purgeCancelledTickets() {
+        let countBefore = queue.count
         queue.removeAll { $0.isCancelled }
+        if queue.count != countBefore {
+            // A waitForLeaseState waiter parked on a cancelled-then-purged
+            // ticket must re-check now; without this it would park until
+            // unrelated gate activity (a release or admission) wakes it.
+            notifyChange()
+        }
     }
 
     private func notifyChange() {
@@ -1153,8 +1162,9 @@ private extension APIClient {
     }
 
     /// Shared reader-lease body for the temporary compatibility adapters.
-    /// The body task is registered with the gate so `gate.cancel(operationID:)`
-    /// synchronously cancels it; the lease is released on every exit.
+    /// The gate cancellation hook is registered before the body task exists so
+    /// `gate.cancel(operationID:)` synchronously cancels it from the moment the
+    /// reader can be admitted; the lease is released on every exit.
     private func runCompatibilityRead<Value>(
         operationID: UUID,
         operationGeneration: UInt64,
@@ -1172,6 +1182,15 @@ private extension APIClient {
         }
         let gate = ProfileContextGateRegistry.shared.gate(for: operationKey.gateKey)
 
+        // Register the cancellation hook BEFORE the body task exists so
+        // `gate.cancel(operationID:)` (e.g. a profile-switch drain) can never
+        // fire into a gap where the reader is already holding a lease but has
+        // no hook yet — the hook is the only thing that can cancel a parked
+        // wire read. The box is attached synchronously right after the task is
+        // created; a cancel that lands before attach is a no-op and the task
+        // simply runs, mirroring the stream path's box pattern.
+        let cancellation = CatalogTaskCancellationBox<CatalogCompatibilityEnvelope<Value>, Error>()
+        await gate.registerCancellation(operationID: operationID, hook: { cancellation.cancel() })
         let bodyTask = Task { () throws -> CatalogCompatibilityEnvelope<Value> in
             let admission = try await gate.acquireReader(operationID: operationID)
             do {
@@ -1192,7 +1211,7 @@ private extension APIClient {
                 throw error
             }
         }
-        await gate.registerCancellation(operationID: operationID, hook: { bodyTask.cancel() })
+        cancellation.attach(bodyTask)
         if Task.isCancelled {
             bodyTask.cancel()
         }
@@ -1306,11 +1325,11 @@ private final class CatalogBaseGroupsBox: @unchecked Sendable {
 /// Strong task handle so an operation-level gate registration can synchronously
 /// cancel the stream task. The box is owned by the stream task itself, so the
 /// handle never outlives the task; there is no retain cycle to break with weak.
-private final class CatalogTaskCancellationBox: @unchecked Sendable {
+private final class CatalogTaskCancellationBox<Success: Sendable = Void, Failure: Error = Never>: @unchecked Sendable {
     private let lock = NSLock()
-    private var task: Task<Void, Never>?
+    private var task: Task<Success, Failure>?
 
-    func attach(_ task: Task<Void, Never>) {
+    func attach(_ task: Task<Success, Failure>) {
         lock.lock()
         self.task = task
         lock.unlock()
