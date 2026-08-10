@@ -27,7 +27,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: operationID,
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         let snapshot = await client.modelCatalogSnapshot(
             requestedProfile: nil,
             operationID: UUID(),
@@ -86,7 +86,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         let snapshot = await client.modelCatalogSnapshot(
             requestedProfile: nil,
             operationID: UUID(),
@@ -117,7 +117,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        _ = await collectEvents(from: stream)
+        _ = await Self.collectEvents(from: stream)
 
         let modelRequests = fixture.requests().filter { request in
             request.url?.path == "/api/models" || request.url?.path == "/api/models/live"
@@ -310,7 +310,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let collectTask = Task { await collectEvents(from: stream) }
+        let collectTask = Task { await Self.collectEvents(from: stream) }
 
         // The live child is parked on the wire, so the single physical
         // operation-level reader lease must still be held: it covers profile
@@ -371,7 +371,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         XCTAssertEqual(terminalCount(of: events), 1)
         XCTAssertTrue(events.contains { event in
             if case .finished = event { return true }
@@ -450,13 +450,15 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let waitingReader = makeReaderTask(gate: gate, operationID: waitingOperation)
         await gate.waitForLeaseState(waitingOperation, .waitingReader)
         waitingReader.task.cancel()
-        XCTAssertNotNil(await waitingReader.canceled.first(where: { _ in true }))
+        let canceled = await waitingReader.canceled.first(where: { _ in true })
+        XCTAssertNotNil(canceled)
 
         let afterCancel = await gate.snapshot()
         XCTAssertFalse(afterCancel.waitingReaders.contains(waitingOperation), "canceled waiting reader unregisters")
         XCTAssertFalse(afterCancel.heldReaders.contains(waitingOperation))
         XCTAssertEqual(afterCancel.heldReaders, [heldOperation])
-        XCTAssertNil(await gate.leaseState(of: waitingOperation))
+        let releasedState = await gate.leaseState(of: waitingOperation)
+        XCTAssertNil(releasedState)
 
         // The canceled waiter must not block the exclusive writer.
         let switchTask = Task { try await client.switchProfile(name: "work") }
@@ -499,7 +501,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         )
 
         writer.release.yield(())
-        XCTAssertNotNil(await lateReader.admitted.first(where: { _ in true }))
+        let lateAdmission = await lateReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(lateAdmission)
         _ = await heldReader.task.value
         _ = await writer.task.value
         _ = await lateReader.task.value
@@ -522,7 +525,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let reserved = await gate.snapshot()
         XCTAssertEqual(reserved.pendingWriterCount, 1)
         waitingWriter.task.cancel()
-        XCTAssertNotNil(await waitingWriter.canceled.first(where: { _ in true }))
+        let canceled = await waitingWriter.canceled.first(where: { _ in true })
+        XCTAssertNotNil(canceled)
         let afterCancel = await gate.snapshot()
         XCTAssertEqual(afterCancel.pendingWriterCount, 0, "canceled waiting writer removes its reservation")
         XCTAssertFalse(afterCancel.waitingWriters.contains(writerOperation))
@@ -538,7 +542,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         }
         heldReader.release.yield(())
         let postSwitchReader = makeReaderTask(gate: gate, operationID: UUID(), holdsAfterAdmission: false)
-        XCTAssertNotNil(await postSwitchReader.admitted.first(where: { _ in true }))
+        let postSwitchAdmission = await postSwitchReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(postSwitchAdmission)
         XCTAssertEqual(
             fixture.requests().filter { $0.url?.path == "/api/profile/switch" }.count,
             0,
@@ -563,7 +568,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
 
         writer.task.cancel()
         writer.release.yield(())
-        XCTAssertNotNil(await queuedReader.admitted.first(where: { _ in true }))
+        let queuedAdmission = await queuedReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(queuedAdmission)
 
         let after = await gate.snapshot()
         XCTAssertNil(after.heldWriter, "canceled held writer releases exclusive ownership")
@@ -597,7 +603,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         } catch {
             XCTFail("switch failures use the fixed ProfileContextSwitchFailure category")
         }
-        XCTAssertNotNil(await queuedReader.admitted.first(where: { _ in true }))
+        let queuedAdmission = await queuedReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(queuedAdmission)
 
         let state = await gate.snapshot()
         XCTAssertTrue(state.heldReaders.isEmpty)
@@ -640,7 +647,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             XCTFail("canceled switch must throw")
         } catch {
         }
-        XCTAssertNotNil(await queuedReader.admitted.first(where: { _ in true }))
+        let queuedAdmission = await queuedReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(queuedAdmission)
 
         let state = await gate.snapshot()
         XCTAssertNil(state.heldWriter, "canceled POST releases the exclusive writer")
@@ -686,12 +694,15 @@ final class ModelCatalogNetworkingTests: XCTestCase {
 
         // The reader cohort ahead of the writer drains first...
         heldReader.release.yield(())
-        XCTAssertNotNil(await queuedReader.admitted.first(where: { _ in true }))
+        let queuedAdmission = await queuedReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(queuedAdmission)
         // ...then writer preference admits the queued writer...
-        XCTAssertNotNil(await waitingWriter.admitted.first(where: { _ in true }))
+        let writerAdmission = await waitingWriter.admitted.first(where: { _ in true })
+        XCTAssertNotNil(writerAdmission)
         waitingWriter.release.yield(())
         // ...and only then the reader that arrived after the writer.
-        XCTAssertNotNil(await arrivingReader.admitted.first(where: { _ in true }))
+        let arrivingAdmission = await arrivingReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(arrivingAdmission)
 
         let finalState = await gate.snapshot()
         XCTAssertTrue(finalState.heldReaders.isEmpty)
@@ -716,14 +727,15 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         guard case let .failed(_, phase, category)? = events.last else {
             XCTFail("a 2xx profile error must produce a failed terminal")
             return
         }
         XCTAssertEqual(phase, .context)
         XCTAssertEqual(category, .profileUnavailable)
-        XCTAssertEqual(await gate.gateEpoch, 0, "invalid profiles must not advance the epoch")
+        let epoch = await gate.gateEpoch
+        XCTAssertEqual(epoch, 0, "invalid profiles must not advance the epoch")
         let paths = fixture.requests().compactMap { $0.url?.path }
         XCTAssertFalse(paths.contains("/api/models"), "zero models GETs on an invalid profile response")
         XCTAssertFalse(paths.contains("/api/models/live"))
@@ -743,14 +755,15 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         guard case let .failed(_, phase, category)? = events.last else {
             XCTFail("a requested-profile mismatch must produce a failed terminal")
             return
         }
         XCTAssertEqual(phase, .context)
         XCTAssertEqual(category, .profileMismatch)
-        XCTAssertEqual(await gate.gateEpoch, 0, "a mismatched profile must not advance the epoch")
+        let epoch = await gate.gateEpoch
+        XCTAssertEqual(epoch, 0, "a mismatched profile must not advance the epoch")
         let paths = fixture.requests().compactMap { $0.url?.path }
         XCTAssertFalse(paths.contains("/api/models"))
         XCTAssertFalse(paths.contains("/api/models/live"))
@@ -769,14 +782,15 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         guard case let .failed(_, phase, category)? = events.last else {
             XCTFail("an ambiguous profile response must produce a failed terminal")
             return
         }
         XCTAssertEqual(phase, .context)
         XCTAssertEqual(category, .profileUnavailable)
-        XCTAssertEqual(await gateFor(fixture: fixture, client: client).gateEpoch, 0)
+        let epoch = await gateFor(fixture: fixture, client: client).gateEpoch
+        XCTAssertEqual(epoch, 0)
         let paths = fixture.requests().compactMap { $0.url?.path }
         XCTAssertFalse(paths.contains("/api/models"))
         XCTAssertFalse(paths.contains("/api/models/live"))
@@ -796,7 +810,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         let contextEvents = events.filter { event in
             if case .contextVerified = event { return true }
             return false
@@ -838,7 +852,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let readerTask = Task { await collectEvents(from: stream) }
+        let readerTask = Task { await Self.collectEvents(from: stream) }
         await fixture.waitForParkedLoad(path: "/api/models/live")
 
         // The coordinator-owned reader holds the shared lease with its live
@@ -879,7 +893,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 2
         )
-        let secondEvents = await collectEvents(from: secondStream)
+        let secondEvents = await Self.collectEvents(from: secondStream)
         XCTAssertTrue(secondEvents.contains { event in
             if case .finished = event { return true }
             return false
@@ -903,7 +917,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: operationID,
             operationGeneration: 1
         )
-        let collectTask = Task { await collectEvents(from: stream) }
+        let collectTask = Task { await Self.collectEvents(from: stream) }
         await fixture.waitForParkedLoad(path: "/api/profiles")
 
         // Cancel through the operation's gate registration; the repeated cancel
@@ -951,7 +965,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        let events = await collectEvents(from: stream)
+        let events = await Self.collectEvents(from: stream)
         XCTAssertEqual(terminalCount(of: events), 1)
         guard case .cancelled? = events.last else {
             XCTFail("URLError.cancelled must map to the cancelled terminal, never transport failure")
@@ -979,7 +993,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let collectTask = Task { await collectEvents(from: stream) }
+        let collectTask = Task { await Self.collectEvents(from: stream) }
 
         // The operation is admitted (one physical pair) and canceled before any
         // child reaches the wire: no child wire/decode events, no second pair.
@@ -1032,7 +1046,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let collectTask = Task { await collectEvents(from: stream) }
+        let collectTask = Task { await Self.collectEvents(from: stream) }
 
         // Both children are on the wire (both loads parked) when the operation
         // is canceled: each started child ends exactly once, with no second
@@ -1185,17 +1199,22 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationID: UUID(),
             operationGeneration: 1
         )
-        XCTAssertEqual(envelope.gateEpoch, await gate.gateEpoch)
-        XCTAssertTrue(
-            await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey)
+        let currentEpoch = await gate.gateEpoch
+        XCTAssertEqual(envelope.gateEpoch, currentEpoch)
+        let acceptsCurrentEpoch = await client.acceptsCompatibilityEpoch(
+            gateEpoch: envelope.gateEpoch,
+            gateKey: envelope.gateKey
         )
+        XCTAssertTrue(acceptsCurrentEpoch)
 
         _ = try await client.switchProfile(name: "work")
-        XCTAssertEqual(await gate.gateEpoch, envelope.gateEpoch + 1)
-        XCTAssertFalse(
-            await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey),
-            "an advanced epoch rejects the pre-switch compatibility envelope before apply"
+        let epochAfterSwitch = await gate.gateEpoch
+        XCTAssertEqual(epochAfterSwitch, envelope.gateEpoch + 1)
+        let acceptsStaleEpoch = await client.acceptsCompatibilityEpoch(
+            gateEpoch: envelope.gateEpoch,
+            gateKey: envelope.gateKey
         )
+        XCTAssertFalse(acceptsStaleEpoch, "an advanced epoch rejects the pre-switch compatibility envelope before apply")
     }
 
     // MARK: - Slice 1 gate helpers
