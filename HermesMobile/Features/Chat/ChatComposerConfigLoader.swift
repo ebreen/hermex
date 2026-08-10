@@ -53,11 +53,6 @@ struct ChatComposerConfigState: Equatable, Sendable {
     }
 }
 
-struct ChatComposerConfigLoadResult: Sendable {
-    let state: ChatComposerConfigState
-    let configurationError: Error?
-}
-
 /// Fixed Sendable failure categories for composer configuration loading
 /// (Slice 3, #16). The Sendable result never carries a raw `Error`.
 enum ChatComposerConfigFailure: Equatable, Sendable {
