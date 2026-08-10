@@ -294,14 +294,29 @@ actor ChatModelCatalogCoordinator {
 
         switch metadata.identity {
         case let .provisional(key):
-            guard key == op.operationKey, key.startingGateEpoch == authoritativeEpoch else { return }
+            // Production metadata hardcodes startingGateEpoch/authGeneration 0
+            // (ModelCatalogNetworking.swift:862-864 — the provider seam has no
+            // epoch parameter), so exact key equality is unsatisfiable after
+            // the first validated profile switch. Fence the operation
+            // identity fields only; the epoch authority lives on the
+            // operation boundary (a superseded op is replaced before its
+            // events can publish).
+            guard key.gateKey == op.operationKey.gateKey,
+                  key.apiClientID == op.operationKey.apiClientID,
+                  key.authGeneration == op.operationKey.authGeneration,
+                  key.requestedProfile == op.operationKey.requestedProfile
+            else { return }
         case let .verified(key):
             // `.contextVerified` is the fence's write site: it carries the
             // context key that later events must match. Exempt it from
-            // key-equality (the key is unknown until this very event); only
-            // the epoch authority is checked here.
+            // key-equality (the key is unknown until this very event) but
+            // bind the operation constants it must not be able to spoof.
             if case .contextVerified = event {
-                guard key.gateEpoch == authoritativeEpoch else { return }
+                guard key.gateEpoch == authoritativeEpoch,
+                      key.gateKey == op.operationKey.gateKey,
+                      key.apiClientID == op.operationKey.apiClientID,
+                      key.authGeneration == op.operationKey.authGeneration
+                else { return }
             } else {
                 guard key == op.verifiedContextKey, key.gateEpoch == authoritativeEpoch else { return }
             }
