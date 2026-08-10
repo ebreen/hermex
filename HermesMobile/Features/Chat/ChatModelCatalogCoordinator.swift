@@ -346,8 +346,10 @@ actor ChatModelCatalogCoordinator {
             )
 
         case let .base(snapshot):
+            // Production emits provisional identity for every event
+            // (ModelCatalogNetworking.swift:867); the context key was already
+            // established by the preceding `.contextVerified` write site.
             guard let contextKey = op.verifiedContextKey,
-                  case .verified = snapshot.metadata.identity,
                   snapshot.metadata.operationID == op.operationID
             else { return }
             // Cache the projection without event metadata; the last-known

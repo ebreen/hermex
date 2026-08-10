@@ -555,7 +555,8 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
         await subscriber.collector.waitUntil { events in
             events.contains { event in
-                if case .finished = event { return true }
+                if case let .base(snapshot) = event,
+                   snapshot.groups.flatMap(\.models).map(\.id) == ["gpt-5", "gpt-4o"] { return true }
                 return false
             }
         }
