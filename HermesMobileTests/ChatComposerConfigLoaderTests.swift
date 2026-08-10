@@ -349,7 +349,7 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         // callback carrying only the Sendable base projection.
         let loader = ChatComposerConfigLoader(
             client: client,
-            catalogEvents: coordinator.subscribe(),
+            catalogEvents: await coordinator.subscribe(),
             onCatalogReady: { @MainActor snapshot in
                 catalogReadyCount += 1
                 catalogReadySnapshot = snapshot
