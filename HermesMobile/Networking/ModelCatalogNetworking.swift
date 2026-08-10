@@ -425,6 +425,16 @@ actor ProfileContextGate {
         }
     }
 
+    /// Advances the gate epoch. The epoch is the gate's only authority; only
+    /// a validated profile switch may call this while it exclusively holds
+    /// the writer lease. Waiters are notified so queued readers can proceed
+    /// once the writer releases.
+    func advanceEpoch(operationID: UUID) {
+        guard heldWriterID == operationID else { return }
+        epoch += 1
+        notifyChange()
+    }
+
     // MARK: Private
 
     private func acquire(operationID: UUID, isWriter: Bool) async throws -> CatalogLeaseAdmission {

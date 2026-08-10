@@ -64,12 +64,72 @@ extension APIClient {
         try await send(endpoint: .profiles, method: "GET")
     }
 
+    /// Switches the active server profile under the exclusive profile-context
+    /// writer lease (issue #16 Slice 1).
+    ///
+    /// The writer first cancels coordinator-owned catalog readers (streams and
+    /// compatibility adapters register a synchronous cancellation hook with
+    /// the gate) so their held leases drain, then acquires the exclusive
+    /// writer lease — which waits for every held reader, including held
+    /// compatibility reads and held live children, to unwind — and only then
+    /// dispatches the POST. The response is validated with the strict profile
+    /// verifier; the gate epoch advances only after a validated success.
+    /// Failed or canceled POSTs release the writer and wake queued readers,
+    /// and a canceled writer never POSTs.
     func switchProfile(name: String) async throws -> ProfileSwitchResponse {
-        try await send(
-            endpoint: .switchProfile,
-            method: "POST",
-            body: ProfileSwitchRequest(name: name)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let gateKey = ProfileContextGateKey(
+            origin: NormalizedServerOrigin(url: baseURL),
+            cookieContextID: cookieContextID
         )
+        let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
+        let operationID = UUID()
+
+        // Cancel coordinator-owned readers so their leases drain before the
+        // POST. Readers that never registered a cancellation hook are
+        // unaffected; the exclusive lease below still waits for them to unwind.
+        let heldReaders = await gate.snapshot().heldReaders
+        for readerID in heldReaders {
+            await gate.cancel(operationID: readerID)
+        }
+
+        // The exclusive writer lease. A canceled writer throws here and never
+        // reaches the POST.
+        let admission: CatalogLeaseAdmission
+        do {
+            admission = try await gate.acquireWriter(operationID: operationID)
+        } catch {
+            throw ProfileContextSwitchFailure.cancelled
+        }
+
+        do {
+            guard !Task.isCancelled else {
+                throw CancellationError()
+            }
+            let response: ProfileSwitchResponse = try await send(
+                endpoint: .switchProfile,
+                method: "POST",
+                body: ProfileSwitchRequest(name: normalizedName)
+            )
+            let verification = CatalogProfileVerifier.verify(
+                profiles: response.profiles ?? [],
+                explicitActive: response.active,
+                singleProfileMode: false,
+                requestedProfile: normalizedName
+            )
+            guard case let .verified(activeProfile, _) = verification,
+                  activeProfile == normalizedName else {
+                throw ProfileContextSwitchFailure.rejected
+            }
+            // The validated switch is the only event that advances the gate
+            // epoch; failed or canceled POSTs leave it untouched.
+            await gate.advanceEpoch(operationID: operationID)
+            await gate.releaseWriter(operationID: operationID, admission: admission)
+            return response
+        } catch {
+            await gate.releaseWriter(operationID: operationID, admission: admission)
+            throw Self.switchFailure(for: error)
+        }
     }
 
     /// Creates a new profile (`POST /api/profile/create`), mirroring the webui's
@@ -161,6 +221,46 @@ extension APIClient {
 
     func insights(days: Int) async throws -> InsightsResponse {
         try await send(endpoint: .insights(days: days), method: "GET")
+    }
+
+    /// Maps a switch POST failure onto the fixed switch failure category.
+    /// Cancellation (task or transport) is detected before any APIError
+    /// mapping so a canceled POST never surfaces as a transport failure.
+    private static func switchFailure(for error: Error) -> ProfileContextSwitchFailure {
+        if let failure = error as? ProfileContextSwitchFailure {
+            return failure
+        }
+        if Task.isCancelled || isSwitchCancellation(error) {
+            return .cancelled
+        }
+        guard let apiError = error as? APIError else {
+            return .transport
+        }
+        switch apiError {
+        case .unauthorized:
+            return .unauthorized
+        case .http:
+            return .rejected
+        case .decoding:
+            return .decoding
+        case .network:
+            return .transport
+        case .invalidServerURL:
+            return .transport
+        }
+    }
+
+    private static func isSwitchCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let urlError = error as? URLError {
+            return urlError.code == .cancelled
+        }
+        if case let APIError.network(underlying) = error {
+            return isSwitchCancellation(underlying)
+        }
+        return false
     }
 }
 
