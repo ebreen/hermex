@@ -741,7 +741,7 @@ extension APIClient {
 
         let effectiveTelemetrySink = telemetrySink ?? catalogTelemetrySink
         return AsyncStream { continuation in
-            let cancellation = CatalogTaskCancellationBox()
+            let cancellation = CatalogTaskCancellationBox<Void, Never>()
             let task = Task { [weak self] in
                 guard let self else {
                     continuation.finish()
@@ -1325,7 +1325,7 @@ private final class CatalogBaseGroupsBox: @unchecked Sendable {
 /// Strong task handle so an operation-level gate registration can synchronously
 /// cancel the stream task. The box is owned by the stream task itself, so the
 /// handle never outlives the task; there is no retain cycle to break with weak.
-private final class CatalogTaskCancellationBox<Success: Sendable = Void, Failure: Error = Never>: @unchecked Sendable {
+private final class CatalogTaskCancellationBox<Success: Sendable, Failure: Error>: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Success, Failure>?
 
