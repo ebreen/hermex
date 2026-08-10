@@ -306,12 +306,13 @@ final class MarkdownLargeContentTests: XCTestCase {
         let identity = MarkdownStreamIdentity(opaqueValue: "slice-a-append")
 
         // Fixture A: a ZWJ family split across the append boundary. Character counts are
-        // NOT additive across the split (7 + 3 != 7); UTF-8 byte counts are (13 + 18 == 31).
+        // NOT additive across the split (7 + 1 != 7 — the appended family is one grapheme
+        // cluster under Swift semantics); UTF-8 byte counts are (13 + 18 == 31).
         let priorSource = "Hello \u{1F468}\u{200D}"
         let appendedSource = "\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
         let combinedSource = priorSource + appendedSource
         XCTAssertEqual(priorSource.count, 7)
-        XCTAssertEqual(appendedSource.count, 3)
+        XCTAssertEqual(appendedSource.count, 1)
         XCTAssertEqual(combinedSource.count, 7)
         XCTAssertNotEqual(priorSource.count + appendedSource.count, combinedSource.count)
         XCTAssertEqual(priorSource.utf8.count + appendedSource.utf8.count, combinedSource.utf8.count)
@@ -328,7 +329,7 @@ final class MarkdownLargeContentTests: XCTestCase {
         let admission = makeAdmission(
             identity: identity, epoch: 1, prior: prior, current: current,
             appendedUTF8: Data(appendedSource.utf8),
-            appendedCharacterCount: 3,
+            appendedCharacterCount: 1,
             appendedLogicalLineDelta: 0
         )
 

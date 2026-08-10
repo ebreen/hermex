@@ -11,29 +11,36 @@ struct MarkdownRenderer: View {
 
     @Environment(\.colorScheme) private var colorScheme
 
-    init(content: String, isStreaming: Bool = false) {
-        self.content = content
-        self.isStreaming = isStreaming
-    }
-
     /// Keeps the streaming renderer mounted briefly after streaming ends so
     /// the reveal queue's in-flight glyph cascade can finish instead of
     /// snapping to the solid static rendering mid-fade.
     @State private var lingersAfterStreaming = false
 
+    /// Owner-lived producer snapshot box for the static source (#17 Slice A).
+    /// Publishing is idempotent per revision, so repeated body recomputation
+    /// reads only the O(1) metadata integers and never re-counts or re-scans
+    /// the source.
+    @State private var snapshotBox: MarkdownSourceSnapshotBox
+    /// Monotonic source revision issued by this renderer for static sources.
+    /// The producer-driven revision/append-admission machinery arrives in
+    /// later slices; `0` means "not published yet".
+    @State private var sourceRevision: UInt64 = 0
+
+    init(content: String, isStreaming: Bool = false) {
+        self.content = content
+        self.isStreaming = isStreaming
+        _snapshotBox = State(initialValue: MarkdownSourceSnapshotBox(
+            recordingIn: MarkdownSnapshotObservationProbe()
+        ))
+    }
+
     var body: some View {
         Group {
-            if isStreaming || lingersAfterStreaming {
-                StreamingMarkdownRenderer(content: content)
-            } else if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(verbatim: " ")
-            } else if let fallbackReason = MarkdownContentRenderingPolicy.fallbackReason(for: content) {
-                PlainMarkdownFallbackView(
-                    content: content,
-                    reason: fallbackReason
-                )
-            } else {
-                markdownContent
+            switch baseRoute {
+            case .ordinary:
+                ordinaryContent
+            case .largePolicyEnabled, .largePolicyDisabledStructured:
+                structuredWholeDocumentContent
             }
         }
         .onChange(of: isStreaming) { wasStreaming, nowStreaming in
@@ -47,6 +54,57 @@ struct MarkdownRenderer: View {
             guard !Task.isCancelled else { return }
             lingersAfterStreaming = false
         }
+        .task(id: content) {
+            // Initial publish only; content changes are handled by
+            // onChange(of: content) below, so re-appearing with the same
+            // content never triggers a redundant producer rebuild.
+            guard sourceRevision == 0 else { return }
+            sourceRevision += 1
+            snapshotBox.publish(source: content, revision: sourceRevision)
+        }
+        .onChange(of: content) { _, newContent in
+            sourceRevision += 1
+            snapshotBox.publish(source: newContent, revision: sourceRevision)
+        }
+    }
+
+    /// O(1) route selection: reads only the producer metadata integers.
+    /// Absent metadata (never-published box) takes the structured
+    /// whole-document route, never the legacy fade or the raw fallback.
+    private var baseRoute: MarkdownLargeContentBaseRoute {
+        MarkdownLargeContentPolicy.baseRoute(
+            metadata: snapshotBox.snapshot.metadata,
+            isPolicyEnabled: true
+        )
+    }
+
+    /// Ordinary route: the existing single ChatMarkdownView (math-segmented)
+    /// and the below-threshold streaming fade path. Size-driven raw fallback
+    /// is gone — ordinary is below threshold by construction, so no size
+    /// input may select `PlainMarkdownFallbackView`.
+    @ViewBuilder
+    private var ordinaryContent: some View {
+        if isStreaming || lingersAfterStreaming {
+            StreamingMarkdownRenderer(content: content)
+        } else if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(verbatim: " ")
+        } else {
+            markdownContent
+        }
+    }
+
+    /// Structured whole-document route for large or policy-disabled content:
+    /// one `ChatMarkdownView` for the entire document (the planned
+    /// LazyVStack/coordinator/plan-state machinery is deferred to slices
+    /// D/F). Never the raw fallback, never the legacy fade path.
+    @ViewBuilder
+    private var structuredWholeDocumentContent: some View {
+        ChatMarkdownView(
+            content: content,
+            colorScheme: colorScheme,
+            isStreaming: isStreaming
+        )
+        .textSelection(.enabled)
     }
 
     @ViewBuilder
@@ -97,12 +155,10 @@ struct StreamingMarkdownRenderer: View {
         Group {
             if displayedContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(verbatim: " ")
-            } else if let fallbackReason = MarkdownContentRenderingPolicy.fallbackReason(for: displayedContent) {
-                PlainMarkdownFallbackView(
-                    content: displayedContent,
-                    reason: fallbackReason
-                )
             } else {
+                // No size fallback here (#17 Slice A): this renderer is only
+                // reachable under the .ordinary base route (below threshold),
+                // so no size input may select PlainMarkdownFallbackView.
                 streamingMarkdownContent
             }
         }
