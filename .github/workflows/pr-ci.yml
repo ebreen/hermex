@@ -209,6 +209,28 @@ jobs:
           echo "### PR CI timing" >> "${GITHUB_STEP_SUMMARY}"
           echo "- Build for testing: ${duration_seconds}s" >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Run focused issue #17 cases
+        env:
+          SIMULATOR_NAME: ${{ steps.sim.outputs.name }}
+        run: |
+          set -euo pipefail
+          start_seconds=${SECONDS}
+          xcodebuild test-without-building \
+            -project "${PROJECT_PATH}" \
+            -scheme "${SCHEME}" \
+            -destination "platform=iOS Simulator,name=${SIMULATOR_NAME}" \
+            -only-testing:HermesMobileTests/MarkdownLargeContentTests \
+            -only-testing:HermesMobileTests/MarkdownMathRendererTests \
+            -only-testing:HermesMobileTests/StreamingMarkdownSupportTests \
+            -only-testing:HermesMobileTests/StreamingTextFadeTests \
+            -only-testing:HermesMobileTests/MessageActionContextTests \
+            -only-testing:HermesMobileTests/TranscriptMediaParserTests \
+            -derivedDataPath "${DERIVED_DATA_PATH}" \
+            CODE_SIGNING_ALLOWED=NO
+          duration_seconds=$((SECONDS - start_seconds))
+          echo "Focused #17 cases duration: ${duration_seconds}s"
+          echo "- Focused #17 cases: ${duration_seconds}s" >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Test without building
         env:
           SIMULATOR_NAME: ${{ steps.sim.outputs.name }}
