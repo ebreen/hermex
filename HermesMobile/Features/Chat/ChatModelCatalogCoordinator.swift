@@ -1,5 +1,26 @@
 import Foundation
 
+/// Every `CatalogNetworkEvent` case carries (or wraps) operation metadata.
+/// This accessor is local to the coordinator; the Networking event shape is
+/// untouched (Slice 1 surface preserved).
+private extension CatalogNetworkEvent {
+    var eventMetadata: CatalogEventMetadata? {
+        switch self {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot):
+            return snapshot.metadata
+        case let .live(snapshot):
+            return snapshot.metadata
+        }
+    }
+}
+
 // MARK: - Slice 2: ChatModelCatalogCoordinator (issue #16)
 //
 // One coordinator per ChatViewModel: the Chat-facing multicast seam of the
@@ -248,28 +269,7 @@ actor ChatModelCatalogCoordinator {
 
     // MARK: Network event handling
 
-    /// Every `CatalogNetworkEvent` case carries (or wraps) operation metadata.
-/// This accessor is local to the coordinator; the Networking event shape is
-/// untouched (Slice 1 surface preserved).
-private extension CatalogNetworkEvent {
-    var eventMetadata: CatalogEventMetadata? {
-        switch self {
-        case let .contextVerified(metadata, _),
-             let .liveFailed(metadata, _),
-             let .finished(metadata),
-             let .cancelled(metadata):
-            return metadata
-        case let .failed(metadata, _, _):
-            return metadata
-        case let .base(snapshot):
-            return snapshot.metadata
-        case let .live(snapshot):
-            return snapshot.metadata
-        }
-    }
-}
-
-/// Actor-serialized handler for one network event. Every event is fenced
+    /// Actor-serialized handler for one network event. Every event is fenced
     /// twice: once against the current operation identity (UUID/generation)
     /// and once against the authoritative gate epoch and the operation's own
     /// context key.
