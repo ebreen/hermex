@@ -331,7 +331,7 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
             apiClientID: UUID(),
             authGeneration: 0,
             provider: { requestedProfile, operationID, operationGeneration in
-                client.modelCatalogStream(
+                await client.modelCatalogStream(
                     requestedProfile: requestedProfile,
                     operationID: operationID,
                     operationGeneration: operationGeneration
