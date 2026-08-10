@@ -31,6 +31,14 @@ struct ChatStreamLoadPreparation: Equatable {
     let shouldPrepareSuspendedStreamResume: Bool
 }
 
+/// Identity of one logical run of a chat stream. A replacement run for the
+/// same stream ID is a new logical generation: the identity changes even
+/// though the stream ID does not (#18 Slice 1).
+struct ChatRunIdentity: Equatable {
+    let streamID: String
+    let logicalGeneration: Int
+}
+
 @MainActor
 protocol ChatStreamCoordinatorDelegate: AnyObject {
     var streamCoordinatorSessionID: String? { get }
@@ -103,6 +111,25 @@ final class ChatStreamCoordinator {
     // double-finalized (PR #266 review #2).
     private var runGeneration = 0
 
+    /// Identity of the run finalized by an accepted `.done` (or a transcript
+    /// refresh). The completing connection's own terminal events arrive AFTER
+    /// finalization — when `runIdentity` is already nil — and must still pass
+    /// the generation fence so `finishStream()` (title refresh, Live Activity
+    /// teardown) runs for the completed run. Every other (superseded)
+    /// connection stays fenced (#18 Slice 1).
+    private var completedRunIdentity: ChatRunIdentity?
+
+    /// The current logical run identity, or nil while no run is active.
+    /// Derived from the active stream ID and the run-generation counter so it
+    /// stays consistent with every start/finalize transition. Each connection
+    /// captures its own identity at creation; a callback whose captured
+    /// identity no longer matches this value is fenced before any mutation
+    /// (#18 Slice 1).
+    var runIdentity: ChatRunIdentity? {
+        guard let activeStreamID else { return nil }
+        return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
+    }
+
     init(
         client: APIClient,
         streamClient: SSEStreamingClient,
@@ -144,6 +171,7 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
+        let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
         activeStreamID = streamID
         isConnectionSuspended = false
         if replayAfterSeq == nil {
@@ -161,7 +189,27 @@ final class ChatStreamCoordinator {
                 replayAfterSeq: replayAfterSeq
             )
         ) { [weak self] event in
-            self?.handle(event)
+            // Connection-generation fencing (#18 Slice 1): every connection
+            // captures the identity of the run it was opened for. A callback
+            // delivered by a superseded connection (older logical generation,
+            // or a different stream's run) returns BEFORE any delegate,
+            // live-activity, transcript, or terminal mutation — a late event
+            // from an old connection can never mutate the replacement run.
+            //
+            // Sole exception: the connection that delivered the accepted
+            // `.done` owns the run's completion, and its own terminal events
+            // (.streamEnd / .cancelled / .error) arrive AFTER the run was
+            // finalized (runIdentity is nil). They are admitted so
+            // finishStream() — title refresh, Live Activity teardown — still
+            // runs for the completed run; payload-carrying events (.token,
+            // .done, …) stay fenced once the run is finalized.
+            guard let self,
+                  self.runIdentity == connectionIdentity
+                    || (self.runIdentity == nil
+                        && connectionIdentity == self.completedRunIdentity
+                        && isTerminalEvent(event))
+            else { return }
+            self.handle(event)
         }
         delegate?.streamCoordinatorStartAuxiliaryMonitoring()
     }
@@ -631,6 +679,10 @@ final class ChatStreamCoordinator {
     }
 
     private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
+        // Capture the completing run's identity BEFORE the active stream is
+        // cleared: the completing connection's own terminal events arrive
+        // after finalization and must still pass the generation fence.
+        completedRunIdentity = runIdentity
         runGeneration &+= 1
         liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
         delegate?.streamCoordinatorRemoveSnapshot(streamID: activeStreamID)
@@ -642,6 +694,20 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = true
         delegate?.streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: needsTranscriptRefresh)
         resetRecoveryState()
+    }
+
+    /// Terminal SSE events that may legitimately arrive from the completing
+    /// connection after the run was finalized by its accepted `.done`.
+    /// Payload events (.token, .done, …) are deliberately excluded: a late
+    /// `.done` must never finalize twice, and stale payload must never mutate
+    /// a completed transcript (#18 Slice 1).
+    private func isTerminalEvent(_ event: SSEEvent) -> Bool {
+        switch event {
+        case .streamEnd, .cancelled, .error:
+            return true
+        default:
+            return false
+        }
     }
 
     private func completeResponseFromRefreshedTranscriptAndFinishStream(streamID completedStreamID: String?) {
