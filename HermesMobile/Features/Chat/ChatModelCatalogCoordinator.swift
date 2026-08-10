@@ -248,7 +248,28 @@ actor ChatModelCatalogCoordinator {
 
     // MARK: Network event handling
 
-    /// Actor-serialized handler for one network event. Every event is fenced
+    /// Every `CatalogNetworkEvent` case carries (or wraps) operation metadata.
+/// This accessor is local to the coordinator; the Networking event shape is
+/// untouched (Slice 1 surface preserved).
+private extension CatalogNetworkEvent {
+    var eventMetadata: CatalogEventMetadata? {
+        switch self {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot):
+            return snapshot.metadata
+        case let .live(snapshot):
+            return snapshot.metadata
+        }
+    }
+}
+
+/// Actor-serialized handler for one network event. Every event is fenced
     /// twice: once against the current operation identity (UUID/generation)
     /// and once against the authoritative gate epoch and the operation's own
     /// context key.
@@ -266,11 +287,12 @@ actor ChatModelCatalogCoordinator {
         guard let op = currentOperation,
               op.operationID == operationID,
               !op.isTerminal,
-              event.metadata.operationID == op.operationID,
-              event.metadata.operationGeneration == op.operationGeneration
+              let metadata = event.eventMetadata,
+              metadata.operationID == op.operationID,
+              metadata.operationGeneration == op.operationGeneration
         else { return }
 
-        switch event.metadata.identity {
+        switch metadata.identity {
         case let .provisional(key):
             guard key == op.operationKey, key.startingGateEpoch == authoritativeEpoch else { return }
         case let .verified(key):
