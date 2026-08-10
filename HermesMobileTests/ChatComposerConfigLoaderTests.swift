@@ -317,18 +317,17 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
 
         // The Slice 2 coordinator is the single catalog authority: its ordered
         // stream carries the neutral base/live projections. The loader consumes
-        // that stream and must make no direct profile/switch request.
+        // that stream and must make no direct profile/switch request. The
+        // coordinator identity MUST derive from the client (same pattern as
+        // ChatModelCatalogCoordinatorTests.swift:1139-1152) or the fence drops
+        // every event produced by client.modelCatalogStream.
         let gateKey = ProfileContextGateKey(
-            origin: NormalizedServerOrigin(
-                scheme: "https",
-                host: "loader-catalog-\(UUID().uuidString.lowercased()).test",
-                port: 443
-            ),
-            cookieContextID: CatalogCookieContextID.injected(UUID())
+            origin: NormalizedServerOrigin(url: await client.baseURL),
+            cookieContextID: client.cookieContextID
         )
         let coordinator = ChatModelCatalogCoordinator(
             gateKey: gateKey,
-            apiClientID: UUID(),
+            apiClientID: client.apiClientID,
             authGeneration: 0,
             provider: { requestedProfile, operationID, operationGeneration in
                 await client.modelCatalogStream(

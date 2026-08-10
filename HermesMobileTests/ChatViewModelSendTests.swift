@@ -7301,7 +7301,7 @@ final class ChatViewModelSendTests: XCTestCase {
         callA.continuation.yield(.contextVerified(metadataA, Self.makeCatalogProfileContext(activeProfile: "default")))
         callA.continuation.yield(.base(Self.makeCatalogBaseSnapshot(metadata: metadataA, groups: [Self.makeCatalogGroup(providerID: "openai", modelIDs: ["gpt-5"])], defaultModel: "gpt-5", activeProvider: "openai")))
         await loadTask.value
-        XCTAssertEqual(viewModel.modelCatalogGroups.map(\.providerID), ["openai"])
+        try await waitUntil { viewModel.modelCatalogGroups.map(\.providerID) == ["openai"] }
 
         // The profile switch completes (gate epoch advances); the picker
         // reopens and operation B supersedes A under the new epoch.
