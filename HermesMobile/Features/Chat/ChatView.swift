@@ -343,12 +343,12 @@ struct ChatView: View {
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
             server: server,
-            showsLiveActivityResponseExcerpts: UserDefaults.standard.bool(
-                forKey: AgentRunLiveActivityPrivacy.showsResponseExcerptsKey
-            ),
             // Production terminal persistence: the real CacheStore-backed
             // writer — never a no-op (#18 §522).
-            terminalCacheWriter: CacheStoreTerminalCacheWriter(serverURL: server)
+            terminalCacheWriter: CacheStoreTerminalCacheWriter(serverURL: server),
+            showsLiveActivityResponseExcerpts: UserDefaults.standard.bool(
+                forKey: AgentRunLiveActivityPrivacy.showsResponseExcerptsKey
+            )
         ))
         _gitAvailabilityViewModel = State(initialValue: GitWorkspaceAvailabilityViewModel(
             session: session,
