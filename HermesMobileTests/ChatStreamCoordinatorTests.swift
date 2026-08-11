@@ -1973,7 +1973,6 @@ private struct RecordedTerminalTransition: Equatable {
     let outcome: ChatRunTerminalOutcome
 }
 
-@MainActor
 private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     var streamCoordinatorSessionID: String? = "session-abc"
     var streamCoordinatorDisplayTitle = "Planning"
@@ -2133,7 +2132,6 @@ private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     }
 }
 
-@MainActor
 private final class CoordinatorSpySSEStreamingClient: SSEStreamingClient {
     private(set) var startedURLs: [URL] = []
     private(set) var stopCount = 0
