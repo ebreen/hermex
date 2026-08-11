@@ -30,6 +30,7 @@
 		10CA110C0DE000000000B004 /* AppShortcuts.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 10CA110C0DE000000000B005 /* AppShortcuts.xcstrings */; };
 		D16000000000000000000002 /* ModelCatalogNetworkingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D16000000000000000000001 /* ModelCatalogNetworkingTests.swift */; settings = {COMPILER_FLAGS = "-strict-concurrency=complete -warnings-as-errors"; }; };
 		F16000000000000000000002 /* ChatModelCatalogCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16000000000000000000001 /* ChatModelCatalogCoordinatorTests.swift */; settings = {COMPILER_FLAGS = "-strict-concurrency=complete -warnings-as-errors"; }; };
+		F36000000000000000000002 /* ChatModelCatalogIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F36000000000000000000001 /* ChatModelCatalogIntegrationTests.swift */; settings = {COMPILER_FLAGS = "-strict-concurrency=complete -warnings-as-errors"; }; };
 		E16000000000000000000002 /* ModelCatalogNetworking.swift in Sources */ = {isa = PBXBuildFile; fileRef = E16000000000000000000001 /* ModelCatalogNetworking.swift */; settings = {COMPILER_FLAGS = "-strict-concurrency=complete -warnings-as-errors"; }; };
 		F26000000000000000000002 /* ChatModelCatalogCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F26000000000000000000001 /* ChatModelCatalogCoordinator.swift */; settings = {COMPILER_FLAGS = "-strict-concurrency=complete -warnings-as-errors"; }; };
 		10CA110C0DE000000000C001 /* LocalizationCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10CA110C0DE000000000C002 /* LocalizationCatalogTests.swift */; };
@@ -385,6 +386,7 @@
 		10CA110C0DE000000000B005 /* AppShortcuts.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = AppShortcuts.xcstrings; sourceTree = "<group>"; };
 		D16000000000000000000001 /* ModelCatalogNetworkingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalogNetworkingTests.swift; sourceTree = "<group>"; };
 		F16000000000000000000001 /* ChatModelCatalogCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModelCatalogCoordinatorTests.swift; sourceTree = "<group>"; };
+		F36000000000000000000001 /* ChatModelCatalogIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModelCatalogIntegrationTests.swift; sourceTree = "<group>"; };
 		E16000000000000000000001 /* ModelCatalogNetworking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalogNetworking.swift; sourceTree = "<group>"; };
 		F26000000000000000000001 /* ChatModelCatalogCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatModelCatalogCoordinator.swift; sourceTree = "<group>"; };
 		10CA110C0DE000000000C002 /* LocalizationCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationCatalogTests.swift; sourceTree = "<group>"; };
@@ -817,6 +819,7 @@
 				C03900000000000000000013 /* ModelCatalogTests.swift */,
 				D16000000000000000000001 /* ModelCatalogNetworkingTests.swift */,
 				F16000000000000000000001 /* ChatModelCatalogCoordinatorTests.swift */,
+				F36000000000000000000001 /* ChatModelCatalogIntegrationTests.swift */,
 				C03900000000000000000014 /* MessageActionContextTests.swift */,
 				C03900000000000000000015 /* SessionIdentityTests.swift */,
 				C03900000000000000000016 /* TranscriptDisplayModelTests.swift */,
@@ -1696,6 +1699,7 @@
 				C03910000000000000000013 /* ModelCatalogTests.swift in Sources */,
 				D16000000000000000000002 /* ModelCatalogNetworkingTests.swift in Sources */,
 				F16000000000000000000002 /* ChatModelCatalogCoordinatorTests.swift in Sources */,
+				F36000000000000000000002 /* ChatModelCatalogIntegrationTests.swift in Sources */,
 				C03910000000000000000014 /* MessageActionContextTests.swift in Sources */,
 				C03910000000000000000015 /* SessionIdentityTests.swift in Sources */,
 				C03910000000000000000016 /* TranscriptDisplayModelTests.swift in Sources */,
