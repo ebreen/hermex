@@ -1871,6 +1871,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertTrue(matches, "expected \(expected) disposition, got \(disposition)", file: file, line: line)
     }
 
+    @MainActor
     private func assertNoCancellationMutation(
         streamClient: CoordinatorSpySSEStreamingClient,
         liveActivityManager: CoordinatorSpyLiveActivityManager,
