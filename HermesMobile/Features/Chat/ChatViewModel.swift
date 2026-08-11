@@ -753,30 +753,32 @@ final class ChatViewModel {
         } while needsComposerConfigurationReload
     }
 
-    /// Refreshes the model catalog when a picker opens: refetch `/api/models`
-    /// through the Networking compatibility lease (so the sheet stops pinning
-    /// the chat-load-time snapshot), then overlay the active provider's live
-    /// list from `/api/models/live`. Failures are silent by design — the
-    /// picker keeps whatever it already shows. An epoch-advanced envelope (a
-    /// profile switch raced this refresh) is discarded before state mutation.
+    /// Refreshes the model catalog when a picker opens through the Networking
+    /// neutral ordered stream. Each projection is revalidated immediately after
+    /// the await and before it mutates MainActor state; a profile switch that
+    /// advances the authoritative epoch silently drops the old result.
     func refreshModelCatalogForPickerOpen() async {
-        if let envelope = try? await client.compatibilityModels(operationID: UUID(), operationGeneration: 1),
-           await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-            let groups = envelope.value.groups
-            if !groups.isEmpty {
-                modelCatalogGroups = groups
-            }
-        }
-
-        if let live = try? await client.compatibilityModelsLive(operationID: UUID(), operationGeneration: 1),
-           await client.acceptsCompatibilityEpoch(gateEpoch: live.gateEpoch, gateKey: live.gateKey) {
-            // The live compatibility snapshot merges onto an empty base in
-            // this fencing slice, so an empty result keeps the cached groups;
-            // the coordinator-owned neutral surface (Slice 3/4) carries the
-            // full merged projection.
-            let liveGroups = live.value.groups
-            if !liveGroups.isEmpty {
-                modelCatalogGroups = liveGroups
+        let stream = client.modelCatalogStream(
+            requestedProfile: nil,
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        for await event in stream {
+            switch event {
+            case let .base(snapshot):
+                guard await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+                if !snapshot.groups.isEmpty {
+                    modelCatalogGroups = snapshot.groups
+                }
+            case let .live(snapshot):
+                guard await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+                if !snapshot.groups.isEmpty {
+                    modelCatalogGroups = snapshot.groups
+                }
+            case .contextVerified, .liveFailed:
+                continue
+            case .failed, .finished, .cancelled:
+                return
             }
         }
     }

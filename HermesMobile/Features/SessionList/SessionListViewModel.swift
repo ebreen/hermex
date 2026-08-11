@@ -270,13 +270,17 @@ final class SessionListViewModel {
         defer { isLoadingActiveProfile = false }
 
         do {
-            // Raw profile read under the Networking compatibility lease (issue
-            // #16 Slice 1); an epoch-advanced result (a concurrent profile
-            // switch) is discarded before state mutation.
-            let envelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-                applyActiveProfile(envelope.value)
+            let snapshot = await client.profileContextSnapshot(
+                operationID: UUID(),
+                operationGeneration: 1
+            )
+            guard !Task.isCancelled,
+                  await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+            guard !snapshot.activeProfile.isEmpty else {
+                activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
+                return
             }
+            applyActiveProfile(snapshot)
         } catch {
             guard !isCancellationError(error) else { return }
 

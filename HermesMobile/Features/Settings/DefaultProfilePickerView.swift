@@ -249,26 +249,25 @@ struct DefaultProfilePickerView: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            // Raw profile read under the Networking compatibility lease (issue
-            // #16 Slice 1); an epoch-advanced result is discarded before state
-            // mutation.
-            let client = APIClient(baseURL: server)
-            let envelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-                let response = envelope.value
-                profiles = response.profiles ?? []
-                activeProfileName = response.effectiveDefaultProfileName ?? currentDefaultProfileName
-                isSingleProfileMode = response.singleProfileMode ?? false
-            }
-        } catch {
-            // A cancelled .task (view dismissed mid-load) must not surface a
-            // "cancelled" error into state.
-            if !Self.isCancellationError(error) {
-                errorMessage = error.localizedDescription
-            }
+        let client = APIClient(baseURL: server)
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        guard !Task.isCancelled,
+              await client.acceptsCatalogMetadata(snapshot.metadata) else {
+            isLoading = false
+            return
         }
 
+        guard !snapshot.profiles.isEmpty, !snapshot.activeProfile.isEmpty else {
+            errorMessage = String(localized: "Could Not Load Profiles")
+            isLoading = false
+            return
+        }
+        profiles = snapshot.profiles
+        activeProfileName = snapshot.activeProfile
+        isSingleProfileMode = snapshot.singleProfileMode
         isLoading = false
     }
 
@@ -460,14 +459,17 @@ private struct CreateProfileSheet: View {
     }
 
     private func loadModels() async {
-        // Best-effort, like the webui form: on failure the picker simply keeps
-        // only the "Use active profile default" option. The compatibility
-        // lease is shared with the profile-switch writer (issue #16 Slice 1);
-        // an epoch-advanced result is discarded before state mutation.
+        // Best-effort neutral catalog projection for the create-profile form.
         let client = APIClient(baseURL: server)
-        guard let envelope = try? await client.compatibilityModels(operationID: UUID(), operationGeneration: 1),
-              await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) else { return }
-        modelGroups = envelope.value.groups
+        let snapshot = await client.modelCatalogSnapshot(
+            requestedProfile: nil,
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        guard !Task.isCancelled,
+              await client.acceptsCatalogSnapshot(snapshot),
+              snapshot.failure == nil else { return }
+        modelGroups = snapshot.live?.groups ?? snapshot.base?.groups ?? []
     }
 
     private func create() async {

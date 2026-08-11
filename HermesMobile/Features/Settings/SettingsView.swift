@@ -1056,12 +1056,15 @@ struct SettingsView: View {
         }
 
         do {
-            // Base catalog under the Networking compatibility lease (issue #16
-            // Slice 1); an epoch-advanced result is discarded before state
-            // mutation.
-            let catalog = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: catalog.gateEpoch, gateKey: catalog.gateKey) {
-                defaultModel = catalog.value.defaultModel
+            let catalog = await client.modelCatalogSnapshot(
+                requestedProfile: nil,
+                operationID: UUID(),
+                operationGeneration: 1
+            )
+            if await client.acceptsCatalogSnapshot(catalog), catalog.failure == nil {
+                defaultModel = catalog.base?.defaultModel
+            } else {
+                defaultModel = nil
             }
         } catch {
             // Non-fatal: default model is optional info
@@ -1071,11 +1074,19 @@ struct SettingsView: View {
         isLoadingDefaultModel = false
 
         do {
-            let profilesEnvelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: profilesEnvelope.gateEpoch, gateKey: profilesEnvelope.gateKey) {
-                let profiles = profilesEnvelope.value
-                defaultProfileName = profiles.effectiveDefaultProfileName
-                defaultProfileDisplayName = profiles.displayName(for: defaultProfileName)
+            let profileSnapshot = await client.profileContextSnapshot(
+                operationID: UUID(),
+                operationGeneration: 1
+            )
+            if await client.acceptsCatalogMetadata(profileSnapshot.metadata),
+               !profileSnapshot.activeProfile.isEmpty {
+                defaultProfileName = profileSnapshot.activeProfile
+                defaultProfileDisplayName = profileSnapshot.profiles.first {
+                    $0.normalizedName == profileSnapshot.activeProfile
+                }?.displayName
+            } else {
+                defaultProfileName = nil
+                defaultProfileDisplayName = nil
             }
         } catch {
             // Non-fatal: default profile is optional info

@@ -195,39 +195,23 @@ struct DefaultModelPickerView: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            let client = APIClient(baseURL: server)
-            let envelope = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-                defaultModel = envelope.value.defaultModel ?? currentDefaultModel
-                groups = envelope.value.groups
-            }
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-
-        isLoading = false
-
-        await overlayLiveModels()
-    }
-
-    /// Overlays the active provider's live (uncached) list onto the cached
-    /// catalog so newly available models appear. Failures are silent by
-    /// design — the cached list stays as-is (issue #236). The compatibility
-    /// lease is shared with the profile-switch writer (issue #16 Slice 1);
-    /// an epoch-advanced result is discarded before state mutation.
-    private func overlayLiveModels() async {
         let client = APIClient(baseURL: server)
-        guard let envelope = try? await client.compatibilityModelsLive(operationID: UUID(), operationGeneration: 1),
-              await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) else { return }
-        // The live compatibility snapshot merges onto an empty base in this
-        // fencing slice, so an empty result keeps the cached groups; the
-        // coordinator-owned neutral surface (Slice 3/4) carries the full
-        // merged projection.
-        let liveGroups = envelope.value.groups
-        if !liveGroups.isEmpty {
-            groups = liveGroups
+        let snapshot = await client.modelCatalogSnapshot(
+            requestedProfile: nil,
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        guard await client.acceptsCatalogSnapshot(snapshot),
+              snapshot.failure == nil,
+              let base = snapshot.base else {
+            errorMessage = String(localized: "Could Not Load Models")
+            isLoading = false
+            return
         }
+
+        defaultModel = base.defaultModel ?? currentDefaultModel
+        groups = snapshot.live?.groups ?? base.groups
+        isLoading = false
     }
 
     private func save(_ model: String, isCustom: Bool = false) async {

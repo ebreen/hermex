@@ -68,38 +68,90 @@ struct ChatComposerConfigLoader {
     func loadConfigurationFromClient(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
         var state = initialState
         var configurationError: Error?
+        var selectedProfile: ProfileSummary?
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
 
-        do {
-            // Raw profile read under the Networking compatibility lease (issue
-            // #16 Slice 1). An epoch-advanced result (a concurrent profile
-            // switch) is discarded before it can mutate state; the next
-            // configuration load reconciles.
-            var selectedProfile: ProfileSummary?
-            let profilesEnvelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: profilesEnvelope.gateEpoch, gateKey: profilesEnvelope.gateKey) {
-                let profilesResponse = profilesEnvelope.value
-                state.profileOptions = profilesResponse.profiles ?? []
-                state.isSingleProfileMode = profilesResponse.singleProfileMode ?? false
-                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                    ?? Self.nonEmpty(profilesResponse.active)
-                    ?? profilesResponse.effectiveDefaultProfileName
+        // The coordinator-backed initializer consumes the ordered
+        // `modelCatalogStream`; this direct compatibility-free path uses the
+        // same Networking-owned Sendable projections when no coordinator is
+        // injected (legacy callers still retain their request ordering).
+        let requestedProfile = Self.nonEmpty(state.currentProfile)
+        var catalogResult: CatalogSnapshotResult?
 
-                if let sessionProfile = Self.nonEmpty(state.currentProfile),
-                   Self.nonEmpty(profilesResponse.active) != sessionProfile {
-                    let switchResponse = try await client.switchProfile(name: sessionProfile)
+        if let requestedProfile {
+            let profileSnapshot = await client.profileContextSnapshot(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+            guard await client.acceptsCatalogMetadata(profileSnapshot.metadata) else {
+                configurationError = NSError(
+                    domain: "ChatComposerConfigLoader",
+                    code: ChatComposerConfigFailure.profileUnavailable.code,
+                    userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileUnavailable.localizedDescription]
+                )
+                return await finishDirectLoad(
+                    state: state,
+                    configurationError: configurationError,
+                    client: client
+                )
+            }
+
+            state.profileOptions = profileSnapshot.profiles
+            state.isSingleProfileMode = profileSnapshot.singleProfileMode
+            state.selectedProfileName = requestedProfile
+            selectedProfile = Self.profileSummary(matching: requestedProfile, in: state.profileOptions)
+            if state.currentModel == nil {
+                state.currentModel = Self.nonEmpty(selectedProfile?.model)
+            }
+
+            if profileSnapshot.activeProfile != requestedProfile {
+                do {
+                    let switchResponse = try await client.switchProfile(name: requestedProfile)
                     state.profileOptions = switchResponse.profiles ?? state.profileOptions
-                    state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? sessionProfile
+                    state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? requestedProfile
                     state.currentProfile = state.selectedProfileName
-
                     if state.currentWorkspace == nil {
                         state.currentWorkspace = Self.nonEmpty(switchResponse.defaultWorkspace)
                     }
-
                     if state.currentModel == nil {
                         state.currentModel = Self.nonEmpty(switchResponse.defaultModel)
                     }
+                } catch {
+                    configurationError = error
                 }
+            }
 
+            if configurationError == nil {
+                catalogResult = await client.modelCatalogBaseOnlySnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    activeProfile: state.selectedProfileName
+                )
+            }
+        } else {
+            catalogResult = await client.modelCatalogBaseSnapshot(
+                requestedProfile: nil,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+        }
+
+        if let catalogResult {
+            guard await client.acceptsCatalogSnapshot(catalogResult) else {
+                configurationError = NSError(
+                    domain: "ChatComposerConfigLoader",
+                    code: ChatComposerConfigFailure.catalogUnavailable.code,
+                    userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription]
+                )
+            }
+
+            if configurationError == nil, let context = catalogResult.context {
+                state.profileOptions = context.profiles
+                state.isSingleProfileMode = context.singleProfileMode
+                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
+                    ?? Self.nonEmpty(context.activeProfile)
+                    ?? context.requestedProfile
                 selectedProfile = Self.profileSummary(
                     matching: state.selectedProfileName,
                     in: state.profileOptions
@@ -109,52 +161,81 @@ struct ChatComposerConfigLoader {
                 }
             }
 
-            // Base catalog under the same shared compatibility lease; an
-            // epoch-advanced result is discarded before state mutation.
-            let modelsEnvelope = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: modelsEnvelope.gateEpoch, gateKey: modelsEnvelope.gateKey) {
-                let modelsResponse = modelsEnvelope.value
-                state.modelCatalogGroups = modelsResponse.groups
+            if configurationError == nil, let base = catalogResult.base {
+                state.modelCatalogGroups = base.groups
                 if state.currentModel == nil {
-                    state.currentModel = modelsResponse.defaultModel
+                    state.currentModel = base.defaultModel
                 }
                 if Self.nonEmpty(state.currentModelProvider) == nil {
                     state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
                         ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
                 }
+                if let failure = catalogResult.failure {
+                    configurationError = Self.error(for: failure)
+                }
+            } else if configurationError == nil {
+                configurationError = Self.error(for: catalogResult.failure ?? .transport)
             }
-
-            // Scope the query to the session's resolved model/provider so the
-            // gating fields are model-accurate (issue #18); the seeded effort is
-            // the server's already-coerced value for that model.
-            let reasoningResponse = try await client.reasoning(
-                model: Self.nonEmpty(state.currentModel),
-                provider: Self.nonEmpty(state.currentModelProvider)
-            )
-            state.selectedReasoningEffort = reasoningResponse.effectiveEffort
-            state.supportedReasoningEfforts = reasoningResponse.normalizedSupportedEfforts
-            state.supportsReasoningEffort = reasoningResponse.supportsReasoningEffort
-
-            let workspaceResponse = try await client.workspaces()
-            state.workspaceRoots = workspaceResponse.workspaces ?? []
-            if state.currentWorkspace == nil {
-                state.currentWorkspace = workspaceResponse.last ?? state.workspaceRoots.compactMap(\.path).first
-            }
-            state.workspaceSuggestions = state.workspaceRoots.compactMap(\.path)
-        } catch {
-            configurationError = error
         }
 
+        if configurationError == nil {
+            do {
+                let reasoningResponse = try await client.reasoning(
+                    model: Self.nonEmpty(state.currentModel),
+                    provider: Self.nonEmpty(state.currentModelProvider)
+                )
+                state.selectedReasoningEffort = reasoningResponse.effectiveEffort
+                state.supportedReasoningEfforts = reasoningResponse.normalizedSupportedEfforts
+                state.supportsReasoningEffort = reasoningResponse.supportsReasoningEffort
+            } catch {
+                configurationError = error
+            }
+
+            do {
+                let workspaceResponse = try await client.workspaces()
+                state.workspaceRoots = workspaceResponse.workspaces ?? []
+                if state.currentWorkspace == nil {
+                    state.currentWorkspace = workspaceResponse.last ?? state.workspaceRoots.compactMap(\.path).first
+                }
+                state.workspaceSuggestions = state.workspaceRoots.compactMap(\.path)
+            } catch {
+                if configurationError == nil { configurationError = error }
+            }
+        }
+
+        return await finishDirectLoad(
+            state: state,
+            configurationError: configurationError,
+            client: client
+        )
+    }
+
+    private func finishDirectLoad(
+        state: ChatComposerConfigState,
+        configurationError: Error?,
+        client: APIClient
+    ) async -> ChatComposerConfigLoadResult {
+        var state = state
         do {
             state.agentCommands = (try await client.commands()).commands ?? []
         } catch {
             state.agentCommands = []
         }
-
         return ChatComposerConfigLoadResult(
             state: state,
             configurationFailure: Self.failureCategory(from: configurationError)
         )
+    }
+
+    private static func error(for failure: CatalogFailureCategory) -> Error {
+        switch failure {
+        case .profileUnavailable, .unknownContext:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileUnavailable.localizedDescription])
+        case .profileSwitchRejected:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileSwitchRejected.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileSwitchRejected.localizedDescription])
+        default:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.catalogUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription])
+        }
     }
 
     private static func failureCategory(from error: Error?) -> ChatComposerConfigFailure? {
