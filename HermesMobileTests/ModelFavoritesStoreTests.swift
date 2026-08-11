@@ -190,6 +190,6 @@ final class ModelFavoritesStoreTests: XCTestCase {
             anthropic
         )
         XCTAssertNil(options.firstMatchingSelection(modelID: "shared/model", providerID: "openrouter"))
-        XCTAssertEqual(options.firstMatchingSelection(modelID: "shared/model", providerID: nil), openAI)
+        XCTAssertNil(options.firstMatchingSelection(modelID: "shared/model", providerID: nil))
     }
 }

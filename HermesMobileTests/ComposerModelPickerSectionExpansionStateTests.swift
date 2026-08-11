@@ -90,4 +90,66 @@ final class ComposerModelPickerSectionExpansionStateTests: XCTestCase {
         XCTAssertTrue(state.isExpanded(groupID: "openai"))
         XCTAssertFalse(state.isExpanded(groupID: "anthropic"))
     }
+
+    func testFirstNonEmptyGroupAutoExpandsWhenNoUsefulRow() {
+        var state = ComposerModelPickerSectionExpansionState()
+        let groups = [
+            ModelCatalogGroup(id: "openai", name: "OpenAI", providerID: "openai", models: [
+                ModelCatalogOption(id: "gpt-5.5", displayName: "GPT-5.5", providerID: "openai")
+            ]),
+            ModelCatalogGroup(id: "anthropic", name: "Anthropic", providerID: "anthropic", models: [
+                ModelCatalogOption(id: "claude", displayName: "Claude", providerID: "anthropic")
+            ])
+        ]
+
+        state.autoExpandFirstNonEmptyGroup(in: groups, usefulRowPresent: false)
+
+        XCTAssertTrue(state.isExpanded(groupID: "openai"))
+        XCTAssertFalse(state.isExpanded(groupID: "anthropic"))
+    }
+
+    func testEmptyFirstGroupSkipsToNextNonEmptyGroup() {
+        var state = ComposerModelPickerSectionExpansionState()
+        let groups = [
+            ModelCatalogGroup(id: "empty", name: "Empty", providerID: "empty", models: []),
+            ModelCatalogGroup(id: "openai", name: "OpenAI", providerID: "openai", models: [
+                ModelCatalogOption(id: "gpt-5.5", displayName: "GPT-5.5", providerID: "openai")
+            ])
+        ]
+
+        state.autoExpandFirstNonEmptyGroup(in: groups, usefulRowPresent: false)
+
+        XCTAssertFalse(state.isExpanded(groupID: "empty"))
+        XCTAssertTrue(state.isExpanded(groupID: "openai"))
+    }
+
+    func testUsefulFallbackRowPreventsAutoExpansion() {
+        var state = ComposerModelPickerSectionExpansionState()
+        let groups = [
+            ModelCatalogGroup(id: "openai", name: "OpenAI", providerID: "openai", models: [
+                ModelCatalogOption(id: "gpt-5.5", displayName: "GPT-5.5", providerID: "openai")
+            ])
+        ]
+
+        state.autoExpandFirstNonEmptyGroup(in: groups, usefulRowPresent: true)
+
+        XCTAssertFalse(state.isExpanded(groupID: "openai"))
+    }
+
+    func testUserTogglePreventsLaterAutomaticOverride() {
+        var state = ComposerModelPickerSectionExpansionState()
+        let groups = [
+            ModelCatalogGroup(id: "openai", name: "OpenAI", providerID: "openai", models: [
+                ModelCatalogOption(id: "gpt-5.5", displayName: "GPT-5.5", providerID: "openai")
+            ])
+        ]
+
+        state.autoExpandFirstNonEmptyGroup(in: groups, usefulRowPresent: false)
+        XCTAssertTrue(state.isExpanded(groupID: "openai"))
+
+        state.setExpanded(false, groupID: "openai")
+        state.autoExpandFirstNonEmptyGroup(in: groups, usefulRowPresent: false)
+
+        XCTAssertFalse(state.isExpanded(groupID: "openai"))
+    }
 }
