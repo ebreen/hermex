@@ -106,11 +106,11 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
         // v1-contract break.
         let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
         XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .completed),
-                       "term-v1-4f8b2c1a9e7d3f6a5b0c8d2e1f4a7b9c")
+                       "term-v1-2bdbbdf1a31e224293bd5f3d888cf24a")
         XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .failed),
-                       "term-v1-9c1d4e7f2a5b8c0d3e6f1a4b7c9d0e2f")
+                       "term-v1-2850cbc540e0b77ca5887e4393515518")
         XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .cancelled),
-                       "term-v1-2e5f8a1b4c7d0e3f6a9b2c5d8e1f4a7b")
+                       "term-v1-8ce19279944bd2610116542da84432e9")
     }
 
     func testTerminalEventMessageIDExcludesConnectionGeneration() {

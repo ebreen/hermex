@@ -352,17 +352,6 @@ final class ChatViewModel {
     var uploadAttachmentErrorMessage: String? { attachmentCoordinator.uploadAttachmentErrorMessage }
     var localAttachmentPreviews: [String: [String: Data]] { attachmentCoordinator.localAttachmentPreviews }
     private(set) var pinnedLocalNotices: [String] = []
-    /// Injected persistence seam for terminal commits (#18 Slice 5). The VM
-    /// appends the stable local notice, then sends the single identity-keyed
-    /// handoff through this writer; a throwing writer keeps the handoff
-    /// pending for retry without re-appending.
-    private let terminalCacheWriter: any ChatTerminalCacheWriter
-    /// Terminal event keys already committed locally, deduping repeated
-    /// terminal callbacks for the same `(streamID, logicalGeneration, outcome)`.
-    private var terminalEventKeys = Set<String>()
-    /// Monotonic handoff generation across runs: every accepted terminal
-    /// commit bumps it, so handoffs are strictly ordered (#18 Slice 5).
-    private var terminalHandoffGeneration = 0
     var approvalPrompt: ApprovalPromptState? { pendingActionCoordinator.approvalPrompt }
     var isRespondingToApproval: Bool { pendingActionCoordinator.isRespondingToApproval }
     var approvalErrorMessage: String? { pendingActionCoordinator.approvalErrorMessage }
@@ -465,8 +454,7 @@ final class ChatViewModel {
         session: SessionSummary,
         server: URL,
         client: APIClient? = nil,
-        streamClient: SSEStreamingClient? = nil,
-        terminalCacheWriter: any ChatTerminalCacheWriter = NoopTerminalCacheWriter(),
+        streamClient: SSEStreamingClient? = nil, terminalCacheWriter: any ChatTerminalCacheWriter = NoopTerminalCacheWriter(),
         approvalStreamClient: SSEStreamingClient? = nil,
         clarifyStreamClient: SSEStreamingClient? = nil,
         btwStreamClient: SSEStreamingClient? = nil,
@@ -488,8 +476,7 @@ final class ChatViewModel {
         currentModelProvider = session.modelProvider
         currentProfile = session.profile
         isCLISession = session.isCliSession == true
-        self.server = server
-        self.terminalCacheWriter = terminalCacheWriter
+        self.server = server; self.terminalCacheWriter = terminalCacheWriter
         let resolvedClient = client ?? APIClient(baseURL: server)
         let resolvedStreamClient = streamClient ?? SSEClient()
         let resolvedLiveActivityManager = liveActivityManager ?? AgentLiveActivityManager.shared
@@ -795,6 +782,18 @@ final class ChatViewModel {
     }
 
     // MARK: Slice 3 coordinator-owned catalog (#16)
+
+    /// Injected persistence seam for terminal commits (#18 Slice 5). The VM
+    /// appends the stable local notice, then sends the single identity-keyed
+    /// handoff through this writer; a throwing writer keeps the handoff
+    /// pending for retry without re-appending.
+    private let terminalCacheWriter: any ChatTerminalCacheWriter
+    /// Terminal event keys already committed locally, deduping repeated
+    /// terminal callbacks for the same `(streamID, logicalGeneration, outcome)`.
+    private var terminalEventKeys = Set<String>()
+    /// Monotonic handoff generation across runs: every accepted terminal
+    /// commit bumps it, so handoffs are strictly ordered (#18 Slice 5).
+    private var terminalHandoffGeneration = 0
 
     /// The recovery-load token of the current run connection (#18 Slice 4).
     /// A transcript load that completes after the run was replaced or
