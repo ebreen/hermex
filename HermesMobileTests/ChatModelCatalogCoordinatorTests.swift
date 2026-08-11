@@ -968,6 +968,99 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
+    func testOldLiveCompletionCannotPublishAfterSwitchEpoch() async throws {
+        let harness = makeHarness()
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        // Operation A is verified and its base is visible under epoch 0.
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let callA = harness.provider.call(0)
+        let metadataA = verifiedMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            activeProfile: "default",
+            gateEpoch: Self.epochZero,
+            operationID: callA.operationID,
+            operationGeneration: callA.operationGeneration
+        )
+        callA.continuation.yield(.contextVerified(metadataA, makeProfileContext(activeProfile: "default")))
+        callA.continuation.yield(.base(makeBaseSnapshot(
+            metadata: metadataA,
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])],
+            defaultModel: "gpt-5",
+            activeProvider: "openai"
+        )))
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .base = event { return true }
+                return false
+            }
+        }
+
+        // The switch advances the authoritative epoch before the old live
+        // completion is released. Operation B is the only current context.
+        try await advanceGateEpoch(gateKey: harness.gateKey)
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(2)
+        let callB = harness.provider.call(1)
+        let metadataB = verifiedMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            activeProfile: "work",
+            gateEpoch: 1,
+            operationID: callB.operationID,
+            operationGeneration: callB.operationGeneration
+        )
+
+        // A's live child completes late and must be dropped before it reaches
+        // the coordinator multicast stream.
+        callA.continuation.yield(.live(makeLiveSnapshot(
+            metadata: metadataA,
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5-mini"])],
+            provider: "openai"
+        )))
+        callA.continuation.yield(.finished(metadataA))
+        callA.continuation.finish()
+
+        callB.continuation.yield(.contextVerified(metadataB, makeProfileContext(activeProfile: "work")))
+        callB.continuation.yield(.base(makeBaseSnapshot(
+            metadata: metadataB,
+            groups: [makeGroup(providerID: "anthropic", modelIDs: ["claude-4"])],
+            defaultModel: "claude-4",
+            activeProvider: "anthropic"
+        )))
+        callB.continuation.yield(.live(makeLiveSnapshot(
+            metadata: metadataB,
+            groups: [makeGroup(providerID: "anthropic", modelIDs: ["claude-4-mini"])],
+            provider: "anthropic"
+        )))
+        callB.continuation.yield(.finished(metadataB))
+        callB.continuation.finish()
+
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .live(snapshot) = event, snapshot.metadata.operationID == callB.operationID {
+                    return true
+                }
+                return false
+            }
+        }
+        let events = subscriber.collector.snapshot()
+        XCTAssertFalse(
+            events.contains { event in
+                if case let .live(snapshot) = event {
+                    return snapshot.metadata.operationID == callA.operationID
+                }
+                return false
+            },
+            "the old live completion must never publish after the switch epoch"
+        )
+        let finalState = await harness.coordinator.state
+        XCTAssertEqual(finalState, .freshReady)
+        await cancel(subscriber)
+    }
+
     func testCoordinatorRejectsEventWithStaleGateEpochBeforeYield() async throws {
         let harness = makeHarness()
         let subscriber = await makeSubscriber(harness.coordinator)
@@ -1132,7 +1225,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
-    func testUnverifiedProfileFailureIssuesZeroModelGETsAndRetryIsAccessible() async throws {
+    func testUnverifiedProfileFailureIssuesZeroModelGETs() async throws {
         let fixture = CoordinatorWireFixture()
         fixture.installProfilesOnly(#"{"profiles":[],"active":null}"#)
         let client = fixture.makeClient()

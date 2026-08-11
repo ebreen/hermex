@@ -1217,6 +1217,180 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertFalse(acceptsStaleEpoch, "an advanced epoch rejects the pre-switch compatibility envelope before apply")
     }
 
+    // MARK: - Slice 4 RED: neutral caller migration and profile-read fencing
+
+    // These caller-level tests deliberately inspect the production path as well
+    // as exercising the neutral request surface. The five paths must stop using
+    // compatibility DTO envelopes in Slice 4: Chat loader/VM consume the ordered
+    // stream, while the three Settings callers consume modelCatalogSnapshot.
+    // The source assertions are expected RED on the protected Slice 4 base; the
+    // request-count assertions pin the neutral surface that GREEN must route to.
+
+    func testChatLoaderCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift",
+            requiredCall: "modelCatalogStream"
+        )
+    }
+
+    func testChatViewModelCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Chat/ChatViewModel.swift",
+            requiredCall: "modelCatalogStream"
+        )
+    }
+
+    func testDefaultModelPickerCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testDefaultProfilePickerCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testSettingsSummaryCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/SettingsView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testSessionListProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/SessionList/SessionListViewModel.swift"
+        )
+    }
+
+    func testDefaultProfilePickerProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift"
+        )
+    }
+
+    func testSettingsProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/Settings/SettingsView.swift"
+        )
+    }
+
+    func testAppIntentProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/AppIntents/ProfileEntity.swift"
+        )
+    }
+
+    private func assertNeutralCatalogCaller(
+        relativePath: String,
+        requiredCall: String
+    ) async throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains(requiredCall),
+            "\(relativePath) must route catalog work through \(requiredCall)"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityModels("),
+            "\(relativePath) must not retain a compatibility model DTO caller"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityProfiles("),
+            "\(relativePath) must not resolve profile context beside the neutral catalog operation"
+        )
+
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        if requiredCall == "modelCatalogStream" {
+            let events = await Self.collectEvents(from: await client.modelCatalogStream(
+                requestedProfile: nil,
+                operationID: operationID,
+                operationGeneration: 1
+            ))
+            XCTAssertTrue(events.contains { event in
+                if case .finished = event { return true }
+                return false
+            })
+        } else {
+            let snapshot = await client.modelCatalogSnapshot(
+                requestedProfile: nil,
+                operationID: operationID,
+                operationGeneration: 1
+            )
+            XCTAssertNil(snapshot.failure)
+            XCTAssertNotNil(snapshot.base)
+        }
+
+        let paths = fixture.requests().compactMap { $0.url?.path }
+        XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "/api/models" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "/api/models/live" }.count, 1)
+    }
+
+    private func assertProfileReadCaller(relativePath: String) async throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("profileContextSnapshot"),
+            "\(relativePath) must use the neutral profile read surface"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityProfiles("),
+            "\(relativePath) must not apply a compatibility profile envelope"
+        )
+
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertEqual(snapshot.activeProfile, "default")
+        XCTAssertEqual(snapshot.profiles.map(\.name), ["default"])
+
+        let acceptedBeforeSwitch = await client.acceptsCatalogMetadata(snapshot.metadata)
+        XCTAssertTrue(acceptedBeforeSwitch, "the current profile read is accepted before the epoch changes")
+
+        try await advanceEpochForSlice4(gate: gateFor(fixture: fixture, client: client))
+        let acceptedAfterSwitch = await client.acceptsCatalogMetadata(snapshot.metadata)
+        XCTAssertFalse(
+            acceptedAfterSwitch,
+            "a decoded profile read must not publish after the authoritative epoch advances"
+        )
+        XCTAssertEqual(
+            fixture.requests().filter { $0.url?.path == "/api/profiles" }.count,
+            1,
+            "profile reads use one neutral profiles request and never issue model requests"
+        )
+        XCTAssertEqual(
+            fixture.requests().filter { $0.url?.path == "/api/models" || $0.url?.path == "/api/models/live" }.count,
+            0
+        )
+    }
+
+    private func advanceEpochForSlice4(gate: ProfileContextGate) async throws {
+        let operationID = UUID()
+        let admission = try await gate.acquireWriter(operationID: operationID)
+        await gate.advanceEpoch(operationID: operationID)
+        await gate.releaseWriter(operationID: operationID, admission: admission)
+    }
+
     // MARK: - Slice 1 gate helpers
 
     private func gateFor(
