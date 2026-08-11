@@ -1,3 +1,4 @@
+import SwiftData
 import XCTest
 @testable import HermesMobile
 
@@ -76,92 +77,116 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
                        "Different attachment filenames are distinct messages")
     }
 
-    // MARK: - Slice 5 (#18): stable terminal event key and identity-keyed handoff
+    // MARK: - Slice 5 (#18): run-status-v1 terminal event key and handoff
     //
-    // RED phase: these tests reference the intended-missing Slice 5 seam —
-    // `stableTerminalEventMessageID` (deterministic v1 fixture function),
-    // `ChatTerminalCommit`, `ChatTerminalPersistenceHandoff` and
-    // `ChatTerminalCacheWriter` — plus the intended `ChatTerminalOutcome`
-    // vocabulary (.completed / .failed / .cancelled, Equatable). One terminal
-    // event per (session, stream, logicalGeneration, outcome); the local notice
-    // is appended before the single identity-keyed handoff is written.
+    // The stable terminal event message ID is `run-status-v1-` + SHA-256 over
+    // the contract's exact canonical bytes (issue #18 §6): domain
+    // `hermex.chat.run-status-terminal/v1\0`, 4-byte BE session-byte length,
+    // session UTF-8, 4-byte BE stream-byte length, stream UTF-8, 8-byte BE
+    // logical generation, and one outcome byte (completed 0x01, failed 0x02,
+    // cancelled 0x03). The four pinned fixtures below are contract-mandated
+    // and were verified independently; changing the canonical encoding is a
+    // v1-contract break.
 
     func testTerminalEventMessageIDIsStableForRunIdentityAndOutcome() {
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let first = stableTerminalEventMessageID(identity: identity, outcome: .completed)
-        let second = stableTerminalEventMessageID(identity: identity, outcome: .completed)
-        XCTAssertEqual(first, second,
-                       "The same (run identity, outcome) must map to one stable terminal event message ID")
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 7)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+        XCTAssertEqual(
+            key.messageID,
+            ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID,
+            "The same (run identity, outcome) must map to one stable terminal event message ID"
+        )
         XCTAssertNotEqual(
-            first,
-            stableTerminalEventMessageID(identity: identity, outcome: .failed),
+            key.messageID,
+            ChatRunStatusTerminalEventKey(identity: identity, outcome: .failed).messageID,
             "A different outcome is a different terminal event key"
         )
     }
 
     func testTerminalEventMessageIDMatchesFixedV1Fixtures() {
-        // Pinned v1 fixtures: GREEN must reproduce these byte-for-byte. The v1
-        // format is "term-v1-" followed by the lowercase hex digest of the
-        // (streamID, logicalGeneration, outcome) key. Changing the format is a
-        // v1-contract break.
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .completed),
-                       "term-v1-2bdbbdf1a31e224293bd5f3d888cf24a")
-        XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .failed),
-                       "term-v1-2850cbc540e0b77ca5887e4393515518")
-        XCTAssertEqual(stableTerminalEventMessageID(identity: identity, outcome: .cancelled),
-                       "term-v1-8ce19279944bd2610116542da84432e9")
+        // Pinned v1 fixtures (issue #18 §6): GREEN must reproduce these
+        // byte-for-byte. The delimiter and UTF-8 vectors prove the ID depends
+        // on byte counts, not ambiguous concatenation or character counts.
+        XCTAssertEqual(
+            ChatRunStatusTerminalEventKey(
+                identity: ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 7),
+                outcome: .completed
+            ).messageID,
+            "run-status-v1-d82f95e865eda8e6b4a3b38e47435465a2d7be51fe9e5360eb7d409e538c7b5d"
+        )
+        XCTAssertEqual(
+            ChatRunStatusTerminalEventKey(
+                identity: ChatRunIdentity(sessionID: "s|a", streamID: "stream\n2", generation: 42),
+                outcome: .failed
+            ).messageID,
+            "run-status-v1-d7f0ba16152e17743c4d648e087ced49d8c620cc5eae063fc92ae748debbddb4"
+        )
+        XCTAssertEqual(
+            ChatRunStatusTerminalEventKey(
+                identity: ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 8),
+                outcome: .cancelled
+            ).messageID,
+            "run-status-v1-62c615d786392fc96eaafeb424f4b7c6b014b33336b6b1bd2bf244d8d3dfac6a"
+        )
+        XCTAssertEqual(
+            ChatRunStatusTerminalEventKey(
+                identity: ChatRunIdentity(sessionID: "sess-é", streamID: "str/\n", generation: 9),
+                outcome: .completed
+            ).messageID,
+            "run-status-v1-687284ccdd959da453bc6db0d3fb770c4f1c50b96d8cab8bb071da8f43c6d58f"
+        )
     }
 
     func testTerminalEventMessageIDExcludesConnectionGeneration() {
-        // A reconnect opens a new connection generation but keeps the logical
-        // identity (same streamID + logicalGeneration), so the terminal key must
-        // not change. ChatRunIdentity carries no connection generation: two
-        // identities that differ only by connection generation are the same key.
-        let identityBeforeReconnect = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let identityAfterReconnect = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
+        // The completed-basic vector must produce the same ID whether the
+        // connection generation is 1 or 99: the key is derived from the
+        // LOGICAL identity (session, stream, generation) plus outcome only.
+        // ChatRunConnectionIdentity — the transport-fencing token that carries
+        // the connection generation — is not an input to the key, so two
+        // distinct connections of the same logical run share one message ID.
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 7)
+        let connection1 = ChatRunConnectionIdentity(streamID: "stream-1", logicalGeneration: 7, connectionGeneration: 1)
+        let connection99 = ChatRunConnectionIdentity(streamID: "stream-1", logicalGeneration: 7, connectionGeneration: 99)
+        XCTAssertNotEqual(connection1, connection99, "The two connections are distinct transport identities")
         XCTAssertEqual(
-            stableTerminalEventMessageID(identity: identityBeforeReconnect, outcome: .completed),
-            stableTerminalEventMessageID(identity: identityAfterReconnect, outcome: .completed),
-            "The terminal event key excludes the connection generation"
+            ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID,
+            ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID,
+            "connectionGeneration is excluded from the terminal event key"
         )
     }
 
     func testSameStreamIDReplacementPersistsNewLogicalGenerationAndUsesDifferentMessageID() {
         // A replacement run with the SAME stream ID is a new logical generation
         // (Slice 4 coordinator behavior), and the persisted commit must carry it.
-        let firstIdentity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let replacementIdentity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 2)
+        let firstIdentity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let replacementIdentity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 2)
 
-        let firstCommit = ChatTerminalCommit(identity: firstIdentity, outcome: .completed)
-        let replacementCommit = ChatTerminalCommit(identity: replacementIdentity, outcome: .completed)
+        let firstKey = ChatRunStatusTerminalEventKey(identity: firstIdentity, outcome: .completed)
+        let replacementKey = ChatRunStatusTerminalEventKey(identity: replacementIdentity, outcome: .completed)
 
-        XCTAssertEqual(replacementCommit.identity.logicalGeneration, firstCommit.identity.logicalGeneration + 1,
+        XCTAssertEqual(replacementIdentity.generation, firstIdentity.generation + 1,
                        "Same-stream replacement persists the new logical generation")
-        XCTAssertEqual(replacementCommit.identity.streamID, firstCommit.identity.streamID)
-        XCTAssertNotEqual(
-            stableTerminalEventMessageID(identity: replacementCommit.identity, outcome: .completed),
-            stableTerminalEventMessageID(identity: firstCommit.identity, outcome: .completed),
-            "A new logical generation is a new terminal event key"
-        )
+        XCTAssertEqual(replacementIdentity.streamID, firstIdentity.streamID)
+        XCTAssertNotEqual(replacementKey.messageID, firstKey.messageID,
+                          "A new logical generation is a new terminal event key")
     }
 
     func testCrossRelaunchReconnectRestoresLogicalGenerationAndDedupesMessageID() {
         // Cold relaunch + reconnect restores the persisted logical generation for
         // the stream, so the recomputed terminal event message ID is identical
         // and the cached terminal event dedupes instead of duplicating.
-        let persistedIdentity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 3)
-        let restoredIdentity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 3)
-        let terminalID = stableTerminalEventMessageID(identity: persistedIdentity, outcome: .failed)
+        let persistedIdentity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 3)
+        let restoredIdentity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 3)
+        let terminalID = ChatRunStatusTerminalEventKey(identity: persistedIdentity, outcome: .failed).messageID
 
         XCTAssertEqual(
-            stableTerminalEventMessageID(identity: restoredIdentity, outcome: .failed),
+            ChatRunStatusTerminalEventKey(identity: restoredIdentity, outcome: .failed).messageID,
             terminalID,
             "Restored logical generation must reproduce the pre-relaunch terminal event message ID"
         )
 
         let cachedTerminalEvent = ChatMessage(
-            role: "assistant", content: "Run failed.", timestamp: 1_770_000_000,
+            role: "local_notice", content: "Response failed", timestamp: 1_770_000_000,
             messageId: terminalID
         )
         let merged = ChatViewModel.mergingLoadedMessages(
@@ -173,44 +198,46 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
     }
 
     func testDifferentOutcomeGetsDifferentTerminalEventKey() {
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let completed = stableTerminalEventMessageID(identity: identity, outcome: .completed)
-        let failed = stableTerminalEventMessageID(identity: identity, outcome: .failed)
-        let cancelled = stableTerminalEventMessageID(identity: identity, outcome: .cancelled)
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let completed = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID
+        let failed = ChatRunStatusTerminalEventKey(identity: identity, outcome: .failed).messageID
+        let cancelled = ChatRunStatusTerminalEventKey(identity: identity, outcome: .cancelled).messageID
         XCTAssertEqual(Set([completed, failed, cancelled]).count, 3,
                        "completed/failed/cancelled are three distinct terminal event keys")
     }
 
-    func testRepeatedTerminalCallbackAppendsOneLocalNotice() throws {
-        // The same terminal event key delivered twice (duplicate terminal
-        // callback) appends the stable local notice exactly once and produces a
-        // single identity-keyed handoff.
-        let writer = RecordingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .completed)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .completed),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Done.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
+    func testChatRunTerminalCommitCarriesIdentityOutcomeKeyAndServerIDs() {
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 7)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: .completed,
+            eventKey: key,
+            serverSessionID: "session-A",
+            serverStreamID: "stream-1"
         )
+        XCTAssertEqual(commit.eventKey, key)
+        XCTAssertEqual(commit.serverSessionID, commit.identity.sessionID)
+        XCTAssertEqual(commit.serverStreamID, commit.identity.streamID)
 
-        try writer.write(handoff)
-        try writer.write(handoff) // duplicate terminal callback for the same key
-
-        XCTAssertEqual(writer.writeCount, 2, "The terminal callback fired twice")
-        XCTAssertEqual(writer.handoffs.count, 1, "One identity-keyed handoff per terminal event key")
-        XCTAssertEqual(writer.duplicateDeliveries, 1, "The repeated callback was deduped, not re-appended")
-        XCTAssertEqual(writer.handoffs.first?.snapshotMessages.map(\.messageId) ?? [], [noticeID],
-                       "The local notice is appended exactly once")
+        let handoff = ChatTerminalPersistenceHandoff(
+            commit: commit,
+            postAppendMessages: [ChatMessage(role: "local_notice", content: "Response complete",
+                                             timestamp: 1_770_000_000, messageId: key.messageID)],
+            handoffGeneration: 1
+        )
+        XCTAssertEqual(handoff.commit, commit)
+        XCTAssertEqual(handoff.handoffGeneration, 1)
+        XCTAssertEqual(handoff.postAppendMessages.map(\.messageId), [key.messageID],
+                       "The handoff snapshot is post-append: it contains the stable local notice")
     }
 
     func testCachedTerminalEventMergesOnceWhenServerTranscriptOmitsIt() {
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .completed)
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let noticeID = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID
         let reloaded = [ChatMessage(role: "user", content: "Last user turn",
                                     timestamp: 1_769_000_000, messageId: "server-user-1")]
-        let cachedTerminalEvent = ChatMessage(role: "assistant", content: "Done.",
+        let cachedTerminalEvent = ChatMessage(role: "local_notice", content: "Response complete",
                                               timestamp: 1_770_000_000, messageId: noticeID)
 
         let merged = ChatViewModel.mergingLoadedMessages(
@@ -223,16 +250,16 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
     }
 
     func testDifferentGenerationDoesNotDeduplicateAsTheSameLogicalRun() {
-        let first = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let replacement = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 2)
-        let firstID = stableTerminalEventMessageID(identity: first, outcome: .completed)
-        let replacementID = stableTerminalEventMessageID(identity: replacement, outcome: .completed)
+        let first = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let replacement = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 2)
+        let firstID = ChatRunStatusTerminalEventKey(identity: first, outcome: .completed).messageID
+        let replacementID = ChatRunStatusTerminalEventKey(identity: replacement, outcome: .completed).messageID
 
         let merged = ChatViewModel.mergingLoadedMessages(
-            [ChatMessage(role: "assistant", content: "Second run done.",
+            [ChatMessage(role: "local_notice", content: "Second run done.",
                          timestamp: 1_770_000_100, messageId: replacementID)],
             withCachedLocalOptimisticMessages: [
-                ChatMessage(role: "assistant", content: "First run done.",
+                ChatMessage(role: "local_notice", content: "First run done.",
                             timestamp: 1_770_000_000, messageId: firstID)
             ]
         )
@@ -241,131 +268,43 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
                        "A different logical generation is a different logical run and must not deduplicate")
     }
 
-    func testCompletedTerminalEventWritesThroughIdentityKeyedHandoff() throws {
-        let writer = RecordingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .completed)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .completed),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Done.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
+    func testMergingLoadedMessagesRetainsOnlyRunStatusNoticesAbsentFromServerPayload() {
+        // Narrow merge rule (#18 §6): ONLY `run-status-v1-` terminal notices
+        // absent from the server payload are retained. Generic local-notice
+        // and optimistic-user merge behavior is unchanged: a generic cached
+        // local notice is NOT re-created by a reload, and an optimistic user
+        // message still merges when the server omits it.
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let noticeID = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID
+        let reloaded = [ChatMessage(role: "user", content: "Last user turn",
+                                    timestamp: 1_769_000_000, messageId: "server-user-1")]
+        let cachedTerminalEvent = ChatMessage(role: "local_notice", content: "Response complete",
+                                              timestamp: 1_770_000_000, messageId: noticeID)
+        let cachedGenericNotice = ChatMessage(role: "local_notice", content: "Goal set.",
+                                              timestamp: 1_769_500_000, messageId: "local-notice-xyz")
+        let cachedOptimisticUser = ChatMessage(role: "user", content: "Optimistic turn",
+                                               timestamp: 1_769_800_000, messageId: "local-opt-1")
+
+        let merged = ChatViewModel.mergingLoadedMessages(
+            reloaded,
+            withCachedLocalOptimisticMessages: [cachedTerminalEvent, cachedGenericNotice, cachedOptimisticUser]
         )
 
-        try writer.write(handoff)
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Exactly one identity-keyed handoff")
-        let written = try XCTUnwrap(writer.handoffs.first)
-        XCTAssertEqual(written.commit.identity, identity, "The handoff is keyed by the run identity")
-        XCTAssertEqual(written.commit.outcome, .completed)
-        XCTAssertEqual(written.snapshotMessages.map(\.messageId), [noticeID],
-                       "The handoff snapshot is post-append: it contains the stable local notice")
-        XCTAssertEqual(written.generation, 1)
-    }
-
-    func testFailedTerminalEventWritesThroughIdentityKeyedHandoff() throws {
-        let writer = RecordingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .failed)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .failed),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Run failed.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
-        )
-
-        try writer.write(handoff)
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Exactly one identity-keyed handoff")
-        let written = try XCTUnwrap(writer.handoffs.first)
-        XCTAssertEqual(written.commit.identity, identity, "The handoff is keyed by the run identity")
-        XCTAssertEqual(written.commit.outcome, .failed)
-        XCTAssertEqual(written.snapshotMessages.map(\.messageId), [noticeID],
-                       "The handoff snapshot is post-append: it contains the stable local notice")
-        XCTAssertEqual(written.generation, 1)
-    }
-
-    func testCancelledTerminalEventWritesThroughIdentityKeyedHandoff() throws {
-        let writer = RecordingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .cancelled)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .cancelled),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Run cancelled.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
-        )
-
-        try writer.write(handoff)
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Exactly one identity-keyed handoff")
-        let written = try XCTUnwrap(writer.handoffs.first)
-        XCTAssertEqual(written.commit.identity, identity, "The handoff is keyed by the run identity")
-        XCTAssertEqual(written.commit.outcome, .cancelled)
-        XCTAssertEqual(written.snapshotMessages.map(\.messageId), [noticeID],
-                       "The handoff snapshot is post-append: it contains the stable local notice")
-        XCTAssertEqual(written.generation, 1)
-    }
-
-    func testFailedTerminalCacheWriterErrorRetainsPendingRequest() throws {
-        let writer = ThrowingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 2)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .failed)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .failed),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Run failed.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
-        )
-
-        writer.failNextWrite = true
-        XCTAssertThrowsError(try writer.write(handoff))
-        XCTAssertEqual(writer.pendingHandoffs.count, 1, "The failed write stays pending for retry")
-        XCTAssertEqual(writer.pendingHandoffs.first?.commit.identity, identity)
-        XCTAssertEqual(writer.handoffs.count, 0, "No duplicate event is written on failure")
-
-        writer.failNextWrite = false
-        try writer.write(handoff) // retry re-sends the SAME handoff, no re-append
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Retry lands exactly one identity-keyed handoff")
-        XCTAssertEqual(writer.handoffs.first?.snapshotMessages.map(\.messageId) ?? [], [noticeID],
-                       "The retried handoff still carries the single stable local notice")
-        XCTAssertTrue(writer.pendingHandoffs.isEmpty, "Retry state is cleared after success")
-    }
-
-    func testCancelledTerminalCacheWriterErrorRetainsPendingRequest() throws {
-        let writer = ThrowingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 2)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .cancelled)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .cancelled),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Run cancelled.",
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
-        )
-
-        writer.failNextWrite = true
-        XCTAssertThrowsError(try writer.write(handoff))
-        XCTAssertEqual(writer.pendingHandoffs.count, 1, "The failed write stays pending for retry")
-        XCTAssertEqual(writer.pendingHandoffs.first?.commit.identity, identity)
-        XCTAssertEqual(writer.handoffs.count, 0, "No duplicate event is written on failure")
-
-        writer.failNextWrite = false
-        try writer.write(handoff) // retry re-sends the SAME handoff, no re-append
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Retry lands exactly one identity-keyed handoff")
-        XCTAssertEqual(writer.handoffs.first?.snapshotMessages.map(\.messageId) ?? [], [noticeID],
-                       "The retried handoff still carries the single stable local notice")
-        XCTAssertTrue(writer.pendingHandoffs.isEmpty, "Retry state is cleared after success")
+        XCTAssertEqual(merged.filter { $0.messageId == noticeID }.count, 1,
+                       "run-status terminal notice is retained when the server omits it")
+        XCTAssertEqual(merged.filter { $0.messageId == "local-notice-xyz" }.count, 0,
+                       "Generic local notices are not re-created by a reload")
+        XCTAssertEqual(merged.filter { $0.messageId == "local-opt-1" }.count, 1,
+                       "Optimistic user messages keep the existing merge behavior")
     }
 
     func testColdOfflineReloadRestoresFailedTerminalEventOnce() {
         // Cold reload while offline: the server transcript is empty, so the only
         // copy of the terminal event is the cached local one. It must be restored
         // exactly once — not dropped and not duplicated.
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .failed)
-        let cachedTerminalEvent = ChatMessage(role: "assistant", content: "Run failed.",
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let noticeID = ChatRunStatusTerminalEventKey(identity: identity, outcome: .failed).messageID
+        let cachedTerminalEvent = ChatMessage(role: "local_notice", content: "Response failed",
                                               timestamp: 1_770_000_000, messageId: noticeID)
 
         let merged = ChatViewModel.mergingLoadedMessages(
@@ -380,9 +319,9 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
         // Cold reload while offline: the server transcript is empty, so the only
         // copy of the terminal event is the cached local one. It must be restored
         // exactly once — not dropped and not duplicated.
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .cancelled)
-        let cachedTerminalEvent = ChatMessage(role: "assistant", content: "Run cancelled.",
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-abc", generation: 1)
+        let noticeID = ChatRunStatusTerminalEventKey(identity: identity, outcome: .cancelled).messageID
+        let cachedTerminalEvent = ChatMessage(role: "local_notice", content: "Response cancelled",
                                               timestamp: 1_770_000_000, messageId: noticeID)
 
         let merged = ChatViewModel.mergingLoadedMessages(
@@ -396,50 +335,42 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
 
 // MARK: - Slice 5 spies (shared across the test target)
 //
-// Both spies conform to the intended-missing `ChatTerminalCacheWriter` seam and
-// model the ViewModel contract: ONE identity-keyed handoff per terminal event
-// key `(streamID, logicalGeneration, outcome)`, and a failed write retains the
-// pending handoff for retry without re-appending the local notice.
+// Both spies conform to the `ChatTerminalCacheWriter` seam: the ViewModel
+// routes exactly one identity-keyed handoff per terminal event key through
+// `persistPendingTerminalPersistence(for:modelContext:)`, and a throwing
+// writer retains the pending handoff for retry without re-appending the
+// local notice.
 
-/// Records every identity-keyed handoff it writes, deduping repeat deliveries
-/// of the same terminal event key.
+/// Records every handoff the ViewModel routes through the seam, including
+/// attempts that failed (the ViewModel retains the handoff for retry).
 final class RecordingTerminalCacheWriter: ChatTerminalCacheWriter {
     private(set) var handoffs: [ChatTerminalPersistenceHandoff] = []
     private(set) var writeCount = 0
-    private(set) var duplicateDeliveries = 0
-    private var keys = Set<String>()
 
-    func write(_ handoff: ChatTerminalPersistenceHandoff) throws {
+    func persistPendingTerminalPersistence(
+        for handoff: ChatTerminalPersistenceHandoff,
+        modelContext: ModelContext?
+    ) throws {
         writeCount += 1
-        let key = "\(handoff.commit.identity.streamID)|\(handoff.commit.identity.logicalGeneration)|\(handoff.commit.outcome)"
-        if keys.contains(key) {
-            duplicateDeliveries += 1
-            return
-        }
-        keys.insert(key)
         handoffs.append(handoff)
     }
 }
 
-/// Fails the next write and retains the pending handoff so the retry path can
-/// re-send the SAME handoff without re-appending the local notice.
+/// Fails writes while `failNextWrite` is set, recording every attempt so a
+/// retry is observable as one additional write per attempt.
 final class ThrowingTerminalCacheWriter: ChatTerminalCacheWriter {
     var failNextWrite = false
     private(set) var handoffs: [ChatTerminalPersistenceHandoff] = []
-    private(set) var pendingHandoffs: [ChatTerminalPersistenceHandoff] = []
-    private var keys = Set<String>()
+    private(set) var writeCount = 0
 
-    func write(_ handoff: ChatTerminalPersistenceHandoff) throws {
+    func persistPendingTerminalPersistence(
+        for handoff: ChatTerminalPersistenceHandoff,
+        modelContext: ModelContext?
+    ) throws {
+        writeCount += 1
         if failNextWrite {
-            pendingHandoffs = [handoff]
             throw StubTerminalCacheWriteError.simulatedFailure
         }
-        pendingHandoffs = []
-        let key = "\(handoff.commit.identity.streamID)|\(handoff.commit.identity.logicalGeneration)|\(handoff.commit.outcome)"
-        if keys.contains(key) {
-            return
-        }
-        keys.insert(key)
         handoffs.append(handoff)
     }
 }
