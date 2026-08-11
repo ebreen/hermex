@@ -511,7 +511,11 @@ final class ChatStreamCoordinator {
     /// Activity end, cleanup) with NO transcript reload consulted.
     private func finalizeFromJournal(outcome: ChatRunTerminalOutcome) {
         if let identity = runIdentity {
-            transitionToTerminal(outcome: outcome, identity: identity)
+            transitionToTerminal(
+                outcome: outcome,
+                identity: identity,
+                needsTranscriptRefresh: false
+            )
         }
     }
 
