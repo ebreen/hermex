@@ -1047,7 +1047,21 @@ struct ChatView: View {
                 }
 
                 if let activeRunStatusPresentation {
-                    ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
+                    if let runSnapshot = viewModel.activeRunStatusSnapshot,
+                       let connectionIdentity = viewModel.activeRunConnectionIdentity {
+                        ChatActiveRunStatusView(
+                            presentation: activeRunStatusPresentation,
+                            connectionIdentity: connectionIdentity,
+                            onClose: {
+                                viewModel.dismissActiveRunStatus(for: runSnapshot.identity)
+                            },
+                            onCancel: { expectedIdentity in
+                                Task { await cancelStream(expectedIdentity: expectedIdentity) }
+                            }
+                        )
+                    } else {
+                        ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
+                    }
                         .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
                 }
 
@@ -1229,10 +1243,8 @@ struct ChatView: View {
 
     private var activeRunStatusPresentation: ChatActiveRunStatusPresentation? {
         ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: viewModel.isStartingChat,
-            hasActiveStream: viewModel.activeStreamID != nil,
-            activeStreamRecoveryState: viewModel.activeStreamRecoveryState,
-            isCancellingStream: viewModel.isCancellingStream,
+            snapshot: viewModel.activeRunStatusSnapshot,
+            dismissedIdentity: viewModel.dismissedRunStatusIdentity,
             isScrolledNearBottom: isScrolledNearBottom
         )
     }
@@ -1560,8 +1572,8 @@ struct ChatView: View {
         }
     }
 
-    private func cancelStream() async {
-        let didCancel = await viewModel.cancelActiveStream()
+    private func cancelStream(expectedIdentity: ChatRunConnectionIdentity? = nil) async {
+        let didCancel = await viewModel.cancelActiveStream(expectedIdentity: expectedIdentity)
         if didCancel {
             ChatHaptics.streamCancelled(isEnabled: isHapticsEnabled)
         }
