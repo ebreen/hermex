@@ -46,14 +46,49 @@ struct ChatRunIdentity: Equatable, Hashable {
     var logicalGeneration: Int { generation }
 }
 
-/// One active run's confirmed status snapshot (#18 Slice 6): the logical run
-/// identity confirmed through `/api/session` plus the goal detail of the
-/// goal kickoff that started it. Exposed by the view model as
-/// `confirmedRunSnapshot`; set only when a goal-kickoff confirmation load
-/// reports an `active_stream_id` and the confirmed stream starts.
+/// Lifecycle projected by the coordinator-driven run-status presentation.
+enum ChatRunStatusLifecycle: Equatable, Hashable {
+    case active
+    case completed
+}
+
+typealias ChatActiveRunStatusLifecycle = ChatRunStatusLifecycle
+
+/// One active run's confirmed status snapshot (#18 Slice 6/7): the logical run
+/// identity, lifecycle, goal detail, and current recovery state. The original
+/// `init(identity:goal:)` remains available for Slice 6 callers.
 struct ChatRunStatusSnapshot: Equatable, Hashable {
     let identity: ChatRunIdentity
+    let lifecycle: ChatRunStatusLifecycle
     let goal: String
+    let recoveryState: ActiveStreamRecoveryState
+
+    init(identity: ChatRunIdentity, goal: String) {
+        self.init(identity: identity, lifecycle: .active, goal: goal, recoveryState: .idle)
+    }
+
+    init(
+        identity: ChatRunIdentity,
+        lifecycle: ChatRunStatusLifecycle,
+        goal: String,
+        recoveryState: ActiveStreamRecoveryState = .idle
+    ) {
+        self.identity = identity
+        self.lifecycle = lifecycle
+        self.goal = goal
+        self.recoveryState = recoveryState
+    }
+
+    /// Compatibility overload for Slice 6 call sites that pass lifecycle or
+    /// recovery state after the goal label.
+    init(
+        identity: ChatRunIdentity,
+        goal: String,
+        lifecycle: ChatRunStatusLifecycle = .active,
+        recoveryState: ActiveStreamRecoveryState = .idle
+    ) {
+        self.init(identity: identity, lifecycle: lifecycle, goal: goal, recoveryState: recoveryState)
+    }
 }
 
 /// The outcome of a finalized chat run, committed exactly once by the
@@ -228,10 +263,54 @@ private extension FixedWidthInteger {
 /// the connection generation. A replay/reconnect start keeps the logical
 /// generation and bumps only the connection generation; a replacement run
 /// bumps both (#18 Slice 3).
-struct ChatRunConnectionIdentity: Equatable, Sendable {
+struct ChatRunConnectionIdentity: Equatable, Hashable, Sendable {
+    /// Optional session context used only to reconstruct `run`; the transport
+    /// equality semantics remain stream + logical generation + connection.
+    let sessionID: String
     let streamID: String
     let logicalGeneration: Int
     let connectionGeneration: Int
+
+    init(
+        streamID: String,
+        logicalGeneration: Int,
+        connectionGeneration: Int,
+        sessionID: String = ""
+    ) {
+        self.sessionID = sessionID
+        self.streamID = streamID
+        self.logicalGeneration = logicalGeneration
+        self.connectionGeneration = connectionGeneration
+    }
+
+    init(run: ChatRunIdentity, connectionGeneration: Int) {
+        self.init(
+            streamID: run.streamID,
+            logicalGeneration: run.generation,
+            connectionGeneration: connectionGeneration,
+            sessionID: run.sessionID
+        )
+    }
+
+    var run: ChatRunIdentity {
+        ChatRunIdentity(
+            sessionID: sessionID,
+            streamID: streamID,
+            generation: logicalGeneration
+        )
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.streamID == rhs.streamID &&
+            lhs.logicalGeneration == rhs.logicalGeneration &&
+            lhs.connectionGeneration == rhs.connectionGeneration
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(streamID)
+        hasher.combine(logicalGeneration)
+        hasher.combine(connectionGeneration)
+    }
 }
 
 /// Identity token for a recovery transcript load (#18 Slice 4). Captured
@@ -466,7 +545,21 @@ final class ChatStreamCoordinator {
         return ChatRunConnectionIdentity(
             streamID: activeStreamID,
             logicalGeneration: logicalRunGeneration,
-            connectionGeneration: connectionGeneration
+            connectionGeneration: connectionGeneration,
+            sessionID: delegate?.streamCoordinatorSessionID ?? ""
+        )
+    }
+
+    /// Coordinator-owned projection consumed by ChatViewModel. It is nil once
+    /// the coordinator has no active run; terminal commits remain transcript
+    /// events and are never projected as a pinned row.
+    var runStatusSnapshot: ChatRunStatusSnapshot? {
+        guard let identity = runIdentity else { return nil }
+        return ChatRunStatusSnapshot(
+            identity: identity,
+            lifecycle: .active,
+            goal: "",
+            recoveryState: recoveryState
         )
     }
 

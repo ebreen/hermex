@@ -2,6 +2,18 @@ import SwiftUI
 
 struct ChatActiveRunStatusView: View {
     let presentation: ChatActiveRunStatusPresentation
+    let onClose: () -> Void
+    let onCancel: () -> Void
+
+    init(
+        presentation: ChatActiveRunStatusPresentation,
+        onClose: @escaping () -> Void = {},
+        onCancel: @escaping () -> Void = {}
+    ) {
+        self.presentation = presentation
+        self.onClose = onClose
+        self.onCancel = onCancel
+    }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
