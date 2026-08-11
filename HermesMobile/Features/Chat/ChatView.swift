@@ -1059,10 +1059,11 @@ struct ChatView: View {
                                 Task { await cancelStream(expectedIdentity: expectedIdentity) }
                             }
                         )
+                        .transition(runStatusParentTransition)
                     } else {
                         ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
+                            .transition(runStatusParentTransition)
                     }
-                        .transition(runStatusParentTransition)
                 }
 
                 if showsApprovalBypassStatus {
