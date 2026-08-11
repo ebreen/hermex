@@ -1104,6 +1104,21 @@ final class SessionListViewModel {
         activeProfileProvider = Self.nonEmpty(profile?.provider)
     }
 
+    private func applyActiveProfile(_ snapshot: CatalogProfileReadSnapshot) {
+        profileOptions = snapshot.profiles
+        isSingleProfileMode = snapshot.singleProfileMode
+
+        let changed = ProfileEntityCache.shared.save(snapshot.profiles)
+        ProfileEntityProvider.refreshAppShortcuts(changed: changed)
+
+        let profile = snapshot.profiles.first { $0.normalizedName == snapshot.activeProfile }
+        activeProfileName = snapshot.activeProfile
+        activeProfileDisplayName = profile?.displayName
+            ?? (snapshot.activeProfile == "default" ? String(localized: "Default") : snapshot.activeProfile)
+        activeProfileModel = Self.nonEmpty(profile?.model)
+        activeProfileProvider = Self.nonEmpty(profile?.provider)
+    }
+
     private func mutate(
         modelContext: ModelContext? = nil,
         animation: Animation? = nil,
