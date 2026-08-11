@@ -726,11 +726,14 @@ final class ChatStreamCoordinator {
         delegate?.streamCoordinatorStartAuxiliaryMonitoring()
     }
 
-    func cancelActiveStream() async -> ChatCancelDisposition {
+    func cancelActiveStream(expectedIdentity: ChatRunConnectionIdentity? = nil) async -> ChatCancelDisposition {
         guard let activeStreamID,
               let connectionIdentity = runConnectionIdentity
         else {
             return .unconfirmed
+        }
+        guard expectedIdentity == nil || expectedIdentity == connectionIdentity else {
+            return .stale
         }
         let streamID = activeStreamID
 

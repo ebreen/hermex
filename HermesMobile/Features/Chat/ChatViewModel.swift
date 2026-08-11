@@ -189,7 +189,7 @@ struct ChatPollingIntervals: Equatable {
     )
 }
 
-enum ActiveStreamRecoveryState: Equatable {
+enum ActiveStreamRecoveryState: Equatable, Hashable {
     case idle
     case checking
     case reconnecting
