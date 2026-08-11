@@ -2468,7 +2468,8 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     @MainActor
     func testSameStreamReplacementPersistsMaxPlusOneInGenerationStore() throws {
         let store = InMemoryRunGenerationStore()
-        let coordinator = makeCoordinator(runGenerationStore: store)
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(delegate: delegate, runGenerationStore: store)
 
         coordinator.start(streamID: "stream-123")
         let first = try XCTUnwrap(coordinator.runIdentity)
@@ -2490,7 +2491,8 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     @MainActor
     func testResumeRestoresPersistedActiveGenerationInsteadOfAllocating() throws {
         let store = InMemoryRunGenerationStore()
-        let coordinator = makeCoordinator(runGenerationStore: store)
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(delegate: delegate, runGenerationStore: store)
 
         coordinator.start(streamID: "stream-123")
         let original = try XCTUnwrap(coordinator.runIdentity)
@@ -2518,7 +2520,8 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     func testTerminalCommitClearsActiveGenerationRetainsLastIssued() throws {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let store = InMemoryRunGenerationStore()
-        let coordinator = makeCoordinator(streamClient: streamClient, runGenerationStore: store)
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate, runGenerationStore: store)
 
         coordinator.start(streamID: "stream-123")
         streamClient.emit(.done(DoneStreamEvent()))
