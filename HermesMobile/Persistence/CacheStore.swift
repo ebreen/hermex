@@ -298,6 +298,7 @@ enum CacheStore {
 /// stable run-status-v1 key — no SwiftData model, schema field, or migration
 /// (#18 §498). A missing model context throws so the ViewModel retains the
 /// handoff for retry.
+@MainActor
 struct CacheStoreTerminalCacheWriter: ChatTerminalCacheWriter {
     let serverURL: URL
 
