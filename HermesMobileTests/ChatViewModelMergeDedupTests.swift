@@ -331,6 +331,290 @@ final class ChatViewModelMergeDedupTests: XCTestCase {
         XCTAssertEqual(merged.filter { $0.messageId == noticeID }.count, 1,
                        "Cold offline reload restores the cancelled terminal event exactly once")
     }
+
+    // MARK: - Slice 5 (#18 §522): writer-error retention and retry
+    //
+    // `streamCoordinatorDidCommitTerminal(_:)` below is the exact delegate
+    // delivery point the stream coordinator's centralized terminal transition
+    // uses once per accepted outcome (ChatStreamCoordinatorTests pins that the
+    // transition constructs the complete ChatRunTerminalCommit and invokes this
+    // callback exactly once). Driving the callback directly — instead of
+    // re-plumbing the SSE spies, which are private to ChatViewModelSendTests —
+    // keeps these tests deterministic: the whole append → handoff → single-write
+    // attempt runs synchronously inside the callback, so no continuation
+    // choreography is required.
+    //
+    // The retention maps (`pendingTerminalPersistenceByKey`,
+    // `terminalPersistenceErrorByKey`) are private and the error map has no
+    // production reader, so assertions are behavioral: a failed write must keep
+    // the EXACT handoff + post-append snapshot retryable (a later retry writes it
+    // once more with the SAME handoff generation and snapshot), and a repeated
+    // terminal commit for a still-pending key must append nothing and write
+    // nothing. Retention after a throwing write is the observable proxy for the
+    // error record: the catch branch that records the error
+    // (ChatViewModel.swift:3460-3463) is the same branch that leaves the key
+    // pending.
+
+    @MainActor
+    func testFailedTerminalCacheWriterErrorRetainsPendingRequest() throws {
+        let context = try makeContext()
+        let writer = ThrowingTerminalCacheWriter()
+        writer.failNextWrite = true
+        let viewModel = try makeViewModel(writer: writer)
+        viewModel.modelContext = context
+
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 1)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: .completed,
+            eventKey: key,
+            serverSessionID: "session-A",
+            serverStreamID: "stream-1"
+        )
+
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+
+        // The failed write still appended the stable local notice exactly once.
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+            "The terminal commit appends exactly one 'Response complete' local notice"
+        )
+        XCTAssertEqual(
+            viewModel.messages.first { $0.messageId == key.messageID }?.content,
+            "Response complete"
+        )
+        XCTAssertEqual(writer.writeCount, 1,
+                       "A throwing writer is attempted exactly once per commit")
+        XCTAssertTrue(writer.handoffs.isEmpty,
+                      "The throwing writer records only successful writes")
+
+        // Retained: a repeated terminal commit for the same key is rejected by
+        // the pending-key guard — no second event appended, no second write.
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+            "A repeated commit for a still-pending key appends no second event"
+        )
+        XCTAssertEqual(writer.writeCount, 1,
+                       "A repeated commit for a still-pending key writes nothing")
+    }
+
+    @MainActor
+    func testCancelledTerminalCacheWriterErrorRetainsPendingRequest() throws {
+        let context = try makeContext()
+        let writer = ThrowingTerminalCacheWriter()
+        writer.failNextWrite = true
+        let viewModel = try makeViewModel(writer: writer)
+        viewModel.modelContext = context
+
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 1)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .cancelled)
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: .cancelled,
+            eventKey: key,
+            serverSessionID: "session-A",
+            serverStreamID: "stream-1"
+        )
+
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+            "The cancelled terminal commit appends exactly one 'Response cancelled' local notice"
+        )
+        XCTAssertEqual(
+            viewModel.messages.first { $0.messageId == key.messageID }?.content,
+            "Response cancelled"
+        )
+        XCTAssertEqual(writer.writeCount, 1,
+                       "A throwing writer is attempted exactly once per commit")
+        XCTAssertTrue(writer.handoffs.isEmpty,
+                      "The throwing writer records only successful writes")
+
+        // Retained: a repeated terminal commit for the same key appends nothing
+        // and writes nothing.
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+            "A repeated commit for a still-pending key appends no second event"
+        )
+        XCTAssertEqual(writer.writeCount, 1,
+                       "A repeated commit for a still-pending key writes nothing")
+    }
+
+    @MainActor
+    func testRetryAfterWriterFailureWritesOnceMoreAndClearsKey() async throws {
+        let context = try makeContext()
+        let writer = ThrowingTerminalCacheWriter()
+        writer.failNextWrite = true
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        let client = APIClient(baseURL: server, session: URLSession(configuration: configuration))
+        let viewModel = try makeViewModel(writer: writer, client: client)
+        viewModel.modelContext = context
+
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 1)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: .completed,
+            eventKey: key,
+            serverSessionID: "session-A",
+            serverStreamID: "stream-1"
+        )
+
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1)
+        XCTAssertEqual(writer.writeCount, 1)
+
+        // Still pending: a repeated same-key commit appends nothing, writes nothing.
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+                       "No second event is appended while the key is pending")
+        XCTAssertEqual(writer.writeCount, 1,
+                       "No second write happens while the key is pending")
+
+        // Retry (#18 §522): a transcript load that obtained a context retries
+        // every retained handoff exactly once (ChatViewModel.swift:1447-1449).
+        writer.failNextWrite = false
+        MockURLProtocol.requestHandler = { request in
+            XCTAssertEqual(request.url?.path, "/api/session")
+            return apiTestJSONResponse(#"{"session": {"session_id": "session-A", "title": "Planning", "messages": [{"role": "user", "content": "Recovered transcript.", "timestamp": 1770000100, "message_id": "user-1"}]}}"#, for: request)
+        }
+        await viewModel.loadMessages(modelContext: context)
+
+        XCTAssertEqual(writer.writeCount, 2,
+                       "The retry writes exactly once more per retained key")
+        let retriedHandoff = try XCTUnwrap(writer.handoffs.last)
+        XCTAssertEqual(retriedHandoff.commit, commit,
+                       "The retry writes the EXACT retained handoff")
+        XCTAssertEqual(retriedHandoff.handoffGeneration, 1,
+                       "The retained handoff keeps its original handoff generation")
+        XCTAssertEqual(
+            retriedHandoff.postAppendMessages.filter { $0.messageId == key.messageID }.count, 1,
+            "The retained post-append snapshot is written as-is: exactly one terminal notice"
+        )
+
+        // The successful write removed exactly that key (and its error entry —
+        // both are cleared in the same success branch, ChatViewModel.swift:3458-3459):
+        // a fresh commit for the same key is accepted again instead of being
+        // dropped by the pending-key guard, and it bumps the handoff generation.
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(writer.writeCount, 3,
+                       "A fresh same-key commit is accepted after the key was cleared")
+        XCTAssertEqual(try XCTUnwrap(writer.handoffs.last).handoffGeneration, 2,
+                       "The replacement handoff carries the next handoff generation")
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+                       "The fresh commit appends exactly one notice — the retry never appended a second")
+    }
+
+    @MainActor
+    func testSuccessfulWriterCommitRemovesKeyAndError() throws {
+        let context = try makeContext()
+        let writer = RecordingTerminalCacheWriter()
+        let viewModel = try makeViewModel(writer: writer)
+        viewModel.modelContext = context
+
+        let identity = ChatRunIdentity(sessionID: "session-A", streamID: "stream-1", generation: 1)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: .completed,
+            eventKey: key,
+            serverSessionID: "session-A",
+            serverStreamID: "stream-1"
+        )
+
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+
+        XCTAssertEqual(writer.writeCount, 1,
+                       "Exactly one write per successful commit")
+        let handoff = try XCTUnwrap(writer.handoffs.first)
+        XCTAssertEqual(handoff.commit, commit)
+        XCTAssertEqual(handoff.handoffGeneration, 1)
+        XCTAssertEqual(
+            handoff.postAppendMessages.filter { $0.messageId == key.messageID }.count, 1,
+            "The written handoff snapshot contains the post-append terminal notice"
+        )
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1)
+        XCTAssertEqual(viewModel.messages.first { $0.messageId == key.messageID }?.content,
+                       "Response complete")
+
+        // The successful write removed exactly that key and its error entry: a
+        // fresh commit for the same key is accepted again and writes once more,
+        // while the stable message ID still dedupes the notice to exactly one.
+        viewModel.streamCoordinatorDidCommitTerminal(commit)
+        XCTAssertEqual(writer.writeCount, 2,
+                       "A fresh same-key commit after a successful write writes once more")
+        XCTAssertEqual(try XCTUnwrap(writer.handoffs.last).handoffGeneration, 2,
+                       "The replacement handoff carries the next handoff generation")
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+                       "The stable message ID still dedupes to exactly one notice")
+    }
+
+    // §522 additionally requires a stale successful write to never clear a
+    // replacement handoff (the guard compares handoffGeneration). That guard is
+    // not reachable from the public/test surface with the current synchronous
+    // writer seam; the skip reason below documents the full analysis.
+    @MainActor
+    func testStaleSuccessfulWriteDoesNotClearReplacementHandoff() throws {
+        throw XCTSkip("""
+        BLOCKED-with-reason: the stale-success generation guard \
+        (ChatViewModel.swift:3457 and its catch-side twin at :3461) cannot be \
+        exercised without production changes. A replacement handoff for the SAME \
+        key can only be installed after the old key was removed: \
+        streamCoordinatorDidCommitTerminal rejects any commit whose key is still \
+        pending (line 3409), which also drops re-entrant same-key commits from a \
+        writer that calls back into the VM during \
+        persistPendingTerminalPersistence; and the writer seam is synchronous, so \
+        the key is removed (line 3458) in the same call stack as the write — there \
+        is no window in which a stale write could observe a newer handoff. The \
+        throwing-then-recording two-sequential-commits alternative is not \
+        expressible either: the writer is injected once at init (line 457), and a \
+        second same-key commit while the key is pending is rejected per the line \
+        3409 guard. The closest executable coverage — fail, retry once more, \
+        succeed, then accept a fresh same-key commit with the NEXT handoff \
+        generation — is provided by testRetryAfterWriterFailureWritesOnceMoreAndClearsKey \
+        and testSuccessfulWriterCommitRemovesKeyAndError.
+        """)
+    }
+
+    @MainActor
+    private func makeViewModel(
+        writer: (any ChatTerminalCacheWriter)?,
+        client: APIClient? = nil
+    ) throws -> ChatViewModel {
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        return ChatViewModel(
+            session: try makeSession(),
+            server: server,
+            client: client,
+            runGenerationStore: InMemoryRunGenerationStore(),
+            terminalCacheWriter: writer
+        )
+    }
+
+    private func makeSession() throws -> SessionSummary {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(
+            SessionSummary.self,
+            from: Data(#"{"session_id": "session-A", "title": "Planning", "workspace": "/tmp/workspace"}"#.utf8)
+        )
+    }
+
+    private func makeContext() throws -> ModelContext {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(
+            for: CachedSession.self,
+            CachedMessage.self,
+            configurations: configuration
+        )
+        return ModelContext(container)
+    }
 }
 
 // MARK: - Slice 5 spies (shared across the test target)
