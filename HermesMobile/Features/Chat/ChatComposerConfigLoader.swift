@@ -138,7 +138,7 @@ struct ChatComposerConfigLoader {
         }
 
         if let catalogResult {
-            guard await client.acceptsCatalogSnapshot(catalogResult) else {
+            if !(await client.acceptsCatalogSnapshot(catalogResult)) {
                 configurationError = NSError(
                     domain: "ChatComposerConfigLoader",
                     code: ChatComposerConfigFailure.catalogUnavailable.code,
