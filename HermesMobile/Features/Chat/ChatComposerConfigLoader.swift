@@ -62,7 +62,7 @@ struct ChatComposerConfigLoader {
     private let client: APIClient
 
     init(client: APIClient) {
-        self.client = client
+        self.client = client; self.catalogEvents = nil; self.onCatalogReady = nil
     }
 
     func loadConfigurationFromClient(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
@@ -187,8 +187,8 @@ struct ChatComposerConfigLoader {
 
     // MARK: Slice 3 catalog path (#16)
 
-    private let catalogEvents: AsyncStream<CatalogEvent>? = nil
-    private let onCatalogReady: (@MainActor @Sendable (CatalogBaseSnapshot) -> Void)? = nil
+    private let catalogEvents: AsyncStream<CatalogEvent>?
+    private let onCatalogReady: (@MainActor @Sendable (CatalogBaseSnapshot) -> Void)?
 
     init(
         client: APIClient,
