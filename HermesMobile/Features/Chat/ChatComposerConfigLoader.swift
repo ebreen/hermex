@@ -324,7 +324,6 @@ struct ChatComposerConfigLoader {
 
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationError: nil,
             configurationFailure: configurationFailure
         )
     }
