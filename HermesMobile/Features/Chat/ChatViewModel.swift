@@ -3799,14 +3799,9 @@ final class ChatViewModel {
             // message ID.
             cancellationFeedbackTicket = ticket
             if ticket.consume() {
-                messages.append(
-                    ChatMessage(
-                        role: "local_notice",
-                        content: String(localized: "Response cancelled"),
-                        timestamp: Date().timeIntervalSince1970,
-                        messageId: ticket.messageID
-                    )
-                )
+                // The single "Response cancelled" notice is appended by the
+                // terminal-commit path with the stable run-status-v1 key; the
+                // accepted cancel does not append a second message.
                 scheduleStreamingScrollTrigger()
             }
             return true

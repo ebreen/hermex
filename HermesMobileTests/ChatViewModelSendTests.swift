@@ -2243,7 +2243,8 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
-            "Final answer loaded without leaving the chat."
+            "Final answer loaded without leaving the chat.",
+            "Response complete"
         ])
     }
 
@@ -2337,7 +2338,8 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
-            "Final answer arrived after the stream was marked inactive."
+            "Final answer arrived after the stream was marked inactive.",
+            "Response complete"
         ])
     }
 
@@ -2412,7 +2414,7 @@ final class ChatViewModelSendTests: XCTestCase {
 
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(streamClient.stopCount, 1)
-            XCTAssertEqual(viewModel.messages.compactMap(\.role), ["user", "assistant", "tool"])
+            XCTAssertEqual(viewModel.messages.compactMap(\.role), ["user", "assistant", "tool", "local_notice"])
             XCTAssertEqual(viewModel.messages.first(where: { $0.role == "assistant" })?.toolCalls?.count, 1)
         }
     }
@@ -2494,9 +2496,13 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(viewModel.displayTitle, "Approval test")
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Do it one more time",
-            "Same result -- approval gate triggered, then the usual JSON-is-not-bash errors."
+            "Same result -- approval gate triggered, then the usual JSON-is-not-bash errors.",
+            "Response complete"
         ])
-        XCTAssertEqual(viewModel.messages.last?.messageId, "assistant-1")
+        XCTAssertTrue(
+            viewModel.messages.last?.messageId?.hasPrefix("run-status-v1-") == true,
+            "The terminal event's messageId is the stable run-status-v1 key"
+        )
     }
 
     func testCompletedStreamSessionDoesNotRequireFollowUpTranscriptRefresh() {
@@ -2539,7 +2545,7 @@ final class ChatViewModelSendTests: XCTestCase {
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
             XCTAssertFalse(viewModel.responseCompletionNeedsTranscriptRefresh)
-            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done."])
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done.", "Response complete"])
         }
     }
 
@@ -2565,7 +2571,7 @@ final class ChatViewModelSendTests: XCTestCase {
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
             XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
-            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done."])
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done.", "Response complete"])
         }
     }
 
@@ -3870,7 +3876,11 @@ final class ChatViewModelSendTests: XCTestCase {
 
         XCTAssertNil(viewModel.activeStreamID)
         XCTAssertEqual(viewModel.activeStreamRecoveryState, .idle)
-        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Recovered full answer."])
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Keep working",
+            "Recovered full answer.",
+            "Response complete"
+        ])
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(requestPaths, ["/api/chat/start", "/api/chat/stream/status", "/api/session"])
     }
@@ -3939,7 +3949,7 @@ final class ChatViewModelSendTests: XCTestCase {
                 errorSummary: nil
             )
         ])
-        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Partial "])
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Partial ", "Response failed"])
     }
 
     @MainActor
@@ -6125,7 +6135,7 @@ final class ChatViewModelSendTests: XCTestCase {
         // reload, so only the locally appended message is present.
         XCTAssertFalse(didReloadMessages)
         XCTAssertNil(viewModel.activeStreamID)
-        XCTAssertEqual(viewModel.messages.map(\.content), ["Keep working"])
+        XCTAssertEqual(viewModel.messages.map(\.content), ["Keep working", "Response complete"])
         XCTAssertNil(viewModel.sendErrorMessage)
         XCTAssertEqual(streamClient.stopCount, 2)
     }
@@ -6502,7 +6512,8 @@ final class ChatViewModelSendTests: XCTestCase {
             "Recent question",
             "Recent answer",
             "Newest question",
-            "Newest answer"
+            "Newest answer",
+            "Response complete"
         ])
         XCTAssertEqual(viewModel.messagesOffset, 0)
         XCTAssertFalse(viewModel.hasOlderMessages)

@@ -653,7 +653,8 @@ final class LiveActivityTests: XCTestCase {
         XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
-            "Completed from transcript refresh."
+            "Completed from transcript refresh.",
+            "Response complete"
         ])
         XCTAssertEqual(requestPaths, ["/api/chat/start", "/api/chat/stream/status", "/api/session"])
     }
