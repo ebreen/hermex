@@ -875,6 +875,17 @@ final class ChatViewModel {
         }
         startCatalogMonitorIfNeeded()
         await modelCatalogCoordinator.openPicker()
+        await applyCurrentCatalogState(from: modelCatalogCoordinator)
+    }
+
+    /// Applies the coordinator's fenced readiness projection. The compatibility
+    /// `.state` event is intentionally ignored as an untrusted hint; callers
+    /// use this snapshot after an awaited open to recover the authoritative
+    /// state without accepting metadata-free input.
+    private func applyCurrentCatalogState(from coordinator: ChatModelCatalogCoordinator) async {
+        guard let snapshot = await coordinator.currentStateSnapshot(),
+              await coordinator.accepts(snapshot.metadata) else { return }
+        catalogCacheState = snapshot.state
     }
 
     /// Applies one catalog event after authoritative revalidation. The VM
@@ -883,9 +894,14 @@ final class ChatViewModel {
     /// any event lands in MainActor state after an await.
     private func applyCatalogEvent(_ event: CatalogEvent, from coordinator: ChatModelCatalogCoordinator) async {
         guard let metadata = event.catalogMetadata else {
-            if case let .state(cacheState) = event {
-                catalogCacheState = cacheState
-            }
+            // `.state` carries no operation or gate metadata and cannot
+            // authorize a MainActor mutation. Replace its payload with the
+            // coordinator's current fenced snapshot and validate that token
+            // immediately before applying the readiness state.
+            guard case .state = event,
+                  let snapshot = await coordinator.currentStateSnapshot(),
+                  await coordinator.accepts(snapshot.metadata) else { return }
+            catalogCacheState = snapshot.state
             return
         }
 
@@ -926,8 +942,14 @@ final class ChatViewModel {
             )
             .loadConfiguration(from: initialState)
         }
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         return await ChatComposerConfigLoader(client: client)
-            .loadConfiguration(from: initialState)
+            .loadConfigurationFromClient(
+                from: initialState,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
     }
 
     /// Applies the loaded state without clobbering a newer user selection:

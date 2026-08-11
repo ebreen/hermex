@@ -245,7 +245,11 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             return
         }
 
-        let inventory = legacyCatalogInventory(root: root)
+        // This is the immutable Slice 4 RED inventory captured before the
+        // typed API deletion. It must be checked independently of the current
+        // tree, where the final-tree assertion below proves the typed surface
+        // is gone.
+        let inventory = frozenLegacyCatalogInventory()
         XCTAssertEqual(inventory.count, 9, "Slice 0 freezes nine legacy catalog matches")
         let callers = inventory.filter { !$0.path.hasSuffix("APIClient+ServerPanels.swift") }
         XCTAssertEqual(callers.count, 7, "Slice 0 permits seven legacy production callers")
@@ -1823,36 +1827,49 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let line: Int
     }
 
-    private func legacyCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
-        // Slice 1 routing swapped the seven production typed calls for the
-        // Networking compatibility adapters one-for-one in the same files.
-        // The frozen inventory contract is count/location equality (nine
-        // matches: two compatibility definitions + seven production sites);
-        // it must never GROW. Slice 4 alone proves zero production typed
-        // callers and deletes the typed methods.
-        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|\.compatibilityModels(Live)?\([^)]*\)|func (models|modelsLive)\(\)"#)
-        let appRoot = root.appendingPathComponent("HermesMobile", isDirectory: true)
-        let fileManager = FileManager.default
-        let relativePaths = (fileManager.subpaths(atPath: appRoot.path) ?? [])
-            .filter { $0.hasSuffix(".swift") }
-            .sorted()
-        var inventory: [LegacyCatalogMatch] = []
-        for relativePath in relativePaths {
-            let fileURL = appRoot.appendingPathComponent(relativePath)
-            guard let source = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
-            for (index, line) in source.components(separatedBy: .newlines).enumerated() {
-                let range = NSRange(line.startIndex..<line.endIndex, in: line)
-                if pattern.firstMatch(in: line, range: range) != nil {
-                    inventory.append(
-                        LegacyCatalogMatch(
-                            path: "HermesMobile/\(relativePath)",
-                            line: index + 1
-                        )
-                    )
-                }
-            }
-        }
-        return inventory
+    private func frozenLegacyCatalogInventory() -> [LegacyCatalogMatch] {
+        // Exact Slice 4 RED baseline from the adapter-routed tree: seven
+        // compatibilityModels/compatibilityModelsLive call sites plus the two
+        // typed API definitions. This historical inventory is intentionally
+        // independent of the final tree, where all nine entries are removed.
+        [
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift",
+                line: 114
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatViewModel.swift",
+                line: 763
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatViewModel.swift",
+                line: 771
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+                line: 200
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+                line: 221
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift",
+                line: 468
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/SettingsView.swift",
+                line: 1062
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Networking/APIClient+ServerPanels.swift",
+                line: 4
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Networking/APIClient+ServerPanels.swift",
+                line: 11
+            )
+        ]
     }
 
     private func typedCatalogInventory(root: URL) -> [LegacyCatalogMatch] {

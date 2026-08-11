@@ -70,11 +70,26 @@ struct ChatComposerConfigLoader {
     }
 
     func loadConfigurationFromClient(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
+        return await loadConfigurationFromClient(
+            from: initialState,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    /// Direct composer fallback with caller-owned operation identity. The
+    /// caller captures both values before the snapshot await so acceptance
+    /// cannot be self-bound to returned metadata.
+    func loadConfigurationFromClient(
+        from initialState: ChatComposerConfigState,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> ChatComposerConfigLoadResult {
         var state = initialState
         var configurationError: Error?
         var selectedProfile: ProfileSummary?
-        let operationID = UUID()
-        let operationGeneration: UInt64 = 1
         let requestedProfile = Self.nonEmpty(state.currentProfile)
 
         // This compatibility initializer is retained for callers that do not
@@ -95,7 +110,11 @@ struct ChatComposerConfigLoader {
         guard !Task.isCancelled,
               catalogResult.metadata.operationID == operationID,
               catalogResult.metadata.operationGeneration == operationGeneration,
-              await client.acceptsCatalogSnapshot(catalogResult)
+              await client.acceptsCatalogSnapshot(
+                  catalogResult,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              )
         else {
             configurationError = NSError(
                 domain: "ChatComposerConfigLoader",
