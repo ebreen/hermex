@@ -67,6 +67,156 @@ final class ChatRunStatusLayoutTests: XCTestCase {
         XCTAssertNil(replayedMessageID)
         XCTAssertEqual(performer.feedback, [.mediumImpact])
     }
+
+    @MainActor
+    func testCloseRecordsDismissalOnly() {
+        let identity = makeStatusConnectionIdentity()
+        var dismissedIdentity: ChatRunIdentity?
+        var cancelCallCount = 0
+        let view = makeActionView(
+            onClose: { dismissedIdentity = identity.run },
+            onCancel: { cancelCallCount += 1 }
+        )
+
+        view.onClose()
+
+        XCTAssertEqual(dismissedIdentity, identity.run)
+        XCTAssertEqual(cancelCallCount, 0)
+    }
+
+    @MainActor
+    func testCancelRecordsExpectedIdentityAndDoesNotClose() {
+        let identity = makeStatusConnectionIdentity()
+        var dismissed = false
+        var cancellationIdentities: [ChatRunConnectionIdentity] = []
+        let view = makeActionView(
+            onClose: { dismissed = true },
+            onCancel: { cancellationIdentities.append(identity) }
+        )
+
+        view.onCancel()
+
+        XCTAssertFalse(dismissed)
+        XCTAssertEqual(cancellationIdentities, [identity])
+    }
+
+    @MainActor
+    func testFailedCancelResultLeavesRowActive() {
+        let identity = makeStatusConnectionIdentity()
+        var lifecycle: ChatRunStatusLifecycle = .active
+        var cancelResult: ChatCancelDisposition = .unconfirmed
+        let rejectedResponse = ChatCancelResponse(
+            ok: false,
+            cancelled: nil,
+            streamId: identity.run.streamID,
+            error: nil
+        )
+        let view = makeActionView(
+            onClose: {},
+            onCancel: {
+                cancelResult = .rejected(rejectedResponse)
+                if case .accepted = cancelResult {
+                    lifecycle = .cancelled
+                }
+            }
+        )
+
+        view.onCancel()
+
+        XCTAssertEqual(cancelResult, .rejected(rejectedResponse))
+        XCTAssertEqual(lifecycle, .active)
+    }
+
+    @MainActor
+    func testStaleCancelResultLeavesReplacementStatusUndismissedAndInvokesNoHaptic() {
+        let replacementIdentity = makeStatusConnectionIdentity(generation: 2)
+        let performer = SpyHapticPerformer()
+        var lifecycle: ChatRunStatusLifecycle = .active
+        var dismissed = false
+        let view = makeActionView(
+            onClose: { dismissed = true },
+            onCancel: {
+                let result = ChatCancelDisposition.stale
+                let didAccept = if case .accepted = result { true } else { false }
+                let messageID = ChatCancellationFeedback.apply(
+                    result: didAccept,
+                    ticket: nil,
+                    isHapticsEnabled: true,
+                    performer: { performer.perform($0) }
+                )
+                if messageID != nil {
+                    lifecycle = .cancelled
+                }
+            }
+        )
+
+        view.onCancel()
+
+        XCTAssertEqual(replacementIdentity.run.generation, 2)
+        XCTAssertEqual(lifecycle, .active)
+        XCTAssertFalse(dismissed)
+        XCTAssertTrue(performer.feedback.isEmpty)
+    }
+
+    @MainActor
+    func testAcceptedCancelResultInvokesOneHapticOnlyAfterTerminalAcceptance() {
+        let identity = makeStatusConnectionIdentity()
+        let performer = SpyHapticPerformer()
+        let ticket = ChatCancellationTicket(identity: identity, messageID: "cancelled-msg")
+        var lifecycle: ChatRunStatusLifecycle = .active
+        let view = makeActionView(
+            onClose: {},
+            onCancel: {
+                let result = ChatCancelDisposition.accepted(ticket)
+                let didAccept = if case .accepted = result { true } else { false }
+                let messageID = ChatCancellationFeedback.apply(
+                    result: didAccept,
+                    ticket: ticket,
+                    isHapticsEnabled: true,
+                    performer: { performer.perform($0) }
+                )
+                if messageID != nil {
+                    lifecycle = .cancelled
+                }
+            }
+        )
+
+        view.onCancel()
+        view.onCancel()
+
+        XCTAssertEqual(lifecycle, .cancelled)
+        XCTAssertTrue(ticket.isConsumed)
+        XCTAssertEqual(performer.feedback, [.mediumImpact])
+    }
+
+    @MainActor
+    func testReduceMotionDisablesRunStatusParentMovement() {
+        XCTAssertEqual(ChatMotion.runStatusParentMotion(reduceMotion: true), .none)
+        XCTAssertEqual(ChatMotion.runStatusParentMotion(reduceMotion: false), .slideAndFade)
+    }
+
+    @MainActor
+    private func makeActionView(
+        onClose: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) -> ChatActiveRunStatusView {
+        ChatActiveRunStatusView(
+            presentation: ChatActiveRunStatusPresentation(kind: .active),
+            onClose: onClose,
+            onCancel: onCancel
+        )
+    }
+
+    private func makeStatusConnectionIdentity(generation: Int = 1) -> ChatRunConnectionIdentity {
+        ChatRunConnectionIdentity(
+            run: ChatRunIdentity(
+                sessionID: "session-1",
+                streamID: "stream-1",
+                generation: generation
+            ),
+            connectionGeneration: 1
+        )
+    }
 }
 
 /// Records every haptic the injected performer is asked to emit.
