@@ -356,6 +356,9 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         let loader = ChatComposerConfigLoader(
             client: client,
             catalogEvents: await coordinator.subscribe(),
+            acceptsCatalogEvent: { metadata in
+                await coordinator.accepts(metadata)
+            },
             onCatalogReady: { @MainActor snapshot in
                 catalogReadyCount += 1
                 catalogReadySnapshot = snapshot

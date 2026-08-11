@@ -60,9 +60,13 @@ struct ChatComposerConfigLoadResult: Sendable {
 
 struct ChatComposerConfigLoader {
     private let client: APIClient
+    private let acceptsCatalogEvent: (@Sendable (CatalogEventMetadata) async -> Bool)?
 
     init(client: APIClient) {
-        self.client = client; self.catalogEvents = nil; self.onCatalogReady = nil
+        self.client = client
+        self.catalogEvents = nil
+        self.acceptsCatalogEvent = nil
+        self.onCatalogReady = nil
     }
 
     func loadConfigurationFromClient(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
@@ -253,18 +257,21 @@ struct ChatComposerConfigLoader {
     init(
         client: APIClient,
         catalogEvents: AsyncStream<CatalogEvent>,
+        acceptsCatalogEvent: @escaping @Sendable (CatalogEventMetadata) async -> Bool,
         onCatalogReady: @escaping @MainActor @Sendable (CatalogBaseSnapshot) -> Void
     ) {
         self.client = client
         self.catalogEvents = catalogEvents
+        self.acceptsCatalogEvent = acceptsCatalogEvent
         self.onCatalogReady = onCatalogReady
     }
 
     func loadConfiguration(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
-        if let catalogEvents, let onCatalogReady {
+        if let catalogEvents, let acceptsCatalogEvent, let onCatalogReady {
             return await loadConfigurationFromCatalog(
                 from: initialState,
                 catalogEvents: catalogEvents,
+                acceptsCatalogEvent: acceptsCatalogEvent,
                 onCatalogReady: onCatalogReady
             )
         }
@@ -274,6 +281,7 @@ struct ChatComposerConfigLoader {
     private func loadConfigurationFromCatalog(
         from initialState: ChatComposerConfigState,
         catalogEvents: AsyncStream<CatalogEvent>,
+        acceptsCatalogEvent: @escaping @Sendable (CatalogEventMetadata) async -> Bool,
         onCatalogReady: @escaping @MainActor @Sendable (CatalogBaseSnapshot) -> Void
     ) async -> ChatComposerConfigLoadResult {
         var state = initialState
@@ -287,6 +295,15 @@ struct ChatComposerConfigLoader {
         var sawContextVerified = false
         var sawBase = false
         for await event in catalogEvents {
+            guard let metadata = Self.catalogEventMetadata(for: event),
+                  await acceptsCatalogEvent(metadata)
+            else {
+                // Readiness transitions intentionally carry no metadata and
+                // cannot authorize a composer mutation. Stale metadata-bearing
+                // events are rejected by the coordinator acceptance closure.
+                continue
+            }
+
             switch event {
             case let .contextVerified(_, context):
                 sawContextVerified = true
@@ -368,6 +385,25 @@ struct ChatComposerConfigLoader {
             state: state,
             configurationFailure: configurationFailure
         )
+    }
+
+    private static func catalogEventMetadata(for event: CatalogEvent) -> CatalogEventMetadata? {
+        switch event {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata),
+             let .contextReset(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot):
+            return snapshot.metadata
+        case let .live(snapshot):
+            return snapshot.metadata
+        case .state:
+            return nil
+        }
     }
 }
 

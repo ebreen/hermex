@@ -919,6 +919,9 @@ final class ChatViewModel {
             return await ChatComposerConfigLoader(
                 client: client,
                 catalogEvents: catalogStream,
+                acceptsCatalogEvent: { metadata in
+                    await modelCatalogCoordinator.accepts(metadata)
+                },
                 onCatalogReady: { @MainActor _ in }
             )
             .loadConfiguration(from: initialState)
