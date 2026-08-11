@@ -250,12 +250,18 @@ struct DefaultProfilePickerView: View {
         errorMessage = nil
 
         let client = APIClient(baseURL: server)
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         let snapshot = await client.profileContextSnapshot(
-            operationID: UUID(),
-            operationGeneration: 1
+            operationID: operationID,
+            operationGeneration: operationGeneration
         )
         guard !Task.isCancelled,
-              await client.acceptsCatalogMetadata(snapshot.metadata) else {
+              await client.acceptsCatalogSnapshot(
+                  snapshot,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              ) else {
             isLoading = false
             return
         }
@@ -461,13 +467,19 @@ private struct CreateProfileSheet: View {
     private func loadModels() async {
         // Best-effort neutral catalog projection for the create-profile form.
         let client = APIClient(baseURL: server)
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         let snapshot = await client.modelCatalogSnapshot(
             requestedProfile: nil,
-            operationID: UUID(),
-            operationGeneration: 1
+            operationID: operationID,
+            operationGeneration: operationGeneration
         )
         guard !Task.isCancelled,
-              await client.acceptsCatalogSnapshot(snapshot),
+              await client.acceptsCatalogSnapshot(
+                  snapshot,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              ),
               snapshot.failure == nil else { return }
         modelGroups = snapshot.live?.groups ?? snapshot.base?.groups ?? []
     }

@@ -270,12 +270,18 @@ final class SessionListViewModel {
         defer { isLoadingActiveProfile = false }
 
         do {
+            let operationID = UUID()
+            let operationGeneration: UInt64 = 1
             let snapshot = await client.profileContextSnapshot(
-                operationID: UUID(),
-                operationGeneration: 1
+                operationID: operationID,
+                operationGeneration: operationGeneration
             )
             guard !Task.isCancelled,
-                  await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+                  await client.acceptsCatalogSnapshot(
+                      snapshot,
+                      operationID: operationID,
+                      operationGeneration: operationGeneration
+                  ) else { return }
             guard !snapshot.activeProfile.isEmpty else {
                 activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
                 return

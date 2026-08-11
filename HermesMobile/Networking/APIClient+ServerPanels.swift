@@ -75,8 +75,18 @@ extension APIClient {
 
     /// Authoritative acceptance for a neutral profile/catalog result. The
     /// check is intentionally performed against the shared gate, not a
-    /// caller's last-applied profile or local epoch copy.
-    func acceptsCatalogMetadata(_ metadata: CatalogEventMetadata) async -> Bool {
+    /// caller's last-applied profile or local epoch copy. The caller-supplied
+    /// operation identity is part of the acceptance contract: a response from
+    /// another request must not be applied merely because it shares a client
+    /// and gate epoch.
+    func acceptsCatalogMetadata(
+        _ metadata: CatalogEventMetadata,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        guard metadata.operationID == operationID,
+              metadata.operationGeneration == operationGeneration else { return false }
+
         let gateKey: ProfileContextGateKey
         let epoch: UInt64
         switch metadata.identity {
@@ -93,12 +103,67 @@ extension APIClient {
             gateKey = key.gateKey
             epoch = key.gateEpoch
         }
+
+        guard !Task.isCancelled else { return false }
         let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
-        return await gate.gateEpoch == epoch
+        let authoritativeEpoch = await gate.gateEpoch
+        return !Task.isCancelled && authoritativeEpoch == epoch
+    }
+
+    /// Compatibility adapter for existing stream consumers. New snapshot
+    /// callers pass their captured operation identity through the overloads
+    /// below; this form remains for the existing event metadata boundary.
+    func acceptsCatalogMetadata(_ metadata: CatalogEventMetadata) async -> Bool {
+        await acceptsCatalogMetadata(
+            metadata,
+            operationID: metadata.operationID,
+            operationGeneration: metadata.operationGeneration
+        )
+    }
+
+    func acceptsCatalogSnapshot(
+        _ result: CatalogSnapshotResult,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        await acceptsCatalogMetadata(
+            result.metadata,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
     }
 
     func acceptsCatalogSnapshot(_ result: CatalogSnapshotResult) async -> Bool {
-        await acceptsCatalogMetadata(result.metadata)
+        await acceptsCatalogSnapshot(
+            result,
+            operationID: result.metadata.operationID,
+            operationGeneration: result.metadata.operationGeneration
+        )
+    }
+
+    /// Profile reads have one additional authority condition: only a snapshot
+    /// produced by strict profile verification may reach cache, selection, or
+    /// UI state. Failure-shaped snapshots remain value-semantic and Sendable,
+    /// but are never accepted even when their provisional metadata is current.
+    func acceptsCatalogSnapshot(
+        _ result: CatalogProfileReadSnapshot,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        guard result.isAuthoritative else { return false }
+        return await acceptsCatalogMetadata(
+            result.metadata,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    func acceptsCatalogSnapshot(_ result: CatalogProfileReadSnapshot) async -> Bool {
+        await acceptsCatalogSnapshot(
+            result,
+            operationID: result.metadata.operationID,
+            operationGeneration: result.metadata.operationGeneration
+        )
     }
 
     /// Neutral base catalog read used by the direct (non-Chat coordinator)

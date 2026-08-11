@@ -124,14 +124,18 @@ enum ProfileEntityProvider {
         // an epoch-advanced result is discarded (the caller falls back to the
         // last cached profiles) instead of publishing stale names.
         let client = APIClient(baseURL: server, customHeaderProvider: { headers })
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         let snapshot = await client.profileContextSnapshot(
-            operationID: UUID(),
-            operationGeneration: 1
+            operationID: operationID,
+            operationGeneration: operationGeneration
         )
-        guard snapshot.isAuthoritative else {
-            throw LiveProfileFetchFailure.unverified
-        }
-        guard await client.acceptsCatalogMetadata(snapshot.metadata) else {
+        guard !Task.isCancelled,
+              await client.acceptsCatalogSnapshot(
+                  snapshot,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              ) else {
             throw LiveProfileFetchFailure.unverified
         }
         return snapshot

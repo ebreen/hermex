@@ -1056,12 +1056,20 @@ struct SettingsView: View {
         }
 
         do {
+            let operationID = UUID()
+            let operationGeneration: UInt64 = 1
             let catalog = await client.modelCatalogSnapshot(
                 requestedProfile: nil,
-                operationID: UUID(),
-                operationGeneration: 1
+                operationID: operationID,
+                operationGeneration: operationGeneration
             )
-            if await client.acceptsCatalogSnapshot(catalog), catalog.failure == nil {
+            if !Task.isCancelled,
+               await client.acceptsCatalogSnapshot(
+                   catalog,
+                   operationID: operationID,
+                   operationGeneration: operationGeneration
+               ),
+               catalog.failure == nil {
                 defaultModel = catalog.base?.defaultModel
             } else {
                 defaultModel = nil
@@ -1074,11 +1082,18 @@ struct SettingsView: View {
         isLoadingDefaultModel = false
 
         do {
+            let operationID = UUID()
+            let operationGeneration: UInt64 = 1
             let profileSnapshot = await client.profileContextSnapshot(
-                operationID: UUID(),
-                operationGeneration: 1
+                operationID: operationID,
+                operationGeneration: operationGeneration
             )
-            if await client.acceptsCatalogMetadata(profileSnapshot.metadata),
+            if !Task.isCancelled,
+               await client.acceptsCatalogSnapshot(
+                   profileSnapshot,
+                   operationID: operationID,
+                   operationGeneration: operationGeneration
+               ),
                !profileSnapshot.activeProfile.isEmpty {
                 defaultProfileName = profileSnapshot.activeProfile
                 defaultProfileDisplayName = profileSnapshot.profiles.first {

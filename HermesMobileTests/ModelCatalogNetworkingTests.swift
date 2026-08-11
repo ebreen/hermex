@@ -1353,6 +1353,64 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertEqual(cache.loadEntities().map(\.id), ["default"])
     }
 
+    func testProfileSnapshotAcceptanceRejectsMismatchedOperationIdentity() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 7
+        let snapshot = await client.profileContextSnapshot(
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+
+        let accepted = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        XCTAssertTrue(accepted)
+
+        let rejectedOperationID = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: UUID(),
+            operationGeneration: operationGeneration
+        )
+        XCTAssertFalse(rejectedOperationID, "a different operation cannot apply a valid snapshot")
+
+        let rejectedGeneration = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration + 1
+        )
+        XCTAssertFalse(rejectedGeneration, "a later operation generation cannot apply an older snapshot")
+    }
+
+    func testUnverifiedProfileSnapshotIsRejectedBeforeStateApplication() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installProfilesOnly(
+            #"{"profiles":[{"name":"a","isActive":true},{"name":"b","isActive":true}],"single_profile_mode":false}"#
+        )
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
+        let snapshot = await client.profileContextSnapshot(
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        XCTAssertFalse(snapshot.isAuthoritative)
+
+        var appliedProfile: String?
+        if await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        ) {
+            appliedProfile = snapshot.activeProfile
+        }
+        XCTAssertNil(appliedProfile, "an unverified profile read must not reach state mutation")
+    }
+
     private func assertNeutralCatalogCaller(
         relativePath: String,
         requiredCall: String

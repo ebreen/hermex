@@ -196,12 +196,19 @@ struct DefaultModelPickerView: View {
         errorMessage = nil
 
         let client = APIClient(baseURL: server)
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         let snapshot = await client.modelCatalogSnapshot(
             requestedProfile: nil,
-            operationID: UUID(),
-            operationGeneration: 1
+            operationID: operationID,
+            operationGeneration: operationGeneration
         )
-        guard await client.acceptsCatalogSnapshot(snapshot),
+        guard !Task.isCancelled,
+              await client.acceptsCatalogSnapshot(
+                  snapshot,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              ),
               snapshot.failure == nil,
               let base = snapshot.base else {
             errorMessage = String(localized: "Could Not Load Models")
