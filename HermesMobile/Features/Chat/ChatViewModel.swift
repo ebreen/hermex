@@ -855,12 +855,15 @@ final class ChatViewModel {
             )
         }
 
-        // Keep the terminal snapshot available for inline-event diagnostics,
-        // but the policy intentionally projects no row for this lifecycle.
-        guard let confirmedRunSnapshot,
-              confirmedRunSnapshot.lifecycle == .completed
-        else { return nil }
-        return confirmedRunSnapshot
+        // Keep terminal snapshots available for inline-event diagnostics, but
+        // the policy intentionally projects no row for any terminal lifecycle.
+        guard let confirmedRunSnapshot else { return nil }
+        switch confirmedRunSnapshot.lifecycle {
+        case .completed, .failed, .cancelled:
+            return confirmedRunSnapshot
+        case .active, .checking, .reconnecting, .dismissed:
+            return nil
+        }
     }
 
     var activeRunConnectionIdentity: ChatRunConnectionIdentity? {
@@ -3503,10 +3506,20 @@ final class ChatViewModel {
     /// attempts persistence. A repeated callback for an already-committed key
     /// (or an already-terminal state) appends nothing and writes nothing.
     func streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit) {
+        let lifecycle: ChatRunStatusLifecycle
+        switch commit.outcome {
+        case .completed:
+            lifecycle = .completed
+        case .failed:
+            lifecycle = .failed
+        case .cancelled:
+            lifecycle = .cancelled
+        }
+
         if confirmedRunSnapshot?.identity == commit.identity {
             confirmedRunSnapshot = ChatRunStatusSnapshot(
                 identity: commit.identity,
-                lifecycle: .completed,
+                lifecycle: lifecycle,
                 goal: confirmedRunSnapshot?.goal ?? "",
                 recoveryState: .idle
             )
@@ -3884,9 +3897,22 @@ final class ChatViewModel {
 
     @discardableResult
     func cancelActiveStream(expectedIdentity: ChatRunConnectionIdentity? = nil) async -> Bool {
-        guard activeStreamID != nil else { return false }
+        let disposition = await cancelActiveStreamDisposition(expectedIdentity: expectedIdentity)
+        if case .accepted = disposition {
+            return true
+        }
+        return false
+    }
+
+    /// Full cancellation result for UI callers that must distinguish a stale
+    /// request from a current transport error. The Bool overload above remains
+    /// source-compatible with slash-command and existing callers.
+    func cancelActiveStreamDisposition(
+        expectedIdentity: ChatRunConnectionIdentity? = nil
+    ) async -> ChatCancelDisposition {
+        guard activeStreamID != nil else { return .unconfirmed }
         guard expectedIdentity == nil || expectedIdentity == activeRunConnectionIdentity else {
-            return false
+            return .stale
         }
 
         activeCancellationCount += 1
@@ -3914,21 +3940,21 @@ final class ChatViewModel {
                 // accepted cancel does not append a second message.
                 scheduleStreamingScrollTrigger()
             }
-            return true
+            return .accepted(ticket)
         case .stale:
             // A superseded cancellation is a silent no-op: no error, no
             // feedback ticket, no "Response cancelled" message — the
             // replacement run's own cancellation owns the UI.
-            return false
+            return .stale
         case .rejected(let response):
             sendErrorMessage = response.error ?? String(localized: "The server could not stop the current response.")
-            return false
+            return .rejected(response)
         case .thrown(let error):
             lastError = error
             sendErrorMessage = error.localizedDescription
-            return false
+            return .thrown(error)
         case .unconfirmed:
-            return false
+            return .unconfirmed
         }
     }
 

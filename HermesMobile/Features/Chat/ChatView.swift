@@ -1046,24 +1046,20 @@ struct ChatView: View {
                         .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
                 }
 
-                if let activeRunStatusPresentation {
-                    if let runSnapshot = viewModel.activeRunStatusSnapshot,
-                       let connectionIdentity = viewModel.activeRunConnectionIdentity {
-                        ChatActiveRunStatusView(
-                            presentation: activeRunStatusPresentation,
-                            connectionIdentity: connectionIdentity,
-                            onClose: {
-                                viewModel.dismissActiveRunStatus(for: runSnapshot.identity)
-                            },
-                            onCancel: { expectedIdentity in
-                                Task { await cancelStream(expectedIdentity: expectedIdentity) }
-                            }
-                        )
-                        .transition(runStatusParentTransition)
-                    } else {
-                        ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
-                            .transition(runStatusParentTransition)
-                    }
+                if let activeRunStatusPresentation,
+                   let runSnapshot = viewModel.activeRunStatusSnapshot,
+                   let connectionIdentity = viewModel.activeRunConnectionIdentity {
+                    ChatActiveRunStatusView(
+                        presentation: activeRunStatusPresentation,
+                        connectionIdentity: connectionIdentity,
+                        onClose: {
+                            viewModel.dismissActiveRunStatus(for: runSnapshot.identity)
+                        },
+                        onCancel: { expectedIdentity in
+                            Task { await cancelStream(expectedIdentity: expectedIdentity) }
+                        }
+                    )
+                    .transition(runStatusParentTransition)
                 }
 
                 if showsApprovalBypassStatus {
@@ -1585,10 +1581,14 @@ struct ChatView: View {
     }
 
     private func cancelStream(expectedIdentity: ChatRunConnectionIdentity? = nil) async {
-        let didCancel = await viewModel.cancelActiveStream(expectedIdentity: expectedIdentity)
-        if didCancel {
+        let disposition = await viewModel.cancelActiveStreamDisposition(expectedIdentity: expectedIdentity)
+        if case .accepted = disposition {
             ChatHaptics.streamCancelled(isEnabled: isHapticsEnabled)
         }
+
+        // A stale cancellation belongs to an older connection/run. Never
+        // forward the replacement run's lastError through this action.
+        if case .stale = disposition { return }
 
         if let lastError = viewModel.lastError {
             onAPIError(lastError)

@@ -451,10 +451,9 @@ enum ChatActiveRunStatusPolicy {
         )
     }
 
-    /// Compatibility surface for callers not yet migrated to the confirmed
-    /// coordinator snapshot. It deliberately cannot invent a run identity for
-    /// a starting flag; active legacy callers get a synthetic presentation only
-    /// until the owning view supplies its confirmed snapshot.
+    /// Compatibility-only surface for callers not yet migrated to the confirmed
+    /// coordinator snapshot. ChatView production code must not call this flag
+    /// overload; it cannot invent a run identity for a starting flag.
     static func presentation(
         isStartingChat: Bool,
         hasActiveStream: Bool,

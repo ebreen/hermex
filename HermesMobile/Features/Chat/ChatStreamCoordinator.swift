@@ -269,8 +269,8 @@ private extension FixedWidthInteger {
 /// generation and bumps only the connection generation; a replacement run
 /// bumps both (#18 Slice 3).
 struct ChatRunConnectionIdentity: Equatable, Hashable, Sendable {
-    /// Optional session context used only to reconstruct `run`; the transport
-    /// equality semantics remain stream + logical generation + connection.
+    /// Session context is part of the connection identity as well as the
+    /// logical-run reconstruction, so identities cannot cross session fences.
     let sessionID: String
     let streamID: String
     let logicalGeneration: Int
