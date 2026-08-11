@@ -1315,9 +1315,20 @@ final class ChatViewModel {
         return activeRecoveryLoadToken == token
     }
 
+    /// Whether a goal-kickoff confirmation load may still apply its result
+    /// (#18 Slice 6). A load whose captured run-generation fence epoch no
+    /// longer matches — a run started or finalized while the load was in
+    /// flight — must not mutate the current run landscape: no transcript
+    /// apply, cache write, session reconcile, or pin/anchor clear.
+    private func isCurrentGoalKickoffFence(_ fence: Int?) -> Bool {
+        guard let fence else { return true }
+        return streamCoordinator.runGenerationEpoch == fence
+    }
+
     func loadMessages(
         modelContext: ModelContext? = nil,
-        recoveryLoadToken: ChatRunRecoveryLoadToken? = nil
+        recoveryLoadToken: ChatRunRecoveryLoadToken? = nil,
+        goalKickoffFence: Int? = nil
     ) async {
         guard let sessionID else {
             errorMessage = String(localized: "The server did not provide a session ID.")
@@ -1368,7 +1379,8 @@ final class ChatViewModel {
             // load whose token no longer matches the current run must not
             // apply messages, write the cache, reconcile the session, clear
             // pins/anchors, or publish anything.
-            guard isCurrentRecoveryLoad(recoveryLoadToken) else { return }
+            guard isCurrentRecoveryLoad(recoveryLoadToken),
+                  isCurrentGoalKickoffFence(goalKickoffFence) else { return }
             let session = response.session
             let loadedMessages = session?.messages ?? []
             let loadedActiveStreamID = session?.activeStreamId?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1450,7 +1462,8 @@ final class ChatViewModel {
         } catch {
             // Same stale-load guard: a cache fallback or error publication
             // from a superseded run's load must not touch the replacement.
-            guard isCurrentRecoveryLoad(recoveryLoadToken) else { return }
+            guard isCurrentRecoveryLoad(recoveryLoadToken),
+                  isCurrentGoalKickoffFence(goalKickoffFence) else { return }
             lastError = error
             latestServerLoadHadAssistantResponseAfterLatestUser = false
             if CacheFallbackPolicy.shouldUseCache(for: error), let modelContext {
@@ -2416,7 +2429,8 @@ final class ChatViewModel {
 
             return await attachGoalKickoffStream(
                 noticeMessage: response.displayMessage,
-                modelContext: modelContext
+                modelContext: modelContext,
+                goalText: response.goal?.goal ?? args
             )
         } catch {
             lastError = error
@@ -2426,33 +2440,75 @@ final class ChatViewModel {
         }
     }
 
-    private func attachGoalKickoffStream(noticeMessage: String?, modelContext: ModelContext?) async -> Bool {
-        await loadMessages(modelContext: modelContext)
 
-        if let errorMessage {
-            goalErrorMessage = errorMessage
-            sendErrorMessage = errorMessage
-            return false
-        }
+    /// The active run's confirmed status snapshot (#18 Slice 6): set ONLY
+    /// when a goal-kickoff confirmation load reports an `active_stream_id`
+    /// and the confirmed stream starts. Nil before any confirmed kickoff or
+    /// when the kickoff fell back inline.
+    private(set) var confirmedRunSnapshot: ChatRunStatusSnapshot?
 
-        guard let streamID = activeStreamID else {
-            if let noticeMessage {
-                appendLocalNoticeMessage(noticeMessage)
+    /// True while the goal-kickoff confirmation reconciliation is in flight
+    /// (#18 Slice 6): the bounded `/api/session` retry that starts the
+    /// confirmed stream only after an `active_stream_id` is reported.
+    private(set) var isReconcilingGoalKickoff = false
+
+    /// Goal-kickoff confirmation (#18 Slice 6): bounded, cancellable
+    /// reconciliation against `/api/session`. The confirmed run's stream
+    /// starts ONLY after a session response reports an `active_stream_id`;
+    /// a late ID is picked up by up to `confirmationLoadBudget` confirmation
+    /// loads. Cancellation, a run start/finalize while a load is in flight
+    /// (run-generation fence), and budget exhaustion are silent no-ops — no
+    /// pin and no fallback mutation. Only exhaustion appends ONE inline
+    /// notice, never a pin; generic pinned slash notices are untouched.
+    private func attachGoalKickoffStream(
+        noticeMessage: String?,
+        modelContext: ModelContext?,
+        goalText: String
+    ) async -> Bool {
+        isReconcilingGoalKickoff = true
+        defer { isReconcilingGoalKickoff = false }
+
+        let confirmationLoadBudget = 3
+        for _ in 0..<confirmationLoadBudget {
+            guard !Task.isCancelled else { return false }
+            let fence = streamCoordinator.runGenerationEpoch
+            await loadMessages(modelContext: modelContext, goalKickoffFence: fence)
+
+            // Cancellation and replacement/finalization during the load are
+            // silent: no fallback notice, no stream start, no snapshot.
+            guard !Task.isCancelled else { return false }
+            guard streamCoordinator.runGenerationEpoch == fence else { return false }
+
+            if let errorMessage {
+                goalErrorMessage = errorMessage
+                sendErrorMessage = errorMessage
+                return false
+            }
+
+            guard let streamID = activeStreamID else { continue }
+
+            if streamingAssistantMessageID == nil {
+                restoreActiveStreamSnapshotIfAvailable(streamID: streamID)
+            }
+            if streamingAssistantMessageID == nil {
+                streamingAssistantMessageID = Self.latestAssistantMessageID(in: messages)
+            }
+
+            streamCoordinator.start(streamID: streamID)
+            if let identity = streamCoordinator.runIdentity {
+                confirmedRunSnapshot = ChatRunStatusSnapshot(
+                    identity: identity,
+                    goal: goalText
+                )
             }
             return true
         }
 
-        if streamingAssistantMessageID == nil {
-            restoreActiveStreamSnapshotIfAvailable(streamID: streamID)
-        }
-        if streamingAssistantMessageID == nil {
-            streamingAssistantMessageID = Self.latestAssistantMessageID(in: messages)
-        }
+        // Budget exhausted without an active stream: ONE inline fallback,
+        // never pinned (#18 Slice 6).
         if let noticeMessage {
-            pinLocalNoticeMessage(noticeMessage)
+            appendLocalNoticeMessage(noticeMessage)
         }
-
-        streamCoordinator.start(streamID: streamID)
         return true
     }
 
