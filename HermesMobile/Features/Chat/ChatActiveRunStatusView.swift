@@ -94,7 +94,7 @@ struct ChatActiveRunStatusView: View {
                 }
             }
 
-            if !presentation.goal.isEmpty {
+            if presentation.layoutMode == .expanded, !presentation.goal.isEmpty {
                 Text(presentation.goal)
                     .font(.caption2)
                     .foregroundStyle(.secondary)

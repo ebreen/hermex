@@ -306,12 +306,14 @@ struct ChatRunConnectionIdentity: Equatable, Hashable, Sendable {
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.streamID == rhs.streamID &&
+        lhs.sessionID == rhs.sessionID &&
+            lhs.streamID == rhs.streamID &&
             lhs.logicalGeneration == rhs.logicalGeneration &&
             lhs.connectionGeneration == rhs.connectionGeneration
     }
 
     func hash(into hasher: inout Hasher) {
+        hasher.combine(sessionID)
         hasher.combine(streamID)
         hasher.combine(logicalGeneration)
         hasher.combine(connectionGeneration)

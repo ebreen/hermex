@@ -1075,7 +1075,10 @@ struct ChatView: View {
             .padding(.bottom, composerHeight + 8)
             .zIndex(8)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: composerAccessoryVisibleItemCount)
-            .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: activeRunStatusPresentation)
+            .animation(
+                reduceMotion ? nil : ChatMotion.quickState(reduceMotion: reduceMotion),
+                value: activeRunStatusPresentation
+            )
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: viewModel.pinnedLocalNotices)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: showsApprovalBypassStatus)
         }

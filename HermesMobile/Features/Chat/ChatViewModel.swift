@@ -5382,8 +5382,18 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     }
 
     func streamCoordinatorDidStartConnection(isReplay: Bool) {
-        activeRunDismissed = false
-        activeRunDismissedIdentity = nil
+        if let identity = streamCoordinator.runConnectionIdentity {
+            let logicalIdentity = identity.run
+            if activeRunDismissedIdentity?.sessionID != logicalIdentity.sessionID ||
+                activeRunDismissedIdentity?.streamID != logicalIdentity.streamID ||
+                activeRunDismissedIdentity?.generation != logicalIdentity.generation {
+                activeRunDismissed = false
+                activeRunDismissedIdentity = nil
+            }
+        } else {
+            activeRunDismissed = false
+            activeRunDismissedIdentity = nil
+        }
         activeStreamReplayMatchedPrefixLength = 0
         activeStreamReplayMatchedInterimLength = 0
         activeStreamReplayMatchedReasoningLength = 0
