@@ -7669,6 +7669,190 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(cancelledMessages.count, 1)
         XCTAssertEqual(Set(cancelledMessages.compactMap(\.messageId)).count, 1)
     }
+
+    // MARK: - Slice 4 (#18): stale recovery-load guards
+
+    // Intended Slice 4 API the GREEN phase adds (referenced here so the RED
+    // phase fails to compile until the recovery-load token exists):
+    //   struct ChatRunRecoveryLoadToken: Equatable, Sendable {
+    //       let identity: ChatRunConnectionIdentity
+    //   }
+    //   var ChatViewModel.activeRecoveryLoadToken: ChatRunRecoveryLoadToken?
+    //   func ChatViewModel.loadMessages(
+    //       modelContext: ModelContext? = nil,
+    //       recoveryLoadToken: ChatRunRecoveryLoadToken? = nil
+    //   ) async
+    //
+    // The delayed load must be revalidated against the current run after the
+    // awaited session response/cache fallback/error. Today the ViewModel
+    // applies the delayed reload over the replacement run — the coordinator's
+    // late guard cannot help because the mutation happens inside loadMessages
+    // before any coordinator check.
+
+    /// Shared harness for the three stale-load tests: builds a real
+    /// `ChatViewModel` (which is the stream coordinator's real delegate) with
+    /// a continuation-gated `/api/session` endpoint, starts run A, holds A's
+    /// recovery load on the gate, pins a local notice, then replaces A with
+    /// run B while the load is still gated. The caller configures what the
+    /// gate releases (success JSON, cacheable error, or non-cacheable error)
+    /// and asserts zero stale-A mutations afterwards. No sleeps, polling, or
+    /// semaphores establish ordering.
+    @MainActor
+    private func startGatedRecoveryLoad(
+        gate: CancelResponseGate,
+        context: ModelContext
+    ) throws -> (viewModel: ChatViewModel, server: URL, loadTask: Task<Void, Never>) {
+        let gatedSession: URLSession = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatedURLProtocol.self]
+            return URLSession(configuration: configuration)
+        }()
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let gatedClient = APIClient(baseURL: server, session: gatedSession)
+        var startCount = 0
+        GatedURLProtocol.asyncHandler = { request in
+            switch request.url?.path {
+            case "/api/session":
+                await gate.enter()
+                if let error = gate.thrownError {
+                    throw error
+                }
+                return apiTestJSONResponse(gate.responseJSON, for: request)
+            case "/api/chat/start":
+                startCount += 1
+                if startCount == 1 {
+                    return apiTestJSONResponse(#"{"session_id": "session-abc", "stream_id": "stream-123"}"#, for: request)
+                }
+                return apiTestJSONResponse(#"{"session_id": "session-abc", "stream_id": "stream-B-replacement"}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let viewModel = try makeViewModel(client: gatedClient, handler: { apiTestJSONResponse("{}", for: $0) })
+
+        // Run A starts; its recovery load enters the gate.
+        let didStartA = await viewModel.sendMessage("Message A")
+        XCTAssertTrue(didStartA)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-123")
+
+        let tokenA = try XCTUnwrap(viewModel.activeRecoveryLoadToken)
+        let loadTaskA = Task { @MainActor in
+            await viewModel.loadMessages(modelContext: context, recoveryLoadToken: tokenA)
+        }
+        await gate.waitForEntry()
+        XCTAssertEqual(gate.enteredCount, 1)
+
+        // A pinned local notice must survive the stale load untouched.
+        viewModel.pinLocalNoticeMessage("Keep this pinned")
+
+        // Replace run A with B (new logical generation, different stream ID so
+        // a wrongly applied reconcileSessionLoad is observable) while A's
+        // session response / cache fallback / error is still gated.
+        let didStartB = await viewModel.sendMessage("Message B")
+        XCTAssertTrue(didStartB)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-B-replacement")
+
+        return (viewModel, server, loadTaskA)
+    }
+
+    @MainActor
+    func testRecoveryLoadStaleBeforeSuccessDoesNotApplyMessagesOrCacheOrClearPins() async throws {
+        let gate = CancelResponseGate()
+        let context = try makeContext()
+        let (viewModel, server, loadTaskA) = try await startGatedRecoveryLoad(gate: gate, context: context)
+        let messagesAfterReplacement = viewModel.messages
+
+        // Release A's gated session response: a server transcript for run A.
+        gate.responseJSON = """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "title": "Planning",
+            "active_stream_id": "stream-123",
+            "messages": [
+              {"role": "user", "content": "Message A", "timestamp": 1770000100, "message_id": "a-user-1"},
+              {"role": "assistant", "content": "Server response A", "timestamp": 1770000101, "message_id": "a-assistant-1"}
+            ]
+          }
+        }
+        """
+        gate.release()
+        await loadTaskA.value
+
+        // Zero stale A mutations: no message replacement, no cache write, no
+        // reconcileSessionLoad (activeStreamID stays B's), no pin/anchor
+        // clear, no error publication.
+        XCTAssertEqual(viewModel.messages, messagesAfterReplacement)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, ["Keep this pinned"])
+        XCTAssertEqual(viewModel.activeStreamID, "stream-B-replacement")
+        let cached = try CacheStore.cachedMessages(serverURL: server, sessionID: "session-abc", in: context, limit: 50)
+        XCTAssertEqual(cached, [])
+        XCTAssertNil(viewModel.cacheErrorMessage)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertNil(viewModel.lastError)
+        XCTAssertNil(viewModel.toolCallAnchorMessageID)
+        XCTAssertNil(viewModel.reasoningAnchorMessageID)
+        XCTAssertFalse(viewModel.isViewingCachedData)
+    }
+
+    @MainActor
+    func testRecoveryLoadStaleBeforeCacheFallbackDoesNotApplyMessagesOrReconcile() async throws {
+        let gate = CancelResponseGate()
+        let context = try makeContext()
+        // Seed the cache so the gated load's cache fallback would have content
+        // to apply if it were allowed to proceed.
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        try CacheStore.cacheMessages(
+            [ChatMessage(role: "assistant", content: "Cached transcript", timestamp: 1_770_000_002, messageId: "cached-assistant")],
+            serverURL: server,
+            sessionID: "session-abc",
+            in: context
+        )
+        let (viewModel, _, loadTaskA) = try await startGatedRecoveryLoad(gate: gate, context: context)
+        let messagesAfterReplacement = viewModel.messages
+
+        // Release a cacheable network timeout: the stale load must not apply
+        // the cached transcript or reconcile the session.
+        gate.thrownError = URLError(.timedOut)
+        gate.release()
+        await loadTaskA.value
+
+        XCTAssertEqual(viewModel.messages, messagesAfterReplacement)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, ["Keep this pinned"])
+        XCTAssertEqual(viewModel.activeStreamID, "stream-B-replacement")
+        XCTAssertFalse(viewModel.isViewingCachedData)
+        XCTAssertNil(viewModel.cacheErrorMessage)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertNil(viewModel.lastError)
+        XCTAssertNil(viewModel.toolCallAnchorMessageID)
+        XCTAssertNil(viewModel.reasoningAnchorMessageID)
+    }
+
+    @MainActor
+    func testRecoveryLoadStaleBeforeErrorDoesNotPublishErrorOrReconcile() async throws {
+        let gate = CancelResponseGate()
+        let context = try makeContext()
+        let (viewModel, _, loadTaskA) = try await startGatedRecoveryLoad(gate: gate, context: context)
+        let messagesAfterReplacement = viewModel.messages
+
+        // Release a non-cacheable transport error: the stale load must not
+        // publish an error message or reconcile the session.
+        gate.thrownError = URLError(.badServerResponse)
+        gate.release()
+        await loadTaskA.value
+
+        XCTAssertEqual(viewModel.messages, messagesAfterReplacement)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, ["Keep this pinned"])
+        XCTAssertEqual(viewModel.activeStreamID, "stream-B-replacement")
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertNil(viewModel.cacheErrorMessage)
+        XCTAssertNil(viewModel.lastError)
+        XCTAssertNil(viewModel.toolCallAnchorMessageID)
+        XCTAssertNil(viewModel.reasoningAnchorMessageID)
+        XCTAssertFalse(viewModel.isViewingCachedData)
+    }
 }
 
 private final class LockedCounter {

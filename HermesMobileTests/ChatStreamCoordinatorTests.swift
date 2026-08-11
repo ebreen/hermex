@@ -1855,6 +1855,462 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertEqual(delegate.finishCount, 0)
     }
 
+    // MARK: - Slice 4 (#18): recovery journal mapping and replay coverage
+
+    // Intended Slice 4 API the GREEN phase adds (referenced here so the RED
+    // phase fails to compile until the closed journal-authority resolver and
+    // the replay connection-generation entry point exist):
+    //   enum ChatRunRecoveryJournalResolution: Equatable {
+    //       case terminal(ChatRunTerminalOutcome)
+    //       case nonTerminal(reason: String)
+    //   }
+    //   func ChatStreamCoordinator.resolveRecoveryJournal(
+    //       active: Bool?,
+    //       journal: RunJournalStatus?
+    //   ) -> ChatRunRecoveryJournalResolution
+    //   func ChatStreamCoordinator.openConnection(
+    //       streamID: String,
+    //       replayAfterSeq: Int? = nil
+    //   )
+    //
+    // The reconnect-driven tests below are written against the existing
+    // `reconnectIfNeeded` surface plus the already-decoded `journal` block so
+    // they exercise the CURRENT finalize-without-journal behavior: today every
+    // inactive non-replay status finalizes as `.failed` after a transcript
+    // reload, regardless of the journal vocabulary.
+
+    @MainActor
+    func testReconnectMapsCompletedJournalState() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        // The transcript is diagnostic only: journal authority must not depend
+        // on the assistant-after-latest-user flag to finalize.
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "completed"}}"#,
+                for: request
+            )
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        // Closed-journal authority: exactly one terminal transition with the
+        // documented outcome, one terminal event, no transcript reload, and
+        // full active-stream cleanup (stream finished, Live Activity ended).
+        XCTAssertEqual(delegate.terminalTransitions, [
+            RecordedTerminalTransition(
+                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                outcome: .completed
+            )
+        ])
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(liveActivityManager.ends.last?.status, .complete)
+    }
+
+    @MainActor
+    func testReconnectMapsErroredJournalState() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "errored"}}"#,
+                for: request
+            )
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        XCTAssertEqual(delegate.terminalTransitions, [
+            RecordedTerminalTransition(
+                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                outcome: .failed
+            )
+        ])
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(liveActivityManager.ends.last?.status, .failed)
+    }
+
+    @MainActor
+    func testReconnectMapsInterruptedByUserJournalState() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "interrupted-by-user"}}"#,
+                for: request
+            )
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        XCTAssertEqual(delegate.terminalTransitions, [
+            RecordedTerminalTransition(
+                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                outcome: .cancelled
+            )
+        ])
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(liveActivityManager.ends.last?.status, .cancelled)
+    }
+
+    @MainActor
+    func testReconnectMapsLostWorkerJournalStateToFailed() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            // The one documented server bookkeeping exception: authoritative
+            // failure even when journal.terminal == false.
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": false, "terminal_state": "lost-worker-bookkeeping"}}"#,
+                for: request
+            )
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        XCTAssertEqual(delegate.terminalTransitions, [
+            RecordedTerminalTransition(
+                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                outcome: .failed
+            )
+        ])
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(liveActivityManager.ends.last?.status, .failed)
+    }
+
+    @MainActor
+    func testInactiveReconnectWithoutJournalRemainsNonTerminal() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        // No assistant-after-latest-user: nothing may infer completion from a
+        // refreshed transcript.
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(#"{"active": false, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        // Missing journal: no terminal authority, so the run stays
+        // non-terminal — nothing is finalized, cleaned up, or ended.
+        assertNoTerminalMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertTrue(coordinator.isConnectionSuspended)
+    }
+
+    @MainActor
+    func testInactiveReconnectWithNilActiveRemainsNonTerminal() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(#"{"active": null, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+
+        await coordinator.reconnectIfNeeded()
+
+        // active == nil is not terminal authority either.
+        assertNoTerminalMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertTrue(coordinator.isConnectionSuspended)
+    }
+
+    @MainActor
+    func testTerminalFalseUnknownOrMissingJournalRemainsNonTerminal() async throws {
+        // (a) journal present but terminal == false with UNKNOWN vocabulary.
+        let streamClientA = CoordinatorSpySSEStreamingClient()
+        let liveActivityManagerA = CoordinatorSpyLiveActivityManager()
+        let delegateA = CoordinatorDelegateSpy()
+        delegateA.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinatorA = makeCoordinator(
+            streamClient: streamClientA,
+            liveActivityManager: liveActivityManagerA,
+            delegate: delegateA
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": false, "terminal_state": "unknown-vocabulary"}}"#,
+                for: request
+            )
+        }
+        coordinatorA.start(streamID: "stream-123")
+        coordinatorA.suspendActiveStreamConnection()
+        await coordinatorA.reconnectIfNeeded()
+        assertNoTerminalMutation(
+            streamClient: streamClientA,
+            liveActivityManager: liveActivityManagerA,
+            delegate: delegateA
+        )
+        XCTAssertEqual(coordinatorA.activeStreamID, "stream-123")
+        XCTAssertTrue(coordinatorA.isConnectionSuspended)
+
+        // (b) journal present but terminal == false with MISSING terminalState
+        // (lost-worker-bookkeeping is the only terminal == false authority).
+        let streamClientB = CoordinatorSpySSEStreamingClient()
+        let liveActivityManagerB = CoordinatorSpyLiveActivityManager()
+        let delegateB = CoordinatorDelegateSpy()
+        delegateB.latestServerLoadHadAssistantResponseAfterLatestUser = false
+        let coordinatorB = makeCoordinator(
+            streamClient: streamClientB,
+            liveActivityManager: liveActivityManagerB,
+            delegate: delegateB
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": false}}"#,
+                for: request
+            )
+        }
+        coordinatorB.start(streamID: "stream-123")
+        coordinatorB.suspendActiveStreamConnection()
+        await coordinatorB.reconnectIfNeeded()
+        assertNoTerminalMutation(
+            streamClient: streamClientB,
+            liveActivityManager: liveActivityManagerB,
+            delegate: delegateB
+        )
+        XCTAssertEqual(coordinatorB.activeStreamID, "stream-123")
+        XCTAssertTrue(coordinatorB.isConnectionSuspended)
+    }
+
+    @MainActor
+    func testExactJournalVocabularyMapsOnlyDocumentedValues() {
+        let coordinator = makeCoordinator()
+
+        // Documented vocabulary maps to exactly one terminal outcome each.
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: true, terminalState: "completed")
+            ),
+            .terminal(.completed)
+        )
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: true, terminalState: "errored")
+            ),
+            .terminal(.failed)
+        )
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: true, terminalState: "interrupted-by-crash")
+            ),
+            .terminal(.failed)
+        )
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: true, terminalState: "interrupted-by-user")
+            ),
+            .terminal(.cancelled)
+        )
+        // Documented bookkeeping exception: authoritative failure even when
+        // journal.terminal == false.
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: false, terminalState: "lost-worker-bookkeeping")
+            ),
+            .terminal(.failed)
+        )
+        // Only surrounding whitespace and ASCII case are normalized.
+        XCTAssertEqual(
+            coordinator.resolveRecoveryJournal(
+                active: false,
+                journal: RunJournalStatus(terminal: true, terminalState: "  COMPLETED  ")
+            ),
+            .terminal(.completed)
+        )
+
+        // Every authority absence and unknown value stays non-terminal; no
+        // transcript-only completion is ever inferred.
+        let nonTerminalCases: [(Bool?, RunJournalStatus?)] = [
+            (nil, RunJournalStatus(terminal: true, terminalState: "completed")),
+            (true, RunJournalStatus(terminal: true, terminalState: "completed")),
+            (false, nil),
+            (false, RunJournalStatus(terminal: true, terminalState: nil)),
+            (false, RunJournalStatus(terminal: nil, terminalState: "completed")),
+            (false, RunJournalStatus(terminal: false, terminalState: "completed")),
+            (false, RunJournalStatus(terminal: false, terminalState: "errored")),
+            (false, RunJournalStatus(terminal: true, terminalState: "unknown-vocabulary")),
+            (false, RunJournalStatus(terminal: true, terminalState: "complete")),
+            (false, RunJournalStatus(terminal: true, terminalState: "success")),
+            (false, RunJournalStatus(terminal: true, terminalState: "failed")),
+            (false, RunJournalStatus(terminal: true, terminalState: "error")),
+            (false, RunJournalStatus(terminal: true, terminalState: "cancelled")),
+            (false, RunJournalStatus(terminal: true, terminalState: "canceled")),
+            (false, RunJournalStatus(terminal: true, terminalState: "lost-worker")),
+            (false, RunJournalStatus(terminal: true, terminalState: "lost_worker"))
+        ]
+        for (active, journal) in nonTerminalCases {
+            guard case .nonTerminal = coordinator.resolveRecoveryJournal(active: active, journal: journal) else {
+                return XCTFail(
+                    "Expected nonTerminal resolution for active=\(String(describing: active)) journal=\(String(describing: journal))"
+                )
+            }
+        }
+    }
+
+    @MainActor
+    func testReplayOpensNewConnectionGenerationForSameLogicalRun() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        coordinator.start(streamID: "stream-123")
+        let originalLogicalIdentity = try XCTUnwrap(coordinator.runIdentity)
+        let originalConnection = try XCTUnwrap(coordinator.runConnectionIdentity)
+        coordinator.suspendActiveStreamConnection()
+
+        // Replay/resume opens a NEW connection generation while keeping the
+        // SAME logical run identity (#18 Slice 4 `openConnection` API).
+        coordinator.openConnection(streamID: "stream-123", replayAfterSeq: 9)
+
+        XCTAssertEqual(coordinator.runIdentity, originalLogicalIdentity)
+        let replayedConnection = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(replayedConnection.logicalGeneration, originalLogicalIdentity.logicalGeneration)
+        XCTAssertEqual(replayedConnection.connectionGeneration, originalConnection.connectionGeneration + 1)
+        XCTAssertEqual(delegate.startConnectionReplayValues, [false, true])
+        XCTAssertFalse(coordinator.isConnectionSuspended)
+        let replayURL = try XCTUnwrap(streamClient.startedURLs.last)
+        let queryItems = URLComponents(url: replayURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(queryItems.first(where: { $0.name == "replay" })?.value, "1")
+        XCTAssertEqual(queryItems.first(where: { $0.name == "after_seq" })?.value, "9")
+    }
+
+    @MainActor
+    func testLateReplayOldConnectionCannotFinalizeCurrentRun() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        coordinator.suspendActiveStreamConnection()
+        // Replay connection: same logical run, new connection generation.
+        coordinator.openConnection(streamID: "stream-123", replayAfterSeq: 4)
+        XCTAssertEqual(streamClient.latestConnectionIndex, 1)
+
+        // Replacement run: new logical generation on connection 2.
+        coordinator.start(streamID: "stream-123")
+        XCTAssertEqual(streamClient.latestConnectionIndex, 2)
+
+        // A late terminal event from the OLD replay connection must not
+        // finalize the current run: it belongs to a different connection
+        // generation of a superseded logical run.
+        streamClient.emit(.done(DoneStreamEvent()), fromConnection: 1)
+        streamClient.emit(.streamEnd, fromConnection: 1)
+
+        assertNoTerminalMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertFalse(coordinator.isConnectionSuspended)
+    }
+
+    @MainActor
+    private func assertNoTerminalMutation(
+        streamClient: CoordinatorSpySSEStreamingClient,
+        liveActivityManager: CoordinatorSpyLiveActivityManager,
+        delegate: CoordinatorDelegateSpy,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty, file: file, line: line)
+        XCTAssertEqual(delegate.terminalEventCount, 0, file: file, line: line)
+        XCTAssertEqual(delegate.finishCount, 0, file: file, line: line)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty, file: file, line: line)
+        XCTAssertEqual(streamClient.stopCount, 0, file: file, line: line)
+        XCTAssertTrue(delegate.removedSnapshotStreamIDs.isEmpty, file: file, line: line)
+        XCTAssertTrue(delegate.stopMonitoringClearPromptValues.isEmpty, file: file, line: line)
+    }
+
     private func assertDisposition(
         _ disposition: ChatCancelDisposition,
         matches expected: ExpectedCancelDisposition,
