@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 import OSLog
@@ -46,6 +47,75 @@ enum ChatRunTerminalOutcome: Equatable {
     case completed
     case cancelled
     case failed
+}
+
+/// The terminal-outcome vocabulary shared by the stable terminal event key and
+/// the cache handoff (#18 Slice 5). Alias of the coordinator's centralized
+/// transition outcome so every terminal path speaks one vocabulary.
+typealias ChatTerminalOutcome = ChatRunTerminalOutcome
+
+/// One finalized run's terminal commit: the logical run identity plus the
+/// winning outcome. Carried by `.terminal` SSE events and by the
+/// ViewModel-owned persistence handoff (#18 Slice 5).
+struct ChatTerminalCommit: Equatable {
+    let identity: ChatRunIdentity
+    let outcome: ChatTerminalOutcome
+}
+
+/// The identity-keyed persistence handoff the ViewModel sends to the injected
+/// `ChatTerminalCacheWriter` AFTER appending the stable local notice: the
+/// commit, the post-append message snapshot, and the monotonic handoff
+/// generation (#18 Slice 5). One handoff per terminal event key
+/// `(streamID, logicalGeneration, outcome)`.
+struct ChatTerminalPersistenceHandoff {
+    let commit: ChatTerminalCommit
+    let snapshotMessages: [ChatMessage]
+    let generation: Int
+}
+
+/// Persistence seam for terminal commits. The ViewModel routes every committed
+/// terminal outcome through the injected writer; a throwing writer keeps the
+/// handoff pending for retry and never mutates the transcript (#18 Slice 5).
+protocol ChatTerminalCacheWriter {
+    func write(_ handoff: ChatTerminalPersistenceHandoff) throws
+}
+
+/// Default writer: inert until the app layer injects a CacheStore-backed
+/// writer. Unit tests inject recording/throwing spies.
+struct NoopTerminalCacheWriter: ChatTerminalCacheWriter {
+    func write(_ handoff: ChatTerminalPersistenceHandoff) throws {}
+}
+
+extension ChatTerminalOutcome {
+    /// Stable persistence token for `CachedTerminalHandoff.outcomeRaw`.
+    var persistenceValue: String {
+        switch self {
+        case .completed: return "completed"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        }
+    }
+
+    init?(persistenceValue: String) {
+        switch persistenceValue {
+        case "completed": self = .completed
+        case "failed": self = .failed
+        case "cancelled": self = .cancelled
+        default: return nil
+        }
+    }
+}
+
+/// Deterministic v1 terminal event message ID: `term-v1-` + the lowercase hex
+/// MD5 digest of the `(streamID, logicalGeneration, outcome)` key. The key
+/// excludes the connection generation, so a replay/reconnect restores the same
+/// ID while a new logical generation or outcome produces a new one. Changing
+/// this format is a v1-contract break (#18 Slice 5).
+func stableTerminalEventMessageID(identity: ChatRunIdentity, outcome: ChatTerminalOutcome) -> String {
+    let key = "\(identity.streamID)|\(identity.logicalGeneration)|\(outcome)"
+    let digest = Insecure.MD5.hash(data: Data(key.utf8))
+    let hex = digest.map { String(format: "%02x", $0) }.joined()
+    return "term-v1-" + hex
 }
 
 /// Identity of one connection of a chat run: the logical run identity plus
@@ -185,6 +255,14 @@ protocol ChatStreamCoordinatorDelegate: AnyObject {
         _ outcome: ChatRunTerminalOutcome,
         identity: ChatRunIdentity
     )
+
+    /// Terminal-commit event callback (#18 Slice 5): invoked when an explicit
+    /// `.terminal` SSE event is admitted by the connection-generation fence.
+    /// The commit may belong to the active run (the centralized transition
+    /// already committed it) or to the completing connection after
+    /// finalization; conformers that do not observe terminal commits inherit
+    /// the default no-op implementation.
+    func streamCoordinatorDidReceiveTerminalCommit(_ commit: ChatTerminalCommit)
 }
 
 extension ChatStreamCoordinatorDelegate {
@@ -194,6 +272,10 @@ extension ChatStreamCoordinatorDelegate {
         _ outcome: ChatRunTerminalOutcome,
         identity: ChatRunIdentity
     ) {}
+
+    /// Default no-op (#18 Slice 5): only observers that persist terminal
+    /// commits (the view model) implement this.
+    func streamCoordinatorDidReceiveTerminalCommit(_ commit: ChatTerminalCommit) {}
 }
 
 @MainActor
@@ -889,6 +971,18 @@ final class ChatStreamCoordinator {
                 delegate?.streamCoordinatorDidReceiveErrorMessage(message)
             }
             finishDeferredStreamIfPending()
+        case .terminal(let commit):
+            // An explicit terminal commit carried by the SSE stream (#18
+            // Slice 5). A commit matching the ACTIVE run commits the
+            // centralized transition exactly once (first outcome wins); the
+            // ViewModel observes it through the terminal-outcome callback. A
+            // commit admitted after finalization (the completing connection's
+            // own late terminal event) is forwarded as-is so the ViewModel can
+            // persist the identity-keyed handoff without re-transitioning.
+            if let identity = runIdentity, identity == commit.identity {
+                transitionToTerminal(outcome: commit.outcome, identity: identity)
+            }
+            delegate?.streamCoordinatorDidReceiveTerminalCommit(commit)
         case .transportError(let message):
             handleTransportError(message)
         case .heartbeat:
@@ -1121,7 +1215,7 @@ final class ChatStreamCoordinator {
     /// a completed transcript (#18 Slice 1).
     private func isTerminalEvent(_ event: SSEEvent) -> Bool {
         switch event {
-        case .streamEnd, .cancelled, .error:
+        case .streamEnd, .cancelled, .error, .terminal:
             return true
         default:
             return false

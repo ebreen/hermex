@@ -352,6 +352,17 @@ final class ChatViewModel {
     var uploadAttachmentErrorMessage: String? { attachmentCoordinator.uploadAttachmentErrorMessage }
     var localAttachmentPreviews: [String: [String: Data]] { attachmentCoordinator.localAttachmentPreviews }
     private(set) var pinnedLocalNotices: [String] = []
+    /// Injected persistence seam for terminal commits (#18 Slice 5). The VM
+    /// appends the stable local notice, then sends the single identity-keyed
+    /// handoff through this writer; a throwing writer keeps the handoff
+    /// pending for retry without re-appending.
+    private let terminalCacheWriter: any ChatTerminalCacheWriter
+    /// Terminal event keys already committed locally, deduping repeated
+    /// terminal callbacks for the same `(streamID, logicalGeneration, outcome)`.
+    private var terminalEventKeys = Set<String>()
+    /// Monotonic handoff generation across runs: every accepted terminal
+    /// commit bumps it, so handoffs are strictly ordered (#18 Slice 5).
+    private var terminalHandoffGeneration = 0
     var approvalPrompt: ApprovalPromptState? { pendingActionCoordinator.approvalPrompt }
     var isRespondingToApproval: Bool { pendingActionCoordinator.isRespondingToApproval }
     var approvalErrorMessage: String? { pendingActionCoordinator.approvalErrorMessage }
@@ -455,6 +466,7 @@ final class ChatViewModel {
         server: URL,
         client: APIClient? = nil,
         streamClient: SSEStreamingClient? = nil,
+        terminalCacheWriter: any ChatTerminalCacheWriter = NoopTerminalCacheWriter(),
         approvalStreamClient: SSEStreamingClient? = nil,
         clarifyStreamClient: SSEStreamingClient? = nil,
         btwStreamClient: SSEStreamingClient? = nil,
@@ -477,6 +489,7 @@ final class ChatViewModel {
         currentProfile = session.profile
         isCLISession = session.isCliSession == true
         self.server = server
+        self.terminalCacheWriter = terminalCacheWriter
         let resolvedClient = client ?? APIClient(baseURL: server)
         let resolvedStreamClient = streamClient ?? SSEClient()
         let resolvedLiveActivityManager = liveActivityManager ?? AgentLiveActivityManager.shared
@@ -3357,6 +3370,44 @@ final class ChatViewModel {
         pinnedLocalNotices.append(trimmed)
     }
 
+    /// Appends the stable terminal local notice and writes the single
+    /// identity-keyed persistence handoff (#18 Slice 5). Idempotent per
+    /// terminal event key `(streamID, logicalGeneration, outcome)`: a repeated
+    /// terminal callback for the same key appends nothing and writes nothing.
+    private func handleTerminalCommit(_ commit: ChatTerminalCommit) {
+        let key = "\(commit.identity.streamID)|\(commit.identity.logicalGeneration)|\(commit.outcome)"
+        guard terminalEventKeys.insert(key).inserted else { return }
+
+        let noticeID = stableTerminalEventMessageID(identity: commit.identity, outcome: commit.outcome)
+        let noticeText: String
+        switch commit.outcome {
+        case .completed:
+            noticeText = String(localized: "Response complete")
+        case .failed:
+            noticeText = String(localized: "Response failed")
+        case .cancelled:
+            noticeText = String(localized: "Response cancelled")
+        }
+        messages.append(
+            ChatMessage(
+                role: "local_notice",
+                content: noticeText,
+                timestamp: Date().timeIntervalSince1970,
+                messageId: noticeID
+            )
+        )
+        scheduleStreamingScrollTrigger()
+        pinnedLocalNotices.append(noticeID)
+
+        terminalHandoffGeneration += 1
+        let handoff = ChatTerminalPersistenceHandoff(
+            commit: commit,
+            snapshotMessages: messages,
+            generation: terminalHandoffGeneration
+        )
+        try? terminalCacheWriter.write(handoff)
+    }
+
     private func appendLocalMessage(_ text: String, role: String, idPrefix: String) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -4022,7 +4073,7 @@ final class ChatViewModel {
             activeBtwAnswer = "Error: \(message)"
             updateActiveBtwMessage(isLoading: false)
             finishBtwStream()
-        case .heartbeat, .ignored, .reasoning, .toolStarted, .toolCompleted, .title, .metering, .pendingSteerLeftover:
+        case .heartbeat, .ignored, .reasoning, .toolStarted, .toolCompleted, .title, .metering, .pendingSteerLeftover, .terminal:
             break
         }
     }
@@ -5135,6 +5186,10 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     func streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: Bool) {
         responseCompletionNeedsTranscriptRefresh = needsTranscriptRefresh
         responseCompletionHapticTrigger += 1
+    }
+
+    func streamCoordinatorDidReceiveTerminalCommit(_ commit: ChatTerminalCommit) {
+        handleTerminalCommit(commit)
     }
 
     func streamCoordinatorDidFinishStream() {

@@ -7246,6 +7246,7 @@ final class ChatViewModelSendTests: XCTestCase {
 
     @MainActor
     private func makeViewModel(
+        terminalCacheWriter: any ChatTerminalCacheWriter = NoopTerminalCacheWriter(),
         streamClient: SSEStreamingClient? = nil,
         approvalStreamClient: SSEStreamingClient? = nil,
         clarifyStreamClient: SSEStreamingClient? = nil,
@@ -7282,6 +7283,7 @@ final class ChatViewModelSendTests: XCTestCase {
             server: server,
             client: resolvedClient,
             streamClient: resolvedStreamClient,
+            terminalCacheWriter: terminalCacheWriter,
             approvalStreamClient: approvalStreamClient ?? SpySSEStreamingClient(),
             clarifyStreamClient: clarifyStreamClient ?? SpySSEStreamingClient(),
             liveActivityManager: liveActivityManager,
