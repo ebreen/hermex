@@ -1294,7 +1294,7 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(streamClient.startedURLs.count, 0)
         XCTAssertEqual(viewModel.pinnedLocalNotices, [])
         XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
-        XCTAssertFalse(viewModel.messages.contains { $0.messageId.hasPrefix("run-status-v1-") })
+        XCTAssertFalse(viewModel.messages.contains { $0.messageId?.hasPrefix("run-status-v1-") == true })
         XCTAssertEqual(
             viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content),
             ["Goal set."]
