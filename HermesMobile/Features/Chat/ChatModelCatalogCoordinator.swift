@@ -257,6 +257,11 @@ actor ChatModelCatalogCoordinator {
     /// (provisional) or the verified context's gate epoch (verified) equals
     /// the process-global registry's current epoch.
     func accepts(_ metadata: CatalogEventMetadata) async -> Bool {
+        if let operation = currentOperation {
+            guard operation.operationID == metadata.operationID,
+                  operation.operationGeneration == metadata.operationGeneration
+            else { return false }
+        }
         switch metadata.identity {
         case let .provisional(key):
             let gate = ProfileContextGateRegistry.shared.gate(for: key.gateKey)
@@ -294,18 +299,10 @@ actor ChatModelCatalogCoordinator {
 
         switch metadata.identity {
         case let .provisional(key):
-            // Production metadata hardcodes startingGateEpoch/authGeneration 0
-            // (ModelCatalogNetworking.swift:862-864 — the provider seam has no
-            // epoch parameter), so exact key equality is unsatisfiable after
-            // the first validated profile switch. Fence the operation
-            // identity fields only; the epoch authority lives on the
-            // operation boundary (a superseded op is replaced before its
-            // events can publish).
-            guard key.gateKey == op.operationKey.gateKey,
-                  key.apiClientID == op.operationKey.apiClientID,
-                  key.authGeneration == op.operationKey.authGeneration,
-                  key.requestedProfile == op.operationKey.requestedProfile
-            else { return }
+            // Provisional metadata is now fully authoritative: the provider
+            // carries the operation's starting epoch, so no identity field may
+            // be admitted from an old or fabricated context.
+            guard key == op.operationKey else { return }
         case let .verified(key):
             // `.contextVerified` is the fence's write site: it carries the
             // context key that later events must match. Exempt it from
@@ -313,6 +310,7 @@ actor ChatModelCatalogCoordinator {
             // bind the operation constants it must not be able to spoof.
             if case .contextVerified = event {
                 guard key.gateEpoch == authoritativeEpoch,
+                      key.gateEpoch == op.operationKey.startingGateEpoch,
                       key.gateKey == op.operationKey.gateKey,
                       key.apiClientID == op.operationKey.apiClientID,
                       key.authGeneration == op.operationKey.authGeneration
@@ -324,11 +322,11 @@ actor ChatModelCatalogCoordinator {
 
         switch event {
         case let .contextVerified(metadata, context):
-            // Production emits `.contextVerified` with provisional identity
-            // (catalogProvisionalMetadata, ModelCatalogNetworking.swift:867);
-            // scripted tests may use verified. Either way this event is the
-            // fence's write site: it establishes the context key that later
-            // base/live/failed events must match.
+            // Production emits `.contextVerified` with the operation's
+            // authoritative provisional identity; scripted tests may use a
+            // verified identity. Either way this event is the fence's write
+            // site: it establishes the context key that later base/live/
+            // failed events must match.
             let contextKey: CatalogContextKey
             switch metadata.identity {
             case let .verified(key):

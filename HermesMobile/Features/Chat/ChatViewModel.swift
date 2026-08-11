@@ -584,10 +584,20 @@ final class ChatViewModel {
             return String(localized: "Model")
         }
 
-        let catalogName = modelCatalogGroups
-            .flatMap(\.models)
-            .firstMatchingSelection(modelID: currentModel, providerID: currentModelProvider)?
-            .displayName
+        // A title is only authoritative when the selected provider is known.
+        // Model IDs are not globally unique across providers, so never choose
+        // the first same-ID option as a title fallback.
+        let catalogName: String?
+        if let provider = Self.nonEmpty(currentModelProvider) {
+            catalogName = modelCatalogGroups
+                .flatMap(\.models)
+                .first { option in
+                    option.id == currentModel && option.providerID == provider
+                }?
+                .displayName
+        } else {
+            catalogName = nil
+        }
 
         return catalogName ?? Self.compactModelTitle(currentModel)
     }
@@ -863,6 +873,7 @@ final class ChatViewModel {
             await refreshModelCatalogForPickerOpen()
             return
         }
+        startCatalogMonitorIfNeeded()
         await modelCatalogCoordinator.openPicker()
     }
 

@@ -340,9 +340,34 @@ struct ChatView: View {
         self.autoStartsVoiceInput = autoStartsVoiceInput
         _draftMessage = State(initialValue: initialDraft)
         _initialAttachments = State(initialValue: initialAttachments)
+        let resolvedClient = APIClient(baseURL: server)
+        let catalogGateKey = ProfileContextGateKey(
+            origin: NormalizedServerOrigin(url: server),
+            cookieContextID: resolvedClient.cookieContextID
+        )
+        let catalogCoordinator = ChatModelCatalogCoordinator(
+            gateKey: catalogGateKey,
+            apiClientID: resolvedClient.apiClientID,
+            authGeneration: 0,
+            provider: { requestedProfile, operationID, operationGeneration in
+                await resolvedClient.modelCatalogStream(
+                    requestedProfile: requestedProfile,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            },
+            configuration: .init(
+                now: { Date() },
+                freshnessInterval: 5 * 60,
+                completedContextLimit: 4,
+                telemetrySink: nil
+            )
+        )
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
             server: server,
+            client: resolvedClient,
+            modelCatalogCoordinator: catalogCoordinator,
             // Production terminal persistence: the real CacheStore-backed
             // writer — never a no-op (#18 §522).
             terminalCacheWriter: CacheStoreTerminalCacheWriter(serverURL: server),
@@ -388,7 +413,7 @@ struct ChatView: View {
             isSingleProfileMode: viewModel.isSingleProfileMode,
             selectedProfileName: viewModel.selectedProfileName,
             selectedProfileTitle: viewModel.selectedProfileTitle,
-            isLoadingModels: viewModel.isLoadingComposerConfiguration,
+            isLoadingModels: viewModel.isLoadingModels,
             selectedReasoningEffort: viewModel.selectedReasoningEffort,
             supportedReasoningEfforts: viewModel.supportedReasoningEfforts,
             showsReasoningControl: viewModel.showsReasoningEffortControl,
@@ -419,7 +444,7 @@ struct ChatView: View {
                 }
             },
             onModelPickerOpen: {
-                await viewModel.refreshModelCatalogForPickerOpen()
+                await viewModel.openModelPicker()
             },
             onLoadWorkspaceSuggestions: { prefix in
                 await viewModel.loadWorkspaceSuggestions(prefix: prefix)

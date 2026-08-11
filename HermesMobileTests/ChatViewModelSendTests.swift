@@ -6319,9 +6319,11 @@ final class ChatViewModelSendTests: XCTestCase {
             ) { request in
                 switch request.url?.path {
                 case "/api/profiles":
-                    return apiTestJSONResponse(#"{"profiles": []}"#, for: request)
+                    return apiTestJSONResponse(#"{"active": "default", "profiles": [{"name": "default", "is_active": true}], "single_profile_mode": true}"#, for: request)
                 case "/api/models":
                     return apiTestJSONResponse(modelsJSON, for: request)
+                case "/api/models/live":
+                    return apiTestJSONResponse(#"{"provider": "openai", "models": []}"#, for: request)
                 case "/api/reasoning":
                     return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
                 case "/api/workspaces":

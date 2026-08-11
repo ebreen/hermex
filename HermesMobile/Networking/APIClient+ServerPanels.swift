@@ -114,7 +114,7 @@ extension APIClient {
                 operationGeneration: operationGeneration
             )
         } catch {
-            return failedCatalogSnapshot(
+            return await failedCatalogSnapshot(
                 operationID: operationID,
                 operationGeneration: operationGeneration,
                 category: .profileUnavailable
@@ -133,7 +133,7 @@ extension APIClient {
             let category: CatalogFailureCategory = verification == .mismatch
                 ? .profileMismatch
                 : .profileUnavailable
-            return failedCatalogSnapshot(
+            return await failedCatalogSnapshot(
                 operationID: operationID,
                 operationGeneration: operationGeneration,
                 gateKey: profileEnvelope.gateKey,
@@ -305,13 +305,13 @@ extension APIClient {
         gateKey: ProfileContextGateKey? = nil,
         gateEpoch: UInt64? = nil,
         category: CatalogFailureCategory
-    ) -> CatalogSnapshotResult {
+    ) async -> CatalogSnapshotResult {
         let key = gateKey ?? catalogGateKey
         let epoch: UInt64
         if let gateEpoch {
             epoch = gateEpoch
         } else {
-            epoch = 0
+            epoch = await ProfileContextGateRegistry.shared.gate(for: key).gateEpoch
         }
         let metadata = catalogMetadata(
             operationID: operationID,
