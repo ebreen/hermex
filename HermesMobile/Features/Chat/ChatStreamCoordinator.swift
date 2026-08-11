@@ -46,6 +46,16 @@ struct ChatRunIdentity: Equatable, Hashable {
     var logicalGeneration: Int { generation }
 }
 
+/// One active run's confirmed status snapshot (#18 Slice 6): the logical run
+/// identity confirmed through `/api/session` plus the goal detail of the
+/// goal kickoff that started it. Exposed by the view model as
+/// `confirmedRunSnapshot`; set only when a goal-kickoff confirmation load
+/// reports an `active_stream_id` and the confirmed stream starts.
+struct ChatRunStatusSnapshot: Equatable, Hashable {
+    let identity: ChatRunIdentity
+    let goal: String
+}
+
 /// The outcome of a finalized chat run, committed exactly once by the
 /// centralized terminal transition. The FIRST valid terminal candidate for a
 /// run wins; every later candidate is a no-op (#18 Slice 2). The one-byte
@@ -397,6 +407,13 @@ final class ChatStreamCoordinator {
     // transcript load so a concurrent cancel/completion during the load can't be
     // double-finalized (PR #266 review #2).
     private var runGeneration = 0
+
+    /// Read-only epoch of the run-generation fence (#18 Slice 3/6): bumped
+    /// whenever the active run starts or finalizes. Captured before an async
+    /// goal-kickoff confirmation load; a mismatch after the await means a run
+    /// started or finalized while the load was in flight, so the load must
+    /// not be applied.
+    var runGenerationEpoch: Int { runGeneration }
 
     // Connection-scoped identity counters (#18 Slice 3). The logical run
     // generation bumps when a NEW logical run starts; the connection

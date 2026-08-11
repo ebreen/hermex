@@ -1035,9 +1035,26 @@ final class ChatViewModelSendTests: XCTestCase {
 
     @MainActor
     func testSubmitGoalAttachesToServerStartedKickoffStream() async throws {
+        // Slice 6 (#18): the Goal kickoff is coordinator-backed, not pinned.
+        // (1) `pinnedLocalNotices` stays empty after kickoff; (2) the
+        // coordinator exposes one active confirmed run identity/status
+        // snapshot with Goal detail; (3) "Goal set." is NOT in `messages` as a
+        // second local notice; (4) the status starts only after `/api/session`
+        // returns `active_stream_id` — the gated session request proves the
+        // stream has not started while the confirmation is pending. Generic
+        // pinned slash notices remain covered by their existing tests.
         let streamClient = SpySSEStreamingClient()
+        let gate = CancelResponseGate()
         var requestedPaths: [String] = []
-        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+        let gatedSession: URLSession = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatedURLProtocol.self]
+            return URLSession(configuration: configuration)
+        }()
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let gatedClient = APIClient(baseURL: server, session: gatedSession)
+
+        GatedURLProtocol.asyncHandler = { request in
             let path = request.url?.path
             requestedPaths.append(path ?? "nil")
 
@@ -1064,6 +1081,264 @@ final class ChatViewModelSendTests: XCTestCase {
                 }
                 """, for: request)
             case "/api/session":
+                await gate.enter()
+                return apiTestJSONResponse(gate.responseJSON, for: request)
+            default:
+                XCTFail("Unexpected request path: \(path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            client: gatedClient,
+            handler: { apiTestJSONResponse("{}", for: $0) }
+        )
+
+        let submitTask = Task { @MainActor in
+            await viewModel.submitGoal(args: "Ship the TestFlight build")
+        }
+
+        // The Goal POST has returned and the confirmation load is in flight,
+        // but the stream must NOT start before /api/session confirms the ID.
+        await gate.waitForEntry()
+        XCTAssertEqual(gate.enteredCount, 1)
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertTrue(viewModel.isReconcilingGoalKickoff)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+
+        gate.responseJSON = """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "title": "Planning",
+            "active_stream_id": "stream-goal",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Start executing the goal.",
+                "timestamp": 1770000100,
+                "message_id": "user-goal"
+              }
+            ]
+          }
+        }
+        """
+        gate.release()
+
+        let didSubmit = await submitTask.value
+
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(requestedPaths, ["/api/goal", "/api/session"])
+        XCTAssertEqual(viewModel.currentGoal?.goal, "Ship the TestFlight build")
+        XCTAssertEqual(viewModel.currentGoal?.status, "active")
+        XCTAssertTrue(viewModel.hasActivatedGoalCommand)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-goal")
+        XCTAssertEqual(streamClient.startedURLs.count, 1)
+        XCTAssertEqual(streamClient.startedURLs.first?.path, "/api/chat/stream")
+        XCTAssertEqual(viewModel.messages.map(\.role), ["user"])
+        XCTAssertEqual(viewModel.messages.last?.content, "Start executing the goal.")
+        XCTAssertFalse(viewModel.messages.contains { $0.content == "Goal set." })
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertEqual(
+            viewModel.confirmedRunSnapshot,
+            ChatRunStatusSnapshot(
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-goal", generation: 1),
+                goal: "Ship the TestFlight build"
+            )
+        )
+
+        streamClient.emit(.token("Working now."))
+
+        XCTAssertEqual(viewModel.messages.map(\.role), ["user", "assistant"])
+        XCTAssertEqual(viewModel.messages.last?.content, "Working now.")
+    }
+
+    // MARK: - Slice 6 (#18): Goal kickoff confirmation and generic pinned notices
+
+    @MainActor
+    func testGoalKickoffWithoutActiveStreamKeepsInlineNoticeFallback() async throws {
+        // The server accepts the goal and promises a kickoff, but /api/session
+        // never reports an active stream: the kickoff falls back to the INLINE
+        // notice (never a pin), starts no stream, and exposes no
+        // coordinator-confirmed run. The load count is deliberately not pinned
+        // here — the exact three-load budget is pinned by
+        // testGoalReconciliationExhaustionUsesOneInlineFallbackAfterExactlyThreeLoads.
+        let streamClient = SpySSEStreamingClient()
+        var sessionLoadCount = 0
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse("""
+                {
+                  "ok": true,
+                  "action": "set",
+                  "message": "Goal set.",
+                  "goal": {
+                    "goal": "Ship the TestFlight build",
+                    "status": "active",
+                    "turns_used": 0,
+                    "max_turns": 20
+                  },
+                  "kickoff_prompt": "Start executing the goal."
+                }
+                """, for: request)
+            case "/api/session":
+                sessionLoadCount += 1
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "title": "Planning",
+                    "messages": []
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the TestFlight build")
+
+        XCTAssertTrue(didSubmit)
+        XCTAssertGreaterThanOrEqual(sessionLoadCount, 1)
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertNil(viewModel.confirmedRunSnapshot)
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content),
+            ["Goal set."]
+        )
+    }
+
+    @MainActor
+    func testGoalWithoutKickoffPromptKeepsInlineNoticeFallback() async throws {
+        // A goal response without a kickoff prompt never enters the
+        // reconciliation path: the display message becomes ONE inline notice
+        // and no session confirmation load, pin, or coordinator start happens.
+        let streamClient = SpySSEStreamingClient()
+        var requestedPaths: [String] = []
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            let path = request.url?.path
+            requestedPaths.append(path ?? "nil")
+            XCTAssertEqual(path, "/api/goal")
+
+            return apiTestJSONResponse("""
+            {
+              "ok": true,
+              "action": "set",
+              "message": "Goal set.",
+              "goal": {
+                "goal": "Ship the TestFlight build",
+                "status": "active",
+                "turns_used": 0,
+                "max_turns": 20
+              }
+            }
+            """, for: request)
+        }
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the TestFlight build")
+
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(requestedPaths, ["/api/goal"])
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertNil(viewModel.confirmedRunSnapshot)
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content),
+            ["Goal set."]
+        )
+    }
+
+    @MainActor
+    func testGoalPostAloneCannotCreateRunStatus() async throws {
+        // The Goal POST's own "status": "active" field is GOAL state, not run
+        // activation: with no kickoff prompt and no confirmed stream, no run
+        // status identity/snapshot may exist and no run-status message may
+        // appear (a naive implementation can confuse the POST with status
+        // activation).
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/goal")
+
+            return apiTestJSONResponse("""
+            {
+              "ok": true,
+              "action": "set",
+              "message": "Goal set.",
+              "goal": {
+                "goal": "Ship the TestFlight build",
+                "status": "active",
+                "turns_used": 0,
+                "max_turns": 20
+              }
+            }
+            """, for: request)
+        }
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the TestFlight build")
+
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(viewModel.currentGoal?.status, "active")
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertNil(viewModel.confirmedRunSnapshot)
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertFalse(viewModel.messages.contains { $0.messageId?.hasPrefix("run-status-v1-") == true })
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content),
+            ["Goal set."]
+        )
+    }
+
+    @MainActor
+    func testGoalLateActiveStreamIDStartsAfterBoundedReconciliationRetry() async throws {
+        // The first confirmation load has no active_stream_id yet; the bounded
+        // reconciliation retries and the SECOND load returns it. Today's
+        // one-load branch loses the late ID: it falls back inline, never
+        // starts the stream, and leaves "Goal set." in the transcript.
+        let streamClient = SpySSEStreamingClient()
+        var sessionLoadCount = 0
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse("""
+                {
+                  "ok": true,
+                  "action": "set",
+                  "message": "Goal set.",
+                  "goal": {
+                    "goal": "Ship the TestFlight build",
+                    "status": "active",
+                    "turns_used": 0,
+                    "max_turns": 20
+                  },
+                  "kickoff_prompt": "Start executing the goal."
+                }
+                """, for: request)
+            case "/api/session":
+                sessionLoadCount += 1
+                if sessionLoadCount == 1 {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                }
                 return apiTestJSONResponse("""
                 {
                   "session": {
@@ -1082,7 +1357,7 @@ final class ChatViewModelSendTests: XCTestCase {
                 }
                 """, for: request)
             default:
-                XCTFail("Unexpected request path: \(path ?? "nil")")
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
                 throw URLError(.badURL)
             }
         }
@@ -1090,21 +1365,311 @@ final class ChatViewModelSendTests: XCTestCase {
         let didSubmit = await viewModel.submitGoal(args: "Ship the TestFlight build")
 
         XCTAssertTrue(didSubmit)
-        XCTAssertEqual(requestedPaths, ["/api/goal", "/api/session"])
-        XCTAssertEqual(viewModel.currentGoal?.goal, "Ship the TestFlight build")
-        XCTAssertEqual(viewModel.currentGoal?.status, "active")
-        XCTAssertTrue(viewModel.hasActivatedGoalCommand)
-        XCTAssertEqual(viewModel.activeStreamID, "stream-goal")
+        XCTAssertEqual(sessionLoadCount, 2)
         XCTAssertEqual(streamClient.startedURLs.count, 1)
         XCTAssertEqual(streamClient.startedURLs.first?.path, "/api/chat/stream")
+        XCTAssertEqual(viewModel.activeStreamID, "stream-goal")
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
         XCTAssertEqual(viewModel.messages.map(\.role), ["user"])
-        XCTAssertEqual(viewModel.messages.last?.content, "Start executing the goal.")
-        XCTAssertEqual(viewModel.pinnedLocalNotices, ["Goal set."])
+        XCTAssertFalse(viewModel.messages.contains { $0.content == "Goal set." })
+        XCTAssertEqual(
+            viewModel.confirmedRunSnapshot,
+            ChatRunStatusSnapshot(
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-goal", generation: 1),
+                goal: "Ship the TestFlight build"
+            )
+        )
+    }
 
-        streamClient.emit(.token("Working now."))
+    @MainActor
+    func testGoalReconciliationCancellationLeavesNoFallbackMutation() async throws {
+        // The reconciliation is cancellable: cancelling the kickoff while the
+        // confirmation retry is gated must leave NO fallback mutation — no
+        // inline notice, no pin, no stream start, no confirmed run — even when
+        // the released session response carries an active_stream_id.
+        let streamClient = SpySSEStreamingClient()
+        let gate = CancelResponseGate()
+        var sessionLoadCount = 0
+        let gatedSession: URLSession = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatedURLProtocol.self]
+            return URLSession(configuration: configuration)
+        }()
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let gatedClient = APIClient(baseURL: server, session: gatedSession)
 
-        XCTAssertEqual(viewModel.messages.map(\.role), ["user", "assistant"])
-        XCTAssertEqual(viewModel.messages.last?.content, "Working now.")
+        GatedURLProtocol.asyncHandler = { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse("""
+                {
+                  "ok": true,
+                  "action": "set",
+                  "message": "Goal set.",
+                  "goal": {
+                    "goal": "Ship the TestFlight build",
+                    "status": "active",
+                    "turns_used": 0,
+                    "max_turns": 20
+                  },
+                  "kickoff_prompt": "Start executing the goal."
+                }
+                """, for: request)
+            case "/api/session":
+                sessionLoadCount += 1
+                if sessionLoadCount == 1 {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                }
+                await gate.enter()
+                return apiTestJSONResponse(gate.responseJSON, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            client: gatedClient,
+            handler: { apiTestJSONResponse("{}", for: $0) }
+        )
+
+        let submitTask = Task { @MainActor in
+            await viewModel.submitGoal(args: "Ship the TestFlight build")
+        }
+
+        await gate.waitForEntry()
+        XCTAssertEqual(gate.enteredCount, 1)
+        XCTAssertTrue(viewModel.isReconcilingGoalKickoff)
+
+        submitTask.cancel()
+        gate.responseJSON = """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "title": "Planning",
+            "active_stream_id": "stream-goal",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Start executing the goal.",
+                "timestamp": 1770000100,
+                "message_id": "user-goal"
+              }
+            ]
+          }
+        }
+        """
+        gate.release()
+
+        _ = await submitTask.value
+
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertNil(viewModel.confirmedRunSnapshot)
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertFalse(viewModel.messages.contains { $0.content == "Goal set." })
+        XCTAssertEqual(viewModel.messages.filter { $0.role == "local_notice" }.count, 0)
+    }
+
+    @MainActor
+    func testGoalReconciliationGenerationFenceCannotStartReplacement() async throws {
+        // A replacement run started while the kickoff confirmation is still
+        // gated bumps the generation fence: releasing a late active_stream_id
+        // for the GOAL stream must not start it over the replacement, must not
+        // mutate the transcript with a fallback notice, and must leave the
+        // confirmed run pointing at the replacement (never the stale goal ID).
+        let streamClient = SpySSEStreamingClient()
+        let gate = CancelResponseGate()
+        var sessionLoadCount = 0
+        let gatedSession: URLSession = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatedURLProtocol.self]
+            return URLSession(configuration: configuration)
+        }()
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let gatedClient = APIClient(baseURL: server, session: gatedSession)
+
+        GatedURLProtocol.asyncHandler = { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse("""
+                {
+                  "ok": true,
+                  "action": "set",
+                  "message": "Goal set.",
+                  "goal": {
+                    "goal": "Ship the TestFlight build",
+                    "status": "active",
+                    "turns_used": 0,
+                    "max_turns": 20
+                  },
+                  "kickoff_prompt": "Start executing the goal."
+                }
+                """, for: request)
+            case "/api/session":
+                sessionLoadCount += 1
+                if sessionLoadCount == 1 {
+                    return apiTestJSONResponse("""
+                    {
+                      "session": {
+                        "session_id": "session-abc",
+                        "title": "Planning",
+                        "messages": []
+                      }
+                    }
+                    """, for: request)
+                }
+                await gate.enter()
+                return apiTestJSONResponse(gate.responseJSON, for: request)
+            case "/api/chat/start":
+                return apiTestJSONResponse(#"{"session_id": "session-abc", "stream_id": "stream-other"}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let viewModel = try makeViewModel(
+            streamClient: streamClient,
+            client: gatedClient,
+            handler: { apiTestJSONResponse("{}", for: $0) }
+        )
+
+        let submitTask = Task { @MainActor in
+            await viewModel.submitGoal(args: "Ship the TestFlight build")
+        }
+
+        await gate.waitForEntry()
+        XCTAssertEqual(gate.enteredCount, 1)
+        XCTAssertTrue(viewModel.isReconcilingGoalKickoff)
+
+        let didStartReplacement = await viewModel.sendMessage("Replace the kickoff")
+        XCTAssertTrue(didStartReplacement)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-other")
+
+        gate.responseJSON = """
+        {
+          "session": {
+            "session_id": "session-abc",
+            "title": "Planning",
+            "active_stream_id": "stream-goal",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Start executing the goal.",
+                "timestamp": 1770000100,
+                "message_id": "user-goal"
+              }
+            ]
+          }
+        }
+        """
+        gate.release()
+
+        _ = await submitTask.value
+
+        XCTAssertEqual(viewModel.activeStreamID, "stream-other")
+        XCTAssertEqual(streamClient.startedURLs.count, 1)
+        XCTAssertEqual(streamClient.startedURLs.first?.path, "/api/chat/stream")
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertFalse(viewModel.messages.contains { $0.content == "Goal set." })
+        XCTAssertEqual(viewModel.messages.filter { $0.role == "local_notice" }.count, 0)
+        XCTAssertNotEqual(viewModel.confirmedRunSnapshot?.identity.streamID, "stream-goal")
+    }
+
+    @MainActor
+    func testGoalReconciliationExhaustionUsesOneInlineFallbackAfterExactlyThreeLoads() async throws {
+        // The reconciliation budget is exactly three confirmation loads: when
+        // none reports an active_stream_id, the kickoff falls back to ONE
+        // inline notice (no pin) and no stream starts. Today's one-load branch
+        // stops after the first load, so the count assertion is RED.
+        let streamClient = SpySSEStreamingClient()
+        var sessionLoadCount = 0
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse("""
+                {
+                  "ok": true,
+                  "action": "set",
+                  "message": "Goal set.",
+                  "goal": {
+                    "goal": "Ship the TestFlight build",
+                    "status": "active",
+                    "turns_used": 0,
+                    "max_turns": 20
+                  },
+                  "kickoff_prompt": "Start executing the goal."
+                }
+                """, for: request)
+            case "/api/session":
+                sessionLoadCount += 1
+                return apiTestJSONResponse("""
+                {
+                  "session": {
+                    "session_id": "session-abc",
+                    "title": "Planning",
+                    "messages": []
+                  }
+                }
+                """, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the TestFlight build")
+
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(sessionLoadCount, 3)
+        XCTAssertEqual(streamClient.startedURLs.count, 0)
+        XCTAssertNil(viewModel.activeStreamID)
+        XCTAssertEqual(viewModel.pinnedLocalNotices, [])
+        XCTAssertNil(viewModel.confirmedRunSnapshot)
+        XCTAssertFalse(viewModel.isReconcilingGoalKickoff)
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content),
+            ["Goal set."]
+        )
+    }
+
+    @MainActor
+    func testGenericPinnedSlashNoticeStillFlushesAfterTerminalStream() async throws {
+        // Generic pinned slash notices are untouched by the Goal rework: a pin
+        // survives while the stream runs and flushes into the transcript as a
+        // local_notice once the run reaches its terminal stream end.
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(streamClient: streamClient) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/start")
+            return apiTestJSONResponse(#"{"session_id": "session-abc", "stream_id": "stream-123"}"#, for: request)
+        }
+
+        viewModel.pinLocalNoticeMessage("Remember the pin")
+
+        let didSend = await viewModel.sendMessage("Hello")
+        XCTAssertTrue(didSend)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-123")
+        XCTAssertEqual(viewModel.pinnedLocalNotices, ["Remember the pin"])
+
+        streamClient.emit(.done(DoneStreamEvent()))
+        streamClient.emit(.streamEnd)
+
+        XCTAssertTrue(viewModel.pinnedLocalNotices.isEmpty)
+        let noticeContents = viewModel.messages.filter { $0.role == "local_notice" }.compactMap(\.content)
+        XCTAssertTrue(noticeContents.contains("Remember the pin"))
     }
 
     @MainActor
