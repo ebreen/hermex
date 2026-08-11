@@ -7302,6 +7302,10 @@ final class ChatViewModelSendTests: XCTestCase {
         callA.continuation.yield(.base(Self.makeCatalogBaseSnapshot(metadata: metadataA, groups: [Self.makeCatalogGroup(providerID: "openai", modelIDs: ["gpt-5"])], defaultModel: "gpt-5", activeProvider: "openai")))
         await loadTask.value
         try await waitUntil { viewModel.modelCatalogGroups.map(\.providerID) == ["openai"] }
+        // Phase-1 events (operation A under epoch 0) are legitimate; the
+        // post-switch assertion below must only see events after the epoch
+        // advance, so the collector restarts here.
+        collector.reset()
 
         // The profile switch completes (gate epoch advances); the picker
         // reopens and operation B supersedes A under the new epoch.
@@ -7893,6 +7897,12 @@ private final class CatalogEventCollector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return events
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        events.removeAll(keepingCapacity: true)
     }
 
     func waitUntil(_ predicate: @escaping (CatalogEvent) -> Bool) async {
