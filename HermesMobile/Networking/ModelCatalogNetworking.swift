@@ -1107,16 +1107,21 @@ private extension APIClient {
             telemetrySink: telemetrySink,
             baseGroupsBox: baseGroupsBox
         )
-        let base = await baseOutcome
-        let live = await liveOutcome
 
-        if Task.isCancelled || base.isCancelled || live.isCancelled {
+        // Publish a valid base as soon as its child completes. Do not await the
+        // live child first: the live request may intentionally remain held while
+        // the base is already usable by stream consumers and snapshot readers.
+        let base = await baseOutcome
+        if Task.isCancelled || base.isCancelled {
+            _ = await liveOutcome
             return .cancelled(metadata)
         }
         if let baseFailure = base.failure {
+            _ = await liveOutcome
             return .failed(metadata, .models, baseFailure)
         }
         guard case let .base(baseSnapshot) = base else {
+            _ = await liveOutcome
             return .failed(metadata, .models, .decoding)
         }
         let baseEvent = CatalogNetworkEvent.base(baseSnapshot)
@@ -1128,6 +1133,14 @@ private extension APIClient {
             gate: gate,
             continuation: continuation
         ) else {
+            _ = await liveOutcome
+            return .cancelled(metadata)
+        }
+
+        // The reader lease remains held while the live child unwinds. This
+        // preserves cancellation/drain semantics after the early base publish.
+        let live = await liveOutcome
+        if Task.isCancelled || live.isCancelled {
             return .cancelled(metadata)
         }
         if let liveFailure = live.failure {

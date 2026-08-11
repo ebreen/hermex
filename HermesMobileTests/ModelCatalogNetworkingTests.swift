@@ -322,12 +322,40 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let collectTask = Task { await Self.collectEvents(from: stream) }
+        let (basePublishedStream, basePublishedContinuation) = AsyncStream<Bool>.makeStream()
+        let collectTask = Task { () -> [CatalogNetworkEvent] in
+            var events: [CatalogNetworkEvent] = []
+            for await event in stream {
+                events.append(event)
+                switch event {
+                case .base(_):
+                    basePublishedContinuation.yield(true)
+                    basePublishedContinuation.finish()
+                case .finished(_), .failed(_, _, _), .cancelled(_):
+                    basePublishedContinuation.yield(false)
+                    basePublishedContinuation.finish()
+                    return events
+                case .contextVerified(_, _), .live(_), .liveFailed(_, _):
+                    continue
+                }
+            }
+            basePublishedContinuation.finish()
+            return events
+        }
+        var basePublishedIterator = basePublishedStream.makeAsyncIterator()
 
         // The live child is parked on the wire, so the single physical
         // operation-level reader lease must still be held: it covers profile
-        // verification plus both children until both have unwound.
+        // verification plus both children until both have unwound. A valid base
+        // must nevertheless be published before the held live response is
+        // released; this is the networking-level base-before-live fence.
         await fixture.waitForParkedLoad(path: "/api/models/live")
+        let basePublished = await basePublishedIterator.next()
+        XCTAssertEqual(
+            basePublished,
+            true,
+            "base publication must not await held live completion"
+        )
         let midFlight = await gate.snapshot()
         XCTAssertEqual(midFlight.heldReaders, [operationID])
         XCTAssertNil(midFlight.heldWriter)
@@ -350,6 +378,23 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             if case .failed = event { return true }
             return false
         })
+        guard let baseIndex = events.firstIndex(where: { event in
+            if case .base = event { return true }
+            return false
+        }), let liveIndex = events.firstIndex(where: { event in
+            if case .live = event { return true }
+            return false
+        }) else {
+            XCTFail("expected both base and live projections")
+            return
+        }
+        XCTAssertLessThan(baseIndex, liveIndex)
+        if case let .base(baseSnapshot) = events[baseIndex] {
+            XCTAssertEqual(baseSnapshot.metadata.operationID, operationID)
+        }
+        if case let .live(liveSnapshot) = events[liveIndex] {
+            XCTAssertEqual(liveSnapshot.metadata.operationID, operationID)
+        }
 
         let finalState = await gate.snapshot()
         XCTAssertTrue(finalState.heldReaders.isEmpty, "the shared lease releases only after both children unwind")
