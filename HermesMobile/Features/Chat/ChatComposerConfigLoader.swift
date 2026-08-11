@@ -253,7 +253,7 @@ struct ChatComposerConfigLoader {
                         ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
                 }
                 publishedSnapshot = snapshot
-            case .live, .failed, .finished, .cancelled, .contextReset, .state:
+            case .live, .liveFailed, .failed, .finished, .cancelled, .contextReset, .state:
                 break
             }
             if sawContextVerified, sawBase {
@@ -298,7 +298,7 @@ struct ChatComposerConfigLoader {
 
         do {
             let commandsResponse = try await client.commands()
-            state.agentCommands = commandsResponse.commands
+            state.agentCommands = commandsResponse.commands ?? []
         } catch {
             if configurationFailure == nil {
                 configurationFailure = .workspacesUnavailable
