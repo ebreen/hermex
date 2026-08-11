@@ -7167,6 +7167,83 @@ final class ChatViewModelSendTests: XCTestCase {
         return userDefaults
     }
 
+    // Slice 5 (#18): completes a run, records the exact ChatTerminalCommit (the
+    // binding contract's ChatRunTerminalCommit), and asserts the stable
+    // local_notice is appended BEFORE the single ViewModel-owned
+    // ChatTerminalPersistenceHandoff is constructed and sent to the injected
+    // writer. The handoff snapshot is post-append and the handoff generation is
+    // monotonic across runs. RED: the `terminalCacheWriter:` seam,
+    // ChatTerminalCommit, ChatTerminalPersistenceHandoff,
+    // ChatTerminalCacheWriter and stableTerminalEventMessageID are
+    // intended-missing and added in GREEN.
+    @MainActor
+    func testTerminalRunAppendsStableLocalNoticeBeforeIdentityKeyedHandoff() async throws {
+        let writer = RecordingTerminalCacheWriter()
+        let streamClient = SpySSEStreamingClient()
+
+        let viewModel = try makeViewModel(
+            terminalCacheWriter: writer,
+            streamClient: streamClient
+        ) { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse(
+                    #"{"ok": true, "action": "set", "message": "Goal set.", "goal": {"goal": "Ship the build", "status": "active", "turns_used": 0, "max_turns": 20}, "kickoff_prompt": "Start executing the goal."}"#,
+                    for: request
+                )
+            case "/api/session":
+                return apiTestJSONResponse(
+                    #"{"session": {"session_id": "session-abc", "title": "Planning", "active_stream_id": "stream-goal", "messages": [{"role": "user", "content": "Start executing the goal.", "timestamp": 1770000100, "message_id": "user-goal"}]}}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let identity = ChatRunIdentity(streamID: "stream-goal", logicalGeneration: 1)
+        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: .completed)
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the build")
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(streamClient.startedURLs.count, 1)
+
+        // Deliver the terminal event. The VM records the exact commit, appends
+        // the stable local notice, then constructs the single identity-keyed
+        // handoff and sends it to the injected writer.
+        streamClient.emit(.terminal(ChatTerminalCommit(identity: identity, outcome: .completed)))
+
+        XCTAssertEqual(
+            viewModel.pinnedLocalNotices.filter { $0 == noticeID }.count, 1,
+            "The stable local notice is appended exactly once"
+        )
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == noticeID }.count, 1,
+            "The stable local notice is present in the post-append messages"
+        )
+        XCTAssertEqual(writer.handoffs.count, 1, "Exactly one ViewModel-owned handoff reaches the injected writer")
+        let handoff = try XCTUnwrap(writer.handoffs.first)
+        XCTAssertEqual(handoff.commit.identity, identity, "The handoff is keyed by the run identity")
+        XCTAssertEqual(handoff.generation, 1)
+        XCTAssertTrue(
+            handoff.snapshotMessages.contains { $0.messageId == noticeID },
+            "The handoff snapshot is post-append: it contains the stable local notice"
+        )
+
+        // A second run with a new logical generation: the handoff generation is
+        // monotonic and the two handoffs are distinct keys.
+        let secondIdentity = ChatRunIdentity(streamID: "stream-goal", logicalGeneration: 2)
+        streamClient.emit(.terminal(ChatTerminalCommit(identity: secondIdentity, outcome: .completed)))
+
+        XCTAssertEqual(writer.handoffs.count, 2)
+        XCTAssertEqual(
+            writer.handoffs[1].generation, writer.handoffs[0].generation + 1,
+            "Handoff generation is monotonic across runs"
+        )
+        XCTAssertNotEqual(writer.handoffs[1].commit.identity, writer.handoffs[0].commit.identity)
+    }
+
     @MainActor
     private func makeViewModel(
         streamClient: SSEStreamingClient? = nil,
