@@ -289,47 +289,36 @@ enum CacheStore {
         descriptor.fetchLimit = 1
         return try context.fetch(descriptor).first
     }
+}
 
-    // MARK: - Terminal handoff cache (#18 Slice 5)
+/// Production `ChatTerminalCacheWriter` (#18 §522): persists a terminal
+/// handoff through the existing `CacheStore.cacheMessages` over the handoff's
+/// post-append snapshot, keyed by the commit's server session ID. The
+/// terminal event is an ordinary `ChatMessage` whose `messageId` is the
+/// stable run-status-v1 key — no SwiftData model, schema field, or migration
+/// (#18 §498). A missing model context throws so the ViewModel retains the
+/// handoff for retry.
+struct CacheStoreTerminalCacheWriter: ChatTerminalCacheWriter {
+    let serverURL: URL
 
-    /// Persists one identity-keyed terminal handoff through the injected
-    /// writer, then upserts the cached row keyed by
-    /// `(streamID, logicalGeneration)`. A throwing writer propagates BEFORE
-    /// any cache mutation, leaving the previous row (or absence) intact for
-    /// retry. Persisting the same terminal event key twice never duplicates.
-    @MainActor
-    static func persistTerminalHandoff(
-        _ handoff: ChatTerminalPersistenceHandoff,
-        in context: ModelContext,
-        writer: any ChatTerminalCacheWriter
+    func persistPendingTerminalPersistence(
+        for handoff: ChatTerminalPersistenceHandoff,
+        modelContext: ModelContext?
     ) throws {
-        try writer.write(handoff)
-
-        if let existing = try terminalHandoff(identity: handoff.commit.identity, in: context) {
-            existing.apply(handoff)
-        } else {
-            context.insert(CachedTerminalHandoff(handoff: handoff))
+        guard let modelContext else {
+            throw CacheStoreTerminalCacheWriterError.missingModelContext
         }
-        try context.save()
-    }
-
-    /// Returns the cached terminal handoff for the run identity, or nil when
-    /// no terminal event was persisted for that `(streamID, logicalGeneration)`.
-    @MainActor
-    static func terminalHandoff(
-        identity: ChatRunIdentity,
-        in context: ModelContext
-    ) throws -> CachedTerminalHandoff? {
-        let streamID = identity.streamID
-        let logicalGeneration = identity.logicalGeneration
-        var descriptor = FetchDescriptor<CachedTerminalHandoff>(
-            predicate: #Predicate { handoff in
-                handoff.streamID == streamID && handoff.logicalGeneration == logicalGeneration
-            }
+        try CacheStore.cacheMessages(
+            handoff.postAppendMessages,
+            serverURL: serverURL,
+            sessionID: handoff.commit.serverSessionID,
+            in: modelContext
         )
-        descriptor.fetchLimit = 1
-        return try context.fetch(descriptor).first
     }
+}
+
+enum CacheStoreTerminalCacheWriterError: Error {
+    case missingModelContext
 }
 
 private extension SessionSummary {
@@ -403,79 +392,5 @@ private extension ChatMessage {
             attachments: attachments,
             turnTps: cachedMessage.turnTps
         )
-    }
-}
-
-/// Lossless-enough persistence DTO for the terminal handoff's post-append
-/// snapshot: the cached copy restores the stable local notice identity and
-/// content, which is all the terminal event merge path needs (#18 Slice 5).
-private struct CachedTerminalSnapshotMessage: Codable {
-    let role: String?
-    let content: String?
-    let timestamp: Double?
-    let messageId: String?
-}
-
-/// Cached terminal handoff row, keyed by the run identity
-/// `(streamID, logicalGeneration)` (#18 Slice 5). The optional to-one
-/// `session` anchor keeps this entity reachable in containers built from
-/// `[CachedSession, CachedMessage]` so in-memory test containers and the app
-/// container both include it without a schema list change.
-@Model
-final class CachedTerminalHandoff {
-    var streamID: String
-    var logicalGeneration: Int
-    var outcomeRaw: String
-    var snapshotMessagesData: Data
-    var generation: Int
-    var session: CachedSession?
-
-    init(handoff: ChatTerminalPersistenceHandoff) {
-        streamID = handoff.commit.identity.streamID
-        logicalGeneration = handoff.commit.identity.logicalGeneration
-        outcomeRaw = handoff.commit.outcome.persistenceValue
-        snapshotMessagesData = Self.encode(handoff.snapshotMessages)
-        generation = handoff.generation
-    }
-
-    func apply(_ handoff: ChatTerminalPersistenceHandoff) {
-        outcomeRaw = handoff.commit.outcome.persistenceValue
-        snapshotMessagesData = Self.encode(handoff.snapshotMessages)
-        generation = handoff.generation
-    }
-
-    /// The reconstructed terminal commit for this cached row.
-    var commit: ChatTerminalCommit {
-        ChatTerminalCommit(
-            identity: ChatRunIdentity(streamID: streamID, logicalGeneration: logicalGeneration),
-            outcome: ChatTerminalOutcome(persistenceValue: outcomeRaw) ?? .failed
-        )
-    }
-
-    /// The reconstructed post-append message snapshot.
-    var snapshotMessages: [ChatMessage] {
-        guard let dtos = try? JSONDecoder().decode([CachedTerminalSnapshotMessage].self, from: snapshotMessagesData) else {
-            return []
-        }
-        return dtos.map {
-            ChatMessage(
-                role: $0.role,
-                content: $0.content,
-                timestamp: $0.timestamp,
-                messageId: $0.messageId
-            )
-        }
-    }
-
-    private static func encode(_ messages: [ChatMessage]) -> Data {
-        let dtos = messages.map {
-            CachedTerminalSnapshotMessage(
-                role: $0.role,
-                content: $0.content,
-                timestamp: $0.timestamp,
-                messageId: $0.messageId
-            )
-        }
-        return (try? JSONEncoder().encode(dtos)) ?? Data()
     }
 }

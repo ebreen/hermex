@@ -43,12 +43,6 @@ final class CachedSession {
     var isReadOnly: Bool?
     var cachedAt: Date
     var expiresAt: Date
-    /// Optional to-one anchor keeping `CachedTerminalHandoff` reachable in the
-    /// container schema built from `[CachedSession, CachedMessage]` (#18
-    /// Slice 5). Terminal handoffs are keyed by run identity, not by session;
-    /// this relationship exists so in-memory test containers and the app
-    /// container include the terminal-handoff entity.
-    var terminalHandoff: CachedTerminalHandoff?
 
     init(serverURLString: String, session: SessionSummary, cachedAt: Date = Date()) {
         let sessionID = session.sessionId ?? session.id

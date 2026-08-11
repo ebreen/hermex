@@ -454,7 +454,7 @@ final class ChatViewModel {
         session: SessionSummary,
         server: URL,
         client: APIClient? = nil,
-        streamClient: SSEStreamingClient? = nil, terminalCacheWriter: any ChatTerminalCacheWriter = NoopTerminalCacheWriter(),
+        streamClient: SSEStreamingClient? = nil, runGenerationStore: any ChatRunGenerationStore = UserDefaultsRunGenerationStore(defaults: .standard), terminalCacheWriter: (any ChatTerminalCacheWriter)? = nil,
         approvalStreamClient: SSEStreamingClient? = nil,
         clarifyStreamClient: SSEStreamingClient? = nil,
         btwStreamClient: SSEStreamingClient? = nil,
@@ -485,7 +485,7 @@ final class ChatViewModel {
             client: resolvedClient,
             streamClient: resolvedStreamClient,
             liveActivityManager: resolvedLiveActivityManager,
-            showsLiveActivityResponseExcerpts: showsLiveActivityResponseExcerpts
+            showsLiveActivityResponseExcerpts: showsLiveActivityResponseExcerpts, runGenerationStore: runGenerationStore
         )
         self.pendingActionCoordinator = ChatPendingActionCoordinator(
             client: resolvedClient,
@@ -781,19 +781,31 @@ final class ChatViewModel {
         }
     }
 
-    // MARK: Slice 3 coordinator-owned catalog (#16)
+    // MARK: Slice 5 (#18): terminal persistence (one-writer pending map)
 
-    /// Injected persistence seam for terminal commits (#18 Slice 5). The VM
+    /// Injected persistence seam for terminal commits (#18 §522). The VM
     /// appends the stable local notice, then sends the single identity-keyed
     /// handoff through this writer; a throwing writer keeps the handoff
-    /// pending for retry without re-appending.
-    private let terminalCacheWriter: any ChatTerminalCacheWriter
-    /// Terminal event keys already committed locally, deduping repeated
-    /// terminal callbacks for the same `(streamID, logicalGeneration, outcome)`.
-    private var terminalEventKeys = Set<String>()
+    /// pending for retry without re-appending. Production injects the
+    /// CacheStore-backed writer (`CacheStoreTerminalCacheWriter`); nil defers
+    /// persistence until a writer is available.
+    private let terminalCacheWriter: (any ChatTerminalCacheWriter)?
+    /// One-writer pending map (#18 §520-525): the session-scoped ViewModel is
+    /// the SOLE owner of terminal persistence, independent of any mounted
+    /// ChatView. Each committed terminal event key maps to exactly one
+    /// post-append handoff; a failed write retains the exact handoff and
+    /// snapshot for retry, and a successful write removes exactly that key.
+    private var pendingTerminalPersistenceByKey: [ChatRunStatusTerminalEventKey: ChatTerminalPersistenceHandoff] = [:]
+    /// The most recent writer error retained per pending key (#18 §523).
+    private var terminalPersistenceErrorByKey: [ChatRunStatusTerminalEventKey: Error] = [:]
     /// Monotonic handoff generation across runs: every accepted terminal
-    /// commit bumps it, so handoffs are strictly ordered (#18 Slice 5).
-    private var terminalHandoffGeneration = 0
+    /// commit bumps it exactly once, so handoffs are strictly ordered (#18
+    /// §521).
+    private var nextTerminalHandoffGeneration = 0
+    /// The model context the terminal writer caches through. Supplied by the
+    /// mounted ChatView when available; setting it never triggers persistence
+    /// on its own (#18 §522).
+    var modelContext: ModelContext?
 
     /// The recovery-load token of the current run connection (#18 Slice 4).
     /// A transcript load that completes after the run was replaced or
@@ -1432,6 +1444,9 @@ final class ChatViewModel {
                 preparation: streamLoadPreparation,
                 usedCacheFallback: false
             )
+            // Terminal persistence retry (#18 §522): a load that obtained a
+            // context retries every retained terminal handoff exactly once.
+            attemptPendingTerminalPersistence(modelContext: modelContext)
         } catch {
             // Same stale-load guard: a cache fallback or error publication
             // from a superseded run's load must not touch the replacement.
@@ -1702,15 +1717,17 @@ final class ChatViewModel {
                 && !loadedMessagesContainEquivalentUserMessage(loadedMessages, localMessage: cachedMessage)
         }
 
-        // Cached terminal events (stable `term-v1-` message IDs, #18 Slice 5)
-        // merge through even when the server transcript omits them. They are
-        // deduped by message ID so a restored terminal event appears exactly
-        // once; a different logical generation/outcome is a different key and
-        // is NOT deduped away.
-        let loadedTerminalIDs = Set(loadedMessages.compactMap { $0.messageId }.filter { $0.hasPrefix("term-v1-") })
+        // Narrow merge rule (#18 §529): ONLY `run-status-v1-` terminal
+        // notices absent from the server payload are retained. Generic
+        // local-notice and optimistic-user merge behavior is unchanged: a
+        // generic cached local notice is NOT re-created by a reload, while an
+        // optimistic user message still merges when the server omits it.
+        let loadedRunStatusIDs = Set(loadedMessages.compactMap { $0.messageId }.filter { $0.hasPrefix("run-status-v1-") })
         let cachedTerminalEvents = cachedMessages.filter { message in
-            guard let messageID = message.messageId, messageID.hasPrefix("term-v1-") else { return false }
-            return !loadedTerminalIDs.contains(messageID)
+            guard message.role == "local_notice",
+                  let messageID = message.messageId,
+                  messageID.hasPrefix("run-status-v1-") else { return false }
+            return !loadedRunStatusIDs.contains(messageID)
         }
 
         guard !localUserMessages.isEmpty || !cachedTerminalEvents.isEmpty else {
@@ -2456,11 +2473,6 @@ final class ChatViewModel {
         } catch {
             cacheErrorMessage = error.localizedDescription
         }
-    }
-
-    func cacheCompletedResponse(modelContext: ModelContext) {
-        guard let sessionID else { return }
-        cacheCurrentMessages(sessionID: sessionID, modelContext: modelContext)
     }
 
     func clearTranscript() {
@@ -3380,42 +3392,87 @@ final class ChatViewModel {
         pinnedLocalNotices.append(trimmed)
     }
 
-    /// Appends the stable terminal local notice and writes the single
-    /// identity-keyed persistence handoff (#18 Slice 5). Idempotent per
-    /// terminal event key `(streamID, logicalGeneration, outcome)`: a repeated
-    /// terminal callback for the same key appends nothing and writes nothing.
-    private func handleTerminalCommit(_ commit: ChatTerminalCommit) {
-        let key = "\(commit.identity.streamID)|\(commit.identity.logicalGeneration)|\(commit.outcome)"
-        guard terminalEventKeys.insert(key).inserted else { return }
+    /// Terminal-commit callback (#18 §500-525): invoked EXACTLY once per
+    /// committed terminal transition. Appends the stable local notice
+    /// (deduped by stable message ID), increments `nextTerminalHandoffGeneration`
+    /// exactly once, constructs the post-append handoff from the immutable
+    /// complete `messages` value, stores it under `commit.eventKey`, and
+    /// attempts persistence. A repeated callback for an already-committed key
+    /// (or an already-terminal state) appends nothing and writes nothing.
+    func streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit) {
+        let key = commit.eventKey
+        guard pendingTerminalPersistenceByKey[key] == nil else { return }
 
-        let noticeID = stableTerminalEventMessageID(identity: commit.identity, outcome: commit.outcome)
-        let noticeText: String
-        switch commit.outcome {
-        case .completed:
-            noticeText = String(localized: "Response complete")
-        case .failed:
-            noticeText = String(localized: "Response failed")
-        case .cancelled:
-            noticeText = String(localized: "Response cancelled")
-        }
+        appendRunStatusTerminalEvent(key: key, text: Self.terminalNoticeText(for: commit.outcome))
+
+        nextTerminalHandoffGeneration += 1
+        let postAppendMessages = messages
+        let handoff = ChatTerminalPersistenceHandoff(
+            commit: commit,
+            postAppendMessages: postAppendMessages,
+            handoffGeneration: nextTerminalHandoffGeneration
+        )
+        pendingTerminalPersistenceByKey[key] = handoff
+        attemptPendingTerminalPersistence(for: key)
+    }
+
+    /// Appends one deterministic inline terminal transcript event with the
+    /// stable `run-status-v1-` message ID (#18 §436-446, §486). Checks
+    /// `messages` by stable message ID before append — a repeated call for
+    /// the same key appends nothing. The event is an ordinary local notice,
+    /// never pinned and never placed in `pinnedLocalNotices`.
+    func appendRunStatusTerminalEvent(key: ChatRunStatusTerminalEventKey, text: String) {
+        let messageID = key.messageID
+        guard !messages.contains(where: { $0.messageId == messageID }) else { return }
         messages.append(
             ChatMessage(
                 role: "local_notice",
-                content: noticeText,
+                content: text,
                 timestamp: Date().timeIntervalSince1970,
-                messageId: noticeID
+                messageId: messageID
             )
         )
         scheduleStreamingScrollTrigger()
-        pinnedLocalNotices.append(noticeID)
+    }
 
-        terminalHandoffGeneration += 1
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: commit,
-            snapshotMessages: messages,
-            generation: terminalHandoffGeneration
-        )
-        try? terminalCacheWriter.write(handoff)
+    /// One-writer terminal persistence (#18 §522-523): invokes the injected
+    /// writer for the exact keyed handoff. A successful write removes exactly
+    /// that key (same handoff generation — a replacement handoff is never
+    /// cleared); a throwing writer retains the exact handoff and post-append
+    /// snapshot for retry, records the error against that key, and never
+    /// appends a second event.
+    private func attemptPendingTerminalPersistence(for key: ChatRunStatusTerminalEventKey) {
+        guard let writer = terminalCacheWriter,
+              let modelContext,
+              let handoff = pendingTerminalPersistenceByKey[key]
+        else { return }
+
+        do {
+            try writer.persistPendingTerminalPersistence(for: handoff, modelContext: modelContext)
+            guard pendingTerminalPersistenceByKey[key]?.handoffGeneration == handoff.handoffGeneration else { return }
+            pendingTerminalPersistenceByKey.removeValue(forKey: key)
+            terminalPersistenceErrorByKey.removeValue(forKey: key)
+        } catch {
+            guard pendingTerminalPersistenceByKey[key]?.handoffGeneration == handoff.handoffGeneration else { return }
+            terminalPersistenceErrorByKey[key] = error
+        }
+    }
+
+    /// Retries every retained handoff when a later load/reconnect path
+    /// obtains a context (#18 §522). One retryable write per attempt per key.
+    private func attemptPendingTerminalPersistence(modelContext: ModelContext?) {
+        guard let modelContext, terminalCacheWriter != nil else { return }
+        for key in pendingTerminalPersistenceByKey.keys {
+            attemptPendingTerminalPersistence(for: key)
+        }
+    }
+
+    private static func terminalNoticeText(for outcome: ChatRunTerminalOutcome) -> String {
+        switch outcome {
+        case .completed: return String(localized: "Response complete")
+        case .failed: return String(localized: "Response failed")
+        case .cancelled: return String(localized: "Response cancelled")
+        }
     }
 
     private func appendLocalMessage(_ text: String, role: String, idPrefix: String) -> String? {
@@ -5196,10 +5253,6 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     func streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: Bool) {
         responseCompletionNeedsTranscriptRefresh = needsTranscriptRefresh
         responseCompletionHapticTrigger += 1
-    }
-
-    func streamCoordinatorDidReceiveTerminalCommit(_ commit: ChatTerminalCommit) {
-        handleTerminalCommit(commit)
     }
 
     func streamCoordinatorDidFinishStream() {

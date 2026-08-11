@@ -79,7 +79,7 @@ enum SSEEvent: Equatable {
     case streamEnd
     case cancelled
     case error(String)
-    case terminal(ChatTerminalCommit)
+    case terminal(ChatRunTerminalCommit)
     case transportError(String)
     case heartbeat
     case ignored
