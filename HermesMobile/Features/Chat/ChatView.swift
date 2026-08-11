@@ -1062,7 +1062,7 @@ struct ChatView: View {
                     } else {
                         ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
                     }
-                        .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
+                        .transition(runStatusParentTransition)
                 }
 
                 if showsApprovalBypassStatus {
@@ -1072,7 +1072,6 @@ struct ChatView: View {
             }
             .padding(.horizontal)
             .padding(.bottom, composerHeight + 8)
-            .allowsHitTesting(false)
             .zIndex(8)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: composerAccessoryVisibleItemCount)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: activeRunStatusPresentation)
@@ -1247,6 +1246,15 @@ struct ChatView: View {
             dismissedIdentity: viewModel.dismissedRunStatusIdentity,
             isScrolledNearBottom: isScrolledNearBottom
         )
+    }
+
+    private var runStatusParentTransition: AnyTransition {
+        switch ChatMotion.runStatusParentMotion(reduceMotion: reduceMotion) {
+        case .none:
+            return .identity
+        case .slideAndFade:
+            return .move(edge: .bottom).combined(with: .opacity)
+        }
     }
 
     private var showsApprovalBypassStatus: Bool {
