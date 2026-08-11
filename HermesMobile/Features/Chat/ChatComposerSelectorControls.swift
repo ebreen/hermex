@@ -98,6 +98,16 @@ struct ComposerModelMenu: View {
     let onSelectModel: (ModelCatalogOption) -> Void
     let onShowAllModels: () -> Void
 
+    private var pickerProjection: ComposerModelPickerProjection {
+        ComposerModelPickerProjection(
+            modelGroups: modelGroups,
+            selectedModelID: selectedModelID,
+            selectedModelProviderID: selectedModelProviderID,
+            favoriteModelKeys: favoriteModelKeys,
+            recentModelKeys: recentModelKeys
+        )
+    }
+
     var body: some View {
         ChatUIKitMenuButton(horizontalPadding: 0, verticalPadding: 14) {
             ComposerMetaControlLabel(
@@ -122,7 +132,7 @@ struct ComposerModelMenu: View {
         }
 
         var children: [UIMenuElement] = []
-        if modelGroups.isEmpty && favoriteOptions.isEmpty && recentOptions.isEmpty && compactOptions.isEmpty {
+        if pickerProjection.sheetRows.isEmpty {
             children.append(disabledMenuAction(title: String(localized: "No catalog models")))
         }
 
@@ -177,62 +187,17 @@ struct ComposerModelMenu: View {
     }
 
     private var compactOptions: [ModelCatalogOption] {
-        let allModels = modelGroups.flatMap(\.models)
-        let favoriteKeys = Set(favoriteOptions.map(\.favoriteKey))
-        let recentKeys = Set(recentOptions.map(\.favoriteKey))
-        var seen = Set<ModelFavoriteKey>()
-        var result: [ModelCatalogOption] = []
-
-        func append(_ option: ModelCatalogOption?) {
-            guard let option,
-                  !favoriteKeys.contains(option.favoriteKey),
-                  !recentKeys.contains(option.favoriteKey),
-                  seen.insert(option.favoriteKey).inserted else { return }
-            result.append(option)
-        }
-
-        append(selectedModelOption(in: allModels))
-
-        return result
+        pickerProjection.compactMenuRows
     }
 
     private var favoriteOptions: [ModelCatalogOption] {
-        ModelFavoritesStore.visibleFavoriteOptions(
-            in: modelGroups,
-            favoriteKeys: favoriteModelKeys
-        )
+        pickerProjection.favoriteRows
     }
 
     private var recentOptions: [ModelCatalogOption] {
-        ModelRecentsStore.visibleRecentOptions(
-            in: modelGroups,
-            recentKeys: recentModelKeys,
-            favoriteKeys: favoriteModelKeys
-        )
+        pickerProjection.recentRows
     }
 
-    private func selectedModelOption(in options: [ModelCatalogOption]) -> ModelCatalogOption? {
-        guard let selectedModelID, !selectedModelID.isEmpty else { return nil }
-
-        if let selectedModelProviderID {
-            return options.firstMatchingSelection(
-                modelID: selectedModelID,
-                providerID: selectedModelProviderID
-            )
-            ?? ModelCatalogOption(
-                id: selectedModelID,
-                displayName: selectedModelID,
-                providerID: selectedModelProviderID
-            )
-        }
-
-        return options.firstMatchingSelection(modelID: selectedModelID, providerID: nil)
-            ?? ModelCatalogOption(
-                id: selectedModelID,
-                displayName: selectedModelID,
-                providerID: nil
-            )
-    }
 
     private func isSelected(_ option: ModelCatalogOption) -> Bool {
         option.matchesSelection(modelID: selectedModelID, providerID: selectedModelProviderID)

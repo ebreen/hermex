@@ -27,27 +27,46 @@ final class ComposerModelPickerProjectionTests: XCTestCase {
         XCTAssertNil(projection.selectedCatalogOption)
         XCTAssertTrue(projection.sheetRows.contains(openAI))
         XCTAssertTrue(projection.sheetRows.contains(anthropic))
-        XCTAssertTrue(projection.compactRows.contains(openAI))
-        XCTAssertTrue(projection.compactRows.contains(anthropic))
+        XCTAssertEqual(projection.compactRows, [unresolved])
     }
 
     func testSheetAndCompactProjectionHaveSameCanonicalRowIdentity() {
         let current = option(id: "current", displayName: "Current", providerID: "openai")
         let favorite = option(id: "favorite", displayName: "Favorite", providerID: "anthropic")
         let recent = option(id: "recent", displayName: "Recent", providerID: "google")
+        let unselectedCatalog = option(id: "unselected", displayName: "Unselected", providerID: "local")
         let projection = makeProjection(
-            groups: [group(id: "catalog", name: "Catalog", providerID: "local", models: [current, favorite, recent])],
+            groups: [group(id: "catalog", name: "Catalog", providerID: "local", models: [current, favorite, recent, unselectedCatalog])],
             selectedModelID: current.id,
             selectedModelProviderID: current.providerID,
             favoriteKeys: [favorite.favoriteKey],
             recentKeys: [recent.favoriteKey]
         )
 
-        XCTAssertEqual(
-            projection.sheetRows.map(\.favoriteKey),
-            projection.compactRows.map(\.favoriteKey),
-            "both picker consumers must expose the same canonical row identity"
+        let sheetCanonicalKeys = Set(
+            projection.sheetGroups
+                .flatMap(\.models)
+                .map(\.favoriteKey)
         )
+        let actualCompactRows = projection.favoriteRows
+            + projection.recentRows
+            + projection.compactMenuRows
+
+        XCTAssertEqual(
+            Set(projection.sheetRows.map(\.favoriteKey)),
+            sheetCanonicalKeys,
+            "the sheet's rendered groups must expose the canonical sheet identity set"
+        )
+        XCTAssertEqual(
+            projection.compactRows.map(\.favoriteKey),
+            actualCompactRows.map(\.favoriteKey),
+            "compact identity must be the favorites + recents + compact-menu union"
+        )
+        XCTAssertTrue(
+            Set(actualCompactRows.map(\.favoriteKey)).isSubset(of: sheetCanonicalKeys),
+            "every compact row must be present in the sheet's canonical identity set"
+        )
+        XCTAssertFalse(actualCompactRows.contains(unselectedCatalog))
     }
 
     func testMissingExplicitSelectionAppearsAsCurrentCustom() {

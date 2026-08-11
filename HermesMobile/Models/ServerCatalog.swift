@@ -695,9 +695,7 @@ struct ModelCatalogOption: Identifiable, Equatable, Hashable, Sendable {
 
 extension ModelCatalogOption {
     func matchesSelection(modelID: String?, providerID: String?) -> Bool {
-        guard id == modelID else { return false }
-        guard let providerID else { return true }
-        return self.providerID == providerID
+        id == modelID && self.providerID == providerID
     }
 }
 
@@ -705,11 +703,10 @@ extension Collection where Element == ModelCatalogOption {
     func firstMatchingSelection(modelID: String?, providerID: String?) -> ModelCatalogOption? {
         guard let modelID, !modelID.isEmpty else { return nil }
 
-        if let providerID {
-            return first { $0.id == modelID && $0.providerID == providerID }
-        }
-
-        return first { $0.id == modelID }
+        // Provider identity is exact, including nil. A missing provider is
+        // ambiguous and must never select the first provider for a duplicate
+        // model ID.
+        return first { $0.id == modelID && $0.providerID == providerID }
     }
 }
 
