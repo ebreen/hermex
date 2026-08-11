@@ -352,6 +352,13 @@ final class ChatViewModel {
     var uploadAttachmentErrorMessage: String? { attachmentCoordinator.uploadAttachmentErrorMessage }
     var localAttachmentPreviews: [String: [String: Data]] { attachmentCoordinator.localAttachmentPreviews }
     private(set) var pinnedLocalNotices: [String] = []
+
+    /// The recovery-load token of the current run connection (#18 Slice 4).
+    /// A transcript load that completes after the run was replaced or
+    /// finalized is stale and must not mutate the replacement run;
+    /// `loadMessages` revalidates the captured token against this value
+    /// after every await.
+    private(set) var activeRecoveryLoadToken: ChatRunRecoveryLoadToken?
     var approvalPrompt: ApprovalPromptState? { pendingActionCoordinator.approvalPrompt }
     var isRespondingToApproval: Bool { pendingActionCoordinator.isRespondingToApproval }
     var approvalErrorMessage: String? { pendingActionCoordinator.approvalErrorMessage }
@@ -1275,7 +1282,19 @@ final class ChatViewModel {
         await attachmentCoordinator.transcriptMediaData(for: reference)
     }
 
-    func loadMessages(modelContext: ModelContext? = nil) async {
+    /// Whether a recovery transcript load may still apply its result. A load
+    /// WITHOUT a token is a plain foreground/background reload and always
+    /// applies; a token-carrying recovery load applies only while it still
+    /// matches the current run connection (#18 Slice 4).
+    private func isCurrentRecoveryLoad(_ token: ChatRunRecoveryLoadToken?) -> Bool {
+        guard let token else { return true }
+        return activeRecoveryLoadToken == token
+    }
+
+    func loadMessages(
+        modelContext: ModelContext? = nil,
+        recoveryLoadToken: ChatRunRecoveryLoadToken? = nil
+    ) async {
         guard let sessionID else {
             errorMessage = String(localized: "The server did not provide a session ID.")
             return
@@ -1320,6 +1339,12 @@ final class ChatViewModel {
                 // tool-heavy session opens populated. "Load earlier" keeps the raw cap.
                 expandRenderable: true
             )
+            // #18 Slice 4 stale-load guard: the run may have been replaced or
+            // finalized while the session response was in flight. A recovery
+            // load whose token no longer matches the current run must not
+            // apply messages, write the cache, reconcile the session, clear
+            // pins/anchors, or publish anything.
+            guard isCurrentRecoveryLoad(recoveryLoadToken) else { return }
             let session = response.session
             let loadedMessages = session?.messages ?? []
             let loadedActiveStreamID = session?.activeStreamId?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1396,6 +1421,9 @@ final class ChatViewModel {
                 usedCacheFallback: false
             )
         } catch {
+            // Same stale-load guard: a cache fallback or error publication
+            // from a superseded run's load must not touch the replacement.
+            guard isCurrentRecoveryLoad(recoveryLoadToken) else { return }
             lastError = error
             latestServerLoadHadAssistantResponseAfterLatestUser = false
             if CacheFallbackPolicy.shouldUseCache(for: error), let modelContext {
@@ -5112,6 +5140,8 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
     func streamCoordinatorDidFinishStream() {
         flushPendingStreamingContent()
         responseCompletionNeedsTranscriptRefresh = false
+        // A finished run's recovery loads are stale by definition (#18 Slice 4).
+        activeRecoveryLoadToken = nil
     }
 
     func streamCoordinatorDidReceiveErrorMessage(_ message: String) {
@@ -5129,6 +5159,13 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
         activeStreamReplayMatchedReasoningLength = 0
         activeStreamReplayToolMatchIndex = 0
         activeStreamReplayPendingToolMatchIndex = nil
+        // Every connection start arms a fresh recovery-load token so a
+        // superseded run's delayed transcript load is discarded (#18 Slice 4).
+        if let identity = streamCoordinator.runConnectionIdentity {
+            activeRecoveryLoadToken = ChatRunRecoveryLoadToken(identity: identity)
+        } else {
+            activeRecoveryLoadToken = nil
+        }
     }
 
     func streamCoordinatorDidResetRecoveryState() {
