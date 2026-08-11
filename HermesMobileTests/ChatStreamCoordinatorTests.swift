@@ -2306,7 +2306,10 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertEqual(delegate.terminalEventCount, 0, file: file, line: line)
         XCTAssertEqual(delegate.finishCount, 0, file: file, line: line)
         XCTAssertTrue(liveActivityManager.ends.isEmpty, file: file, line: line)
-        XCTAssertEqual(streamClient.stopCount, 0, file: file, line: line)
+        // The test choreography suspends the stream connection before the
+        // reconnect probe, which stops the client exactly once. No ADDITIONAL
+        // stop may come from the journal/reconnect path.
+        XCTAssertEqual(streamClient.stopCount, 1, file: file, line: line)
         XCTAssertTrue(delegate.removedSnapshotStreamIDs.isEmpty, file: file, line: line)
         XCTAssertTrue(delegate.stopMonitoringClearPromptValues.isEmpty, file: file, line: line)
     }
