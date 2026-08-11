@@ -2475,6 +2475,11 @@ final class ChatViewModel {
         }
     }
 
+    func cacheCompletedResponse(modelContext: ModelContext) {
+        guard let sessionID else { return }
+        cacheCurrentMessages(sessionID: sessionID, modelContext: modelContext)
+    }
+
     func clearTranscript() {
         cancelPendingStreamingScrollTrigger()
         resetPendingStreamingContentBuffers()

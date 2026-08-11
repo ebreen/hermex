@@ -7264,8 +7264,8 @@ final class ChatViewModelSendTests: XCTestCase {
     func testStreamCoordinatorDidCommitTerminalInvokedExactlyOncePerTerminalTransition() async throws {
         let streamClient = SpySSEStreamingClient()
         let viewModel = try makeViewModel(
-            streamClient: streamClient,
-            runGenerationStore: InMemoryRunGenerationStore()
+            runGenerationStore: InMemoryRunGenerationStore(),
+            streamClient: streamClient
         ) { request in
             switch request.url?.path {
             case "/api/goal":
