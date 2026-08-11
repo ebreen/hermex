@@ -157,6 +157,16 @@ final class ChatStreamCoordinator {
         return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
     }
 
+    /// Armed when a `.done` commits the terminal transition with the stream
+    /// finish deferred to the completing connection's own terminal event
+    /// (`.streamEnd`, `.cancelled`, or `.error`). The finishing event is
+    /// admitted by the generation fence and performs no transition work —
+    /// it only runs the deferred `finishStream()` exactly once, so the
+    /// stream client is not stopped before that event is delivered and a
+    /// `.done` without a trailing terminal event leaves the view-model
+    /// transcript-refresh flag untouched (Slice 2 regression guards).
+    private var pendingDeferredStreamFinish = false
+
     init(
         client: APIClient,
         streamClient: SSEStreamingClient,
@@ -198,6 +208,9 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
+        // A stale deferred finish from a previous run must never be consumed
+        // by this run's terminal events.
+        pendingDeferredStreamFinish = false
         let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
         activeStreamID = streamID
         isConnectionSuspended = false
@@ -562,10 +575,17 @@ final class ChatStreamCoordinator {
         case .done(let payload):
             let hasCompletedTranscript = delegate?.streamCoordinatorApplyDone(payload) == true
             if let identity = runIdentity {
+                // The `.done` commits the terminal transition but defers
+                // `finishStream()` to the completing connection's own terminal
+                // event: stopping the client here would drop that event before
+                // delivery, and finishing here would clear the view-model
+                // transcript-refresh flag a bare `.done` must leave visible
+                // (Slice 2 regression guards).
                 transitionToTerminal(
                     outcome: .completed,
                     identity: identity,
-                    needsTranscriptRefresh: !hasCompletedTranscript
+                    needsTranscriptRefresh: !hasCompletedTranscript,
+                    defersStreamFinish: true
                 )
             }
         case .approvalPending(let update):
@@ -584,14 +604,23 @@ final class ChatStreamCoordinator {
             // Server closed the stream: a terminal `.completed` candidate. A
             // late `.streamEnd` from the completing connection after
             // finalization is admitted by the fence but no-ops in the
-            // centralized transition (first outcome wins).
+            // centralized transition (first outcome wins). A bare `.streamEnd`
+            // (no `.done`) finishes the stream WITHOUT marking the response
+            // completed — the pre-#18 semantics the queued-message drain and
+            // title-refresh paths rely on.
             if let identity = runIdentity {
-                transitionToTerminal(outcome: .completed, identity: identity)
+                transitionToTerminal(
+                    outcome: .completed,
+                    identity: identity,
+                    marksResponseCompleted: false
+                )
             }
+            finishDeferredStreamIfPending()
         case .cancelled:
             if let identity = runIdentity {
                 transitionToTerminal(outcome: .cancelled, identity: identity)
             }
+            finishDeferredStreamIfPending()
         case .error(let message):
             // The failure message is surfaced only when THIS call commits the
             // transition — a late error after a cancelled/completed outcome is
@@ -600,6 +629,7 @@ final class ChatStreamCoordinator {
                transitionToTerminal(outcome: .failed, identity: identity) {
                 delegate?.streamCoordinatorDidReceiveErrorMessage(message)
             }
+            finishDeferredStreamIfPending()
         case .transportError(let message):
             handleTransportError(message)
         case .heartbeat:
@@ -728,17 +758,31 @@ final class ChatStreamCoordinator {
     /// — `.done`, `.streamEnd`, `.cancelled`, `.error`, and the explicit
     /// recovery/cancel finalize paths — funnels through here. The FIRST valid
     /// candidate for a run commits: Live Activity end, terminal delegate
-    /// callback, stream stop, snapshot removal, monitoring stop, and
-    /// coordinator cleanup all happen exactly once. Later candidates —
-    /// duplicate terminal events or terminal events from the completing
-    /// connection arriving after finalization — are no-ops.
+    /// callback, snapshot removal, monitoring stop, and coordinator cleanup
+    /// all happen exactly once. Later candidates — duplicate terminal events
+    /// or terminal events from the completing connection arriving after
+    /// finalization — are no-ops.
+    ///
+    /// `.completed` has two refinements preserving pre-#18 semantics:
+    /// - `marksResponseCompleted: false` (bare `.streamEnd`): finishes the
+    ///   stream without firing `streamCoordinatorDidCompleteCurrentResponse`
+    ///   or marking the response completed, so the queued-message drain and
+    ///   title refresh keep their legacy behavior.
+    /// - `defersStreamFinish: true` (`.done`): the terminal transition is
+    ///   committed but `finishStream()` waits for the completing connection's
+    ///   own terminal event, so the client is not stopped before that event
+    ///   is delivered and a `.done` with no trailing terminal event leaves
+    ///   the view-model transcript-refresh flag untouched.
+    ///
     /// Transport errors are NOT terminal candidates and never reach this
     /// transition. Returns whether this call committed.
     @discardableResult
     private func transitionToTerminal(
         outcome: ChatRunTerminalOutcome,
         identity: ChatRunIdentity,
-        needsTranscriptRefresh: Bool = true
+        needsTranscriptRefresh: Bool = true,
+        marksResponseCompleted: Bool = true,
+        defersStreamFinish: Bool = false
     ) -> Bool {
         guard runIdentity == identity else { return false }
 
@@ -747,10 +791,11 @@ final class ChatStreamCoordinator {
         // after finalization and must still pass the generation fence.
         completedRunIdentity = identity
         runGeneration &+= 1
+        pendingDeferredStreamFinish = defersStreamFinish
 
         switch outcome {
         case .completed:
-            if !hasCompletedCurrentResponse {
+            if marksResponseCompleted, !hasCompletedCurrentResponse {
                 hasCompletedCurrentResponse = true
                 delegate?.streamCoordinatorDidCompleteCurrentResponse(
                     needsTranscriptRefresh: needsTranscriptRefresh
@@ -769,7 +814,9 @@ final class ChatStreamCoordinator {
         lastEventID = nil
         liveTokensPerSecond = nil
         delegate?.streamCoordinatorStreamingAssistantMessageID = nil
-        finishStream()
+        if !defersStreamFinish {
+            finishStream()
+        }
         return true
     }
 
@@ -823,6 +870,13 @@ final class ChatStreamCoordinator {
                 needsTranscriptRefresh: false
             )
         } else {
+            // No active run identity (the run was reconciled to nil during the
+            // transcript load): the run still completed, so end the Live
+            // Activity and notify the response-completion observers exactly as
+            // the pre-#18 completion path did — a foreground-reconnect
+            // completion must never leave the Live Activity on "running".
+            liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
+            delegate?.streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: false)
             delegate?.streamCoordinatorRemoveSnapshot(streamID: completedStreamID)
             finishStream()
         }
@@ -863,7 +917,17 @@ final class ChatStreamCoordinator {
         }
     }
 
+    /// Runs the deferred `finishStream()` when the completing connection's own
+    /// terminal event arrives after a `.done` committed the transition. The
+    /// event performs no transition work (first outcome wins) but must still
+    /// finish the stream exactly once.
+    private func finishDeferredStreamIfPending() {
+        guard pendingDeferredStreamFinish else { return }
+        finishStream()
+    }
+
     private func finishStream() {
+        pendingDeferredStreamFinish = false
         runGeneration &+= 1
         let completedNormally = hasCompletedCurrentResponse
         let finishedStreamID = activeStreamID
