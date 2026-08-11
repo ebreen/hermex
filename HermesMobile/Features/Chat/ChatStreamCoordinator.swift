@@ -166,6 +166,9 @@ final class ChatStreamCoordinator {
     /// `.done` without a trailing terminal event leaves the view-model
     /// transcript-refresh flag untouched (Slice 2 regression guards).
     private var pendingDeferredStreamFinish = false
+    /// Set when the terminal transition already cleared auxiliary monitoring
+    /// (`.completed`), so the deferred `finishStream()` does not clear twice.
+    private var monitoringClearedAtTerminal = false
 
     init(
         client: APIClient,
@@ -803,7 +806,10 @@ final class ChatStreamCoordinator {
             }
             // The approval/clarification prompt is resolved by the completed
             // response even when the stream finish is deferred (pre-#18
-            // `.done` finished immediately and cleared the prompt here).
+            // `.done` finished immediately and cleared the prompt here). The
+            // deferred `finishStream()` skips its own clear when this flag is
+            // set, so the prompt clears exactly once.
+            monitoringClearedAtTerminal = true
             delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
             liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
         case .cancelled:
@@ -936,7 +942,10 @@ final class ChatStreamCoordinator {
         let completedNormally = hasCompletedCurrentResponse
         let finishedStreamID = activeStreamID
         streamClient.stop()
-        delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+        if !monitoringClearedAtTerminal {
+            delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+        }
+        monitoringClearedAtTerminal = false
         delegate?.streamCoordinatorFlushPinnedLocalNoticesToTranscript()
         delegate?.streamCoordinatorRemoveSnapshot(streamID: finishedStreamID)
         activeStreamID = nil
