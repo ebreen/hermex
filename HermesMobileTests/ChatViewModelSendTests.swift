@@ -10,6 +10,7 @@ final class ChatViewModelSendTests: XCTestCase {
     override func tearDown() {
         ChatViewModel.resetActiveStreamSnapshotsForTesting()
         MockURLProtocol.requestHandler = nil
+        GatedURLProtocol.asyncHandler = nil
         super.tearDown()
     }
 
@@ -7174,6 +7175,7 @@ final class ChatViewModelSendTests: XCTestCase {
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
         userDefaults: UserDefaults = .standard,
         modelCatalogCoordinator: ChatModelCatalogCoordinator? = nil,
+        client: APIClient? = nil,
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data)
     ) throws -> ChatViewModel {
         MockURLProtocol.requestHandler = handler
@@ -7182,7 +7184,7 @@ final class ChatViewModelSendTests: XCTestCase {
         configuration.protocolClasses = [MockURLProtocol.self]
         let urlSession = URLSession(configuration: configuration)
         let server = try XCTUnwrap(URL(string: "https://example.test"))
-        let client = APIClient(baseURL: server, session: urlSession)
+        let resolvedClient = client ?? APIClient(baseURL: server, session: urlSession)
         let summary: SessionSummary
         if let sessionSummary {
             summary = sessionSummary
@@ -7194,7 +7196,7 @@ final class ChatViewModelSendTests: XCTestCase {
         let viewModel = ChatViewModel(
             session: summary,
             server: server,
-            client: client,
+            client: resolvedClient,
             streamClient: resolvedStreamClient,
             approvalStreamClient: approvalStreamClient ?? SpySSEStreamingClient(),
             clarifyStreamClient: clarifyStreamClient ?? SpySSEStreamingClient(),
@@ -7581,6 +7583,91 @@ final class ChatViewModelSendTests: XCTestCase {
             file: file,
             line: line
         )
+    }
+
+    // MARK: - Slice 3 (#18): continuation-gated cross-layer cancellation
+
+    // A's cancelActiveStream() is held on a checked-continuation gate; the
+    // run is replaced (same stream ID, new logical generation); B's
+    // cancellation is gated separately. Releasing A's stale ok:true must
+    // yield a silent `false` — no error, no "Response cancelled" message, no
+    // success feedback — and must not publish over B's in-flight
+    // cancellation projection or the replacement's active UI snapshot.
+    @MainActor
+    func testStaleCancelAfterRunReplacementDoesNotPublishOverReplacementCancellation() async throws {
+        let gateA = CancelResponseGate()
+        let gateB = CancelResponseGate()
+        var cancelEntryCount = 0
+        let gatedSession: URLSession = {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GatedURLProtocol.self]
+            return URLSession(configuration: configuration)
+        }()
+        let server = try XCTUnwrap(URL(string: "https://example.test"))
+        let gatedClient = APIClient(baseURL: server, session: gatedSession)
+
+        GatedURLProtocol.asyncHandler = { request in
+            if request.url?.path == "/api/chat/cancel" {
+                cancelEntryCount += 1
+                if cancelEntryCount == 1 {
+                    await gateA.enter()
+                } else {
+                    await gateB.enter()
+                }
+            }
+            return apiTestJSONResponse(#"{"ok": true, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        let viewModel = try makeViewModel(
+            client: gatedClient,
+            handler: { apiTestJSONResponse("{}", for: $0) }
+        )
+
+        // Run A starts; its cancel request enters gate A.
+        let didStartA = await viewModel.sendMessage("First message")
+        XCTAssertTrue(didStartA)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-123")
+        let cancelTaskA = Task { await viewModel.cancelActiveStream() }
+        await gateA.waitForEntry()
+
+        // Replacement run B with the SAME stream ID: new logical generation.
+        let didStartB = await viewModel.sendMessage("Second message")
+        XCTAssertTrue(didStartB)
+        XCTAssertEqual(viewModel.activeStreamID, "stream-123")
+
+        // B's cancellation is gated separately and is in flight.
+        let cancelTaskB = Task { await viewModel.cancelActiveStream() }
+        await gateB.waitForEntry()
+        XCTAssertTrue(viewModel.isCancellingStream)
+        let snapshotBeforeRelease = try XCTUnwrap(viewModel.activeRunSnapshot)
+        XCTAssertTrue(snapshotBeforeRelease.isActive)
+        XCTAssertFalse(snapshotBeforeRelease.dismissed)
+
+        // Release A's stale success: silent false, nothing published over B.
+        gateA.release()
+        let aResult = await cancelTaskA.value
+        XCTAssertFalse(aResult)
+        XCTAssertTrue(viewModel.isCancellingStream)
+        XCTAssertNil(viewModel.lastError)
+        XCTAssertNil(viewModel.sendErrorMessage)
+        XCTAssertNil(viewModel.cancellationFeedbackTicket)
+        XCTAssertFalse(viewModel.messages.contains { $0.content == "Response cancelled" })
+        let snapshotAfterRelease = try XCTUnwrap(viewModel.activeRunSnapshot)
+        XCTAssertTrue(snapshotAfterRelease.isActive)
+        XCTAssertFalse(snapshotAfterRelease.dismissed)
+
+        // Release B's accepted cancel: true, one consumed terminal feedback
+        // ticket, one deduplicated stable "Response cancelled" message.
+        gateB.release()
+        let bResult = await cancelTaskB.value
+        XCTAssertTrue(bResult)
+        XCTAssertFalse(viewModel.isCancellingStream)
+        let ticket = try XCTUnwrap(viewModel.cancellationFeedbackTicket)
+        XCTAssertTrue(ticket.isConsumed)
+        XCTAssertFalse(ticket.consume())
+        let cancelledMessages = viewModel.messages.filter { $0.content == "Response cancelled" }
+        XCTAssertEqual(cancelledMessages.count, 1)
+        XCTAssertEqual(Set(cancelledMessages.compactMap(\.messageId)).count, 1)
     }
 }
 

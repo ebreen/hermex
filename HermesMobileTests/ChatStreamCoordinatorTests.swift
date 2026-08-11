@@ -656,41 +656,6 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     }
 
     @MainActor
-    func testCancelDoesNotFinishReplacementStreamWhenResponseReturnsLate() async throws {
-        let cancelRequestStarted = expectation(description: "cancel request started")
-        let releaseCancelResponse = DispatchSemaphore(value: 0)
-        let streamClient = CoordinatorSpySSEStreamingClient()
-        let liveActivityManager = CoordinatorSpyLiveActivityManager()
-        let delegate = CoordinatorDelegateSpy()
-        let coordinator = makeCoordinator(
-            streamClient: streamClient,
-            liveActivityManager: liveActivityManager,
-            delegate: delegate
-        ) { request in
-            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
-            cancelRequestStarted.fulfill()
-            _ = releaseCancelResponse.wait(timeout: .now() + 2)
-            return apiTestJSONResponse(#"{"ok": true}"#, for: request)
-        }
-
-        coordinator.start(streamID: "stream-cancel")
-        let cancelTask = Task { @MainActor in
-            try await coordinator.cancelActiveStream()
-        }
-
-        await fulfillment(of: [cancelRequestStarted], timeout: 1)
-        coordinator.start(streamID: "stream-new")
-        releaseCancelResponse.signal()
-        let response = try await cancelTask.value
-
-        XCTAssertEqual(response?.ok, true)
-        XCTAssertEqual(coordinator.activeStreamID, "stream-new")
-        XCTAssertEqual(streamClient.startedURLs.count, 2)
-        XCTAssertTrue(liveActivityManager.ends.isEmpty)
-        XCTAssertEqual(delegate.finishCount, 0)
-    }
-
-    @MainActor
     func testCompletionErrorAndCancelFinalizeLiveActivity() async throws {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let liveActivityManager = CoordinatorSpyLiveActivityManager()
@@ -732,8 +697,11 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
             sessionId: "session-abc"
         )))
         XCTAssertEqual(coordinator.liveTokensPerSecond, 24.5)
-        let response = try await coordinator.cancelActiveStream()
-        XCTAssertEqual(response?.ok, true)
+        let disposition = await coordinator.cancelActiveStream()
+        guard case .accepted = disposition else {
+            XCTFail("expected accepted cancel disposition, got \(disposition)")
+            return
+        }
         XCTAssertNil(coordinator.activeStreamID)
         XCTAssertNil(coordinator.liveTokensPerSecond)
         XCTAssertEqual(liveActivityManager.ends.last?.status, .cancelled)
@@ -1194,6 +1162,768 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertEqual(streamClient.stopCount, 1)
     }
 
+    // MARK: - Slice 3 (#18): cancellation and async generation gates
+
+    // A server-refused cancel response (explicit ok:false with a non-empty
+    // error) never transitions the current run: `.rejected`, still active,
+    // zero terminal/delegate/live-activity/cleanup mutation.
+    @MainActor
+    func testFailedCancelResponseLeavesRunActive() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            return apiTestJSONResponse(#"{"ok": false, "error": "busy"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let connectionIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+
+        let disposition = await coordinator.cancelActiveStream()
+        guard case .rejected = disposition else {
+            XCTFail("expected rejected disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, connectionIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 1
+        )
+    }
+
+    // A thrown cancel request from the CURRENT identity is `.thrown` (kept
+    // separate from a server rejection) and never transitions the run.
+    @MainActor
+    func testThrownCancelRequestLeavesRunActive() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            throw URLError(.timedOut)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let connectionIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+
+        let disposition = await coordinator.cancelActiveStream()
+        guard case .thrown = disposition else {
+            XCTFail("expected thrown disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, connectionIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 1
+        )
+    }
+
+    // A delayed SUCCESSFUL cancel from a superseded run (same stream ID, new
+    // logical generation) is `.stale`: the raw ok:true is never returned as a
+    // current success, and nothing — terminal, Live Activity, cleanup,
+    // replacement state — is touched. The replacement is asserted active
+    // BEFORE the gate release.
+    @MainActor
+    func testDelayedSuccessfulCancelSameIDNewGenerationReturnsStaleDisposition() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let oldIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        let cancelTask = Task { @MainActor in
+            await coordinator.cancelActiveStream()
+        }
+        await gate.waitForEntry()
+
+        // Replacement run with the SAME stream ID: only the logical
+        // generation changes.
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(replacementIdentity.streamID, oldIdentity.streamID)
+        XCTAssertEqual(replacementIdentity.logicalGeneration, oldIdentity.logicalGeneration + 1)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+
+        gate.responseJSON = #"{"ok": true, "stream_id": "stream-123"}"#
+        gate.release()
+        let disposition = await cancelTask.value
+        guard case .stale = disposition else {
+            XCTFail("expected stale disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 2
+        )
+    }
+
+    // Reconnect/replay keeps the logical identity and changes ONLY the
+    // connection generation; a delayed successful cancel from the old
+    // connection is still `.stale`.
+    @MainActor
+    func testDelayedSuccessfulCancelAfterConnectionGenerationReplacementReturnsStaleDisposition() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let oldIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        let cancelTask = Task { @MainActor in
+            await coordinator.cancelActiveStream()
+        }
+        await gate.waitForEntry()
+
+        // Reconnect/replay for the SAME logical run: the connection
+        // generation changes while the logical generation stays.
+        coordinator.start(streamID: "stream-123", replayAfterSeq: 4, recoveryState: .reconnecting)
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(replacementIdentity.streamID, oldIdentity.streamID)
+        XCTAssertEqual(replacementIdentity.logicalGeneration, oldIdentity.logicalGeneration)
+        XCTAssertEqual(replacementIdentity.connectionGeneration, oldIdentity.connectionGeneration + 1)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+
+        gate.responseJSON = #"{"ok": true, "stream_id": "stream-123"}"#
+        gate.release()
+        let disposition = await cancelTask.value
+        guard case .stale = disposition else {
+            XCTFail("expected stale disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 2
+        )
+    }
+
+    // A delayed REJECTED cancel (ok:false + error) from a superseded run is
+    // still `.stale` — the rejection must not surface as a current error.
+    @MainActor
+    func testDelayedRejectedCancelAfterReplacementReturnsStaleDispositionWithoutError() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let oldIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        let cancelTask = Task { @MainActor in
+            await coordinator.cancelActiveStream()
+        }
+        await gate.waitForEntry()
+
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+
+        gate.responseJSON = #"{"ok": false, "error": "busy"}"#
+        gate.release()
+        let disposition = await cancelTask.value
+        guard case .stale = disposition else {
+            XCTFail("expected stale disposition, got \(disposition)")
+            return
+        }
+
+        // The stale rejection surfaces no error at all.
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertTrue(delegate.recoveryErrors.isEmpty)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 2
+        )
+    }
+
+    // A delayed THROWN cancel from a superseded run is `.stale` too: the
+    // throw is swallowed, never published as a current error.
+    @MainActor
+    func testDelayedThrownCancelAfterReplacementReturnsStaleDispositionWithoutError() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let oldIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        let cancelTask = Task { @MainActor in
+            await coordinator.cancelActiveStream()
+        }
+        await gate.waitForEntry()
+
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+
+        gate.thrownError = URLError(.timedOut)
+        gate.release()
+        let disposition = await cancelTask.value
+        guard case .stale = disposition else {
+            XCTFail("expected stale disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertTrue(delegate.recoveryErrors.isEmpty)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        assertNoCancellationMutation(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            expectedStartedURLCount: 2
+        )
+    }
+
+    // Two overlapping cancellations: A's request is gated, B replaces the run
+    // and cancels the CURRENT identity (accepted). A's stale cleanup must not
+    // clear B's committed terminal state or re-run any cleanup.
+    @MainActor
+    func testOverlappingCancellationAStaleCleanupDoesNotClearCurrentBState() async throws {
+        let gate = CancelResponseGate()
+        var cancelEntryCount = 0
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            cancelEntryCount += 1
+            if cancelEntryCount == 1 {
+                await gate.enter()
+            }
+            return apiTestJSONResponse(#"{"ok": true, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let cancelTaskA = Task { @MainActor in
+            await coordinator.cancelActiveStream()
+        }
+        await gate.waitForEntry()
+
+        // Replacement run B with the SAME stream ID: A's cancel is now stale.
+        coordinator.start(streamID: "stream-123")
+        let connectionIdentityB = try XCTUnwrap(coordinator.runConnectionIdentity)
+        let runIdentityB = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+
+        // B's cancellation is CURRENT: accepted, transitions B exactly once.
+        let dispositionB = await coordinator.cancelActiveStream()
+        guard case .accepted = dispositionB else {
+            XCTFail("expected accepted disposition for B, got \(dispositionB)")
+            return
+        }
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: runIdentityB, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.map(\.status), [.cancelled])
+        XCTAssertEqual(delegate.finishCount, 1)
+
+        // Release A's stale success: it must not clear B's committed state or
+        // re-run any cleanup.
+        gate.release()
+        let dispositionA = await cancelTaskA.value
+        guard case .stale = dispositionA else {
+            XCTFail("expected stale disposition for A, got \(dispositionA)")
+            return
+        }
+        XCTAssertEqual(delegate.terminalTransitions.count, 1)
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.count, 1)
+        XCTAssertEqual(delegate.removedSnapshotStreamIDs.count, 1)
+        XCTAssertEqual(delegate.stopMonitoringClearPromptValues.count, 1)
+        XCTAssertEqual(streamClient.stopCount, 1)
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertNotEqual(coordinator.runConnectionIdentity, connectionIdentityB)
+    }
+
+    // Current-identity accepted cancel: `.accepted(ticket)`, one centralized
+    // terminal transition, one terminal event, one valid ticket consume, and
+    // no duplicate when the terminal callback is replayed.
+    @MainActor
+    func testSuccessfulCancelCurrentIdentityReturnsAcceptedDisposition() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            return apiTestJSONResponse(#"{"ok": true, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+        let connectionIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+
+        let disposition = await coordinator.cancelActiveStream()
+        guard case .accepted(let ticket) = disposition else {
+            XCTFail("expected accepted disposition, got \(disposition)")
+            return
+        }
+
+        // The ticket is bound to the exact connection identity that accepted.
+        XCTAssertEqual(ticket.identity, connectionIdentity)
+        XCTAssertFalse(ticket.messageID.isEmpty)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.map(\.status), [.cancelled])
+        XCTAssertNil(coordinator.activeStreamID)
+
+        // One valid ticket consume; a second consume is refused.
+        XCTAssertTrue(ticket.consume())
+        XCTAssertFalse(ticket.consume())
+        XCTAssertTrue(ticket.isConsumed)
+
+        // Replaying the completing connection's own terminal callback cannot
+        // commit a second transition or finish twice.
+        streamClient.emit(.cancelled, fromConnection: 0)
+        XCTAssertEqual(delegate.terminalTransitions.count, 1)
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.count, 1)
+        XCTAssertEqual(streamClient.stopCount, 1)
+    }
+
+    // Envelope precedence matrix: stream identity mismatch ⇒ stale; trimmed
+    // non-empty error ⇒ rejected; explicit ok:false ⇒ rejected; ok:true ⇒
+    // accepted; nil/nil ⇒ unconfirmed. Contradictory booleans resolve by the
+    // same precedence.
+    @MainActor
+    func testChatCancelResponseEnvelopeMatrixUsesStreamIdentityErrorAndBooleanPrecedence() async throws {
+        let envelopes: [(json: String, expected: ExpectedCancelDisposition)] = [
+            (#"{"ok": true}"#, .accepted),
+            (#"{"ok": true, "stream_id": "stream-123"}"#, .accepted),
+            (#"{"ok": false}"#, .rejected),
+            (#"{"ok": false, "error": "busy"}"#, .rejected),
+            (#"{"ok": true, "error": "boom"}"#, .rejected),
+            (#"{"ok": true, "error": "  "}"#, .accepted),
+            (#"{}"#, .unconfirmed),
+            (#"{"error": ""}"#, .unconfirmed),
+            (#"{"ok": true, "stream_id": "stream-other"}"#, .stale),
+            (#"{"ok": false, "stream_id": "stream-other", "error": "busy"}"#, .stale),
+        ]
+
+        for envelope in envelopes {
+            let streamClient = CoordinatorSpySSEStreamingClient()
+            let liveActivityManager = CoordinatorSpyLiveActivityManager()
+            let delegate = CoordinatorDelegateSpy()
+            let coordinator = makeCoordinator(
+                streamClient: streamClient,
+                liveActivityManager: liveActivityManager,
+                delegate: delegate
+            ) { request in
+                XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+                return apiTestJSONResponse(envelope.json, for: request)
+            }
+
+            coordinator.start(streamID: "stream-123")
+            let disposition = await coordinator.cancelActiveStream()
+            assertDisposition(disposition, matches: envelope.expected)
+
+            switch envelope.expected {
+            case .accepted:
+                XCTAssertNil(coordinator.activeStreamID)
+                XCTAssertEqual(delegate.terminalTransitions.map(\.outcome), [.cancelled])
+                XCTAssertEqual(delegate.terminalEventCount, 1)
+                XCTAssertEqual(liveActivityManager.ends.map(\.status), [.cancelled])
+            case .stale, .rejected, .unconfirmed:
+                XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+                XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+                XCTAssertEqual(delegate.terminalEventCount, 0)
+                XCTAssertTrue(liveActivityManager.ends.isEmpty)
+                XCTAssertEqual(delegate.finishCount, 0)
+            }
+        }
+    }
+
+    // The surfaced rejection error is trimmed; whitespace-only or nil/nil
+    // envelopes stay `.unconfirmed` and never transition the run.
+    @MainActor
+    func testChatCancelResponseTrimsNonEmptyErrorAndPreservesNilNilUnconfirmed() async throws {
+        var envelopeIndex = 0
+        let envelopes = [
+            #"{"ok": false, "error": "  busy  "}"#,
+            #"{"error": "   "}"#,
+            #"{}"#,
+        ]
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            let json = envelopes[envelopeIndex]
+            envelopeIndex += 1
+            return apiTestJSONResponse(json, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        let rejected = await coordinator.cancelActiveStream()
+        guard case .rejected(let response) = rejected else {
+            XCTFail("expected rejected disposition, got \(rejected)")
+            return
+        }
+        XCTAssertEqual(response.error, "busy")
+
+        let whitespaceOnly = await coordinator.cancelActiveStream()
+        assertDisposition(whitespaceOnly, matches: .unconfirmed)
+
+        let nilNil = await coordinator.cancelActiveStream()
+        assertDisposition(nilNil, matches: .unconfirmed)
+
+        // Nil/nil unconfirmed never transitions: the run stays active.
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runIdentity, identity)
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+        XCTAssertEqual(delegate.terminalEventCount, 0)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertEqual(delegate.finishCount, 0)
+        XCTAssertEqual(streamClient.stopCount, 0)
+    }
+
+    // Accepted current-identity cancel transitions once; the completing
+    // connection's replayed `.cancelled` and a late `.error` both dedupe.
+    @MainActor
+    func testAcceptedCancelTransitionsOnceAndDedupesCancelledEvent() async throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/cancel")
+            return apiTestJSONResponse(#"{"ok": true, "stream_id": "stream-123"}"#, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        let disposition = await coordinator.cancelActiveStream()
+        guard case .accepted = disposition else {
+            XCTFail("expected accepted disposition, got \(disposition)")
+            return
+        }
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.map(\.status), [.cancelled])
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertEqual(streamClient.stopCount, 1)
+        XCTAssertEqual(delegate.removedSnapshotStreamIDs.count, 1)
+        XCTAssertEqual(delegate.stopMonitoringClearPromptValues.count, 1)
+
+        // The completing connection's own terminal callbacks replay after
+        // finalization: `.cancelled` then a late `.error` must both dedupe.
+        streamClient.emit(.cancelled, fromConnection: 0)
+        streamClient.emit(.error("late failure"), fromConnection: 0)
+
+        XCTAssertEqual(delegate.terminalTransitions.count, 1)
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.count, 1)
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // The post-recovery-load gate bails when the run was replaced during the
+    // transcript load: the replay replacement (connection-generation change)
+    // is neither finalized nor clobbered by the stale recovery path.
+    @MainActor
+    func testRecoveryLoadGateBailsAfterGenerationReplacement() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = true
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            timing: ChatStreamCoordinatorTiming(
+                checkingInterval: 5,
+                reconnectInterval: 18,
+                runningToolReconnectInterval: 25,
+                statusPollCooldown: 4,
+                transportFreshInterval: 12
+            )
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let oldIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        // A replay replacement happens DURING the transcript load, so the
+        // connection generation changes while the logical run stays the same.
+        delegate.onLoadMessages = {
+            coordinator.start(streamID: "stream-123", replayAfterSeq: 4, recoveryState: .reconnecting)
+        }
+        let start = Date(timeIntervalSince1970: 1_770_000_000)
+        coordinator.markProgress(now: start)
+
+        let recoveryTask = Task { @MainActor in
+            await coordinator.recoverStaleStreamIfNeeded(now: start.addingTimeInterval(12.1))
+        }
+        await gate.waitForEntry()
+        gate.responseJSON = #"{"active": false, "stream_id": "stream-123"}"#
+        gate.release()
+        await recoveryTask.value
+
+        // The post-load gate bailed: the replacement stays active and nothing
+        // was finalized or ended.
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        XCTAssertNotEqual(replacementIdentity, oldIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+        XCTAssertEqual(delegate.terminalEventCount, 0)
+        XCTAssertEqual(delegate.finishCount, 0)
+        XCTAssertTrue(delegate.completedNeedsTranscriptRefreshValues.isEmpty)
+    }
+
+    // A delayed status response for a superseded run cannot restart the
+    // replacement: no third connection, no stop, no terminal mutation.
+    @MainActor
+    func testDelayedStatusResponseCannotRestartReplacementRun() async throws {
+        let gate = CancelResponseGate()
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeGatedCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate,
+            timing: ChatStreamCoordinatorTiming(
+                checkingInterval: 5,
+                reconnectInterval: 18,
+                runningToolReconnectInterval: 25,
+                statusPollCooldown: 4,
+                transportFreshInterval: 12
+            )
+        ) { request in
+            XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
+            await gate.enter()
+            if let error = gate.thrownError {
+                throw error
+            }
+            return apiTestJSONResponse(gate.responseJSON, for: request)
+        }
+
+        coordinator.start(streamID: "stream-123")
+        let start = Date(timeIntervalSince1970: 1_770_000_000)
+        coordinator.markProgress(now: start)
+
+        let recoveryTask = Task { @MainActor in
+            await coordinator.recoverStaleStreamIfNeeded(now: start.addingTimeInterval(12.1))
+        }
+        await gate.waitForEntry()
+
+        // Replacement run (same stream ID, new logical generation) while the
+        // status poll is suspended.
+        coordinator.start(streamID: "stream-123")
+        let replacementIdentity = try XCTUnwrap(coordinator.runConnectionIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+
+        gate.responseJSON = #"{"active": true, "stream_id": "stream-123", "replay_available": true}"#
+        gate.release()
+        await recoveryTask.value
+
+        // The delayed response must not restart or reconnect the replacement.
+        XCTAssertEqual(streamClient.startedURLs.count, 2)
+        XCTAssertEqual(streamClient.stopCount, 0)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runConnectionIdentity, replacementIdentity)
+        XCTAssertNotEqual(coordinator.recoveryState, .reconnecting)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+        XCTAssertEqual(delegate.terminalEventCount, 0)
+        XCTAssertEqual(delegate.finishCount, 0)
+    }
+
+    private func assertDisposition(
+        _ disposition: ChatCancelDisposition,
+        matches expected: ExpectedCancelDisposition,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let matches: Bool
+        switch (disposition, expected) {
+        case (.accepted, .accepted), (.stale, .stale), (.rejected, .rejected), (.unconfirmed, .unconfirmed):
+            matches = true
+        default:
+            matches = false
+        }
+        XCTAssertTrue(matches, "expected \(expected) disposition, got \(disposition)", file: file, line: line)
+    }
+
+    private func assertNoCancellationMutation(
+        streamClient: CoordinatorSpySSEStreamingClient,
+        liveActivityManager: CoordinatorSpyLiveActivityManager,
+        delegate: CoordinatorDelegateSpy,
+        expectedStartedURLCount: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(streamClient.startedURLs.count, expectedStartedURLCount, file: file, line: line)
+        XCTAssertEqual(streamClient.stopCount, 0, file: file, line: line)
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty, file: file, line: line)
+        XCTAssertEqual(delegate.terminalEventCount, 0, file: file, line: line)
+        XCTAssertEqual(delegate.finishCount, 0, file: file, line: line)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty, file: file, line: line)
+        XCTAssertTrue(delegate.errorMessages.isEmpty, file: file, line: line)
+        XCTAssertTrue(delegate.recoveryErrors.isEmpty, file: file, line: line)
+        XCTAssertTrue(delegate.removedSnapshotStreamIDs.isEmpty, file: file, line: line)
+        XCTAssertTrue(delegate.stopMonitoringClearPromptValues.isEmpty, file: file, line: line)
+    }
+
+    override func tearDown() {
+        GatedURLProtocol.asyncHandler = nil
+        super.tearDown()
+    }
+
+    @MainActor
+    private func makeGatedCoordinator(
+        streamClient: CoordinatorSpySSEStreamingClient? = nil,
+        liveActivityManager: CoordinatorSpyLiveActivityManager? = nil,
+        delegate: CoordinatorDelegateSpy? = nil,
+        timing: ChatStreamCoordinatorTiming = .standard,
+        handler: @escaping @MainActor (URLRequest) async throws -> (HTTPURLResponse, Data)
+    ) -> ChatStreamCoordinator {
+        GatedURLProtocol.asyncHandler = handler
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatedURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = APIClient(baseURL: URL(string: "https://example.test")!, session: session)
+
+        let streamClient = streamClient ?? CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = liveActivityManager ?? CoordinatorSpyLiveActivityManager()
+        let delegate = delegate ?? CoordinatorDelegateSpy()
+        let coordinator = ChatStreamCoordinator(
+            client: client,
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            showsLiveActivityResponseExcerpts: false,
+            timing: timing
+        )
+        coordinator.attach(delegate: delegate)
+        return coordinator
+    }
+
     @MainActor
     private func makeCoordinator(
         streamClient: CoordinatorSpySSEStreamingClient? = nil,
@@ -1478,4 +2208,87 @@ private final class CoordinatorSpyLiveActivityManager: AgentLiveActivityManaging
     func end(status: AgentRunActivityStatus, activity: String, errorSummary: String?) {
         ends.append(End(status: status, activity: activity, errorSummary: errorSummary))
     }
+}
+
+private enum ExpectedCancelDisposition {
+    case accepted
+    case stale
+    case rejected
+    case unconfirmed
+}
+
+// MARK: - Slice 3 (#18): continuation-gated HTTP mock
+
+/// Checked-continuation gate for one HTTP request (#18 Slice 3). The mock
+/// handler awaits `enter()` after recording entry; the test observes entry
+/// with `waitForEntry()` and resumes the request with `release()`. The
+/// released outcome (ok response, rejection, or thrown error) is configured
+/// on the gate BEFORE `release()`, so every delayed-result variant is
+/// deterministic. No sleeps, polling, or semaphores establish ordering.
+@MainActor
+final class CancelResponseGate {
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var enteredCount = 0
+
+    /// JSON body returned after release (default: an accepted cancel).
+    var responseJSON = #"{"ok": true}"#
+
+    /// When set, the handler throws this error after release instead of
+    /// returning `responseJSON`.
+    var thrownError: Error?
+
+    func enter() async {
+        enteredCount += 1
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitForEntry() async {
+        guard enteredCount == 0 else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+/// URLProtocol test double whose handler is async and continuation-gated:
+/// `startLoading` runs the handler on the main actor so it can `await` a
+/// `CancelResponseGate`; the response is produced only after the test calls
+/// `gate.release()`. Deterministic replacement for the old semaphore-blocked
+/// sync handler (#18 Slice 3).
+final class GatedURLProtocol: URLProtocol {
+    static var asyncHandler: (@MainActor (URLRequest) async throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let asyncHandler = Self.asyncHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let client = self.client
+        let request = self.request
+        Task { @MainActor in
+            do {
+                let (response, data) = try await asyncHandler(request)
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: data)
+                client?.urlProtocolDidFinishLoading(self)
+            } catch {
+                client?.urlProtocol(self, didFailWithError: error)
+            }
+        }
+    }
+
+    override func stopLoading() {}
 }
