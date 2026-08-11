@@ -12,21 +12,7 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
             case "/api/profiles":
                 return apiTestJSONResponse("""
                 {
-                  "active": "default",
-                  "profiles": [
-                    {"name": "default", "model": "gpt-5.4", "provider": "openai", "is_default": true},
-                    {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter"}
-                  ]
-                }
-                """, for: request)
-            case "/api/profile/switch":
-                let body = try apiTestJSONBody(from: request)
-                XCTAssertEqual(body["name"] as? String, "work")
-                return apiTestJSONResponse("""
-                {
                   "active": "work",
-                  "default_model": "\(openRouterModel)",
-                  "default_workspace": "/tmp/workspace",
                   "profiles": [
                     {"name": "default", "model": "gpt-5.4", "provider": "openai", "is_default": true},
                     {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter", "is_active": true}
@@ -46,6 +32,13 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
                       ]
                     }
                   ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [{"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}]
                 }
                 """, for: request)
             case "/api/reasoning":
@@ -76,10 +69,10 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         XCTAssertNil(result.state.supportsReasoningEffort)
         XCTAssertEqual(result.state.workspaceSuggestions, ["/tmp/workspace"])
         XCTAssertEqual(result.state.agentCommands.map(\.name), ["status"])
-        XCTAssertEqual(requestPaths, [
-            "/api/profiles",
-            "/api/profile/switch",
-            "/api/models",
+        XCTAssertEqual(requestPaths.count, 6)
+        XCTAssertEqual(requestPaths.first, "/api/profiles")
+        XCTAssertEqual(Set(requestPaths.dropFirst().prefix(2)), Set(["/api/models", "/api/models/live"]))
+        XCTAssertEqual(Array(requestPaths.suffix(3)), [
             "/api/reasoning",
             "/api/workspaces",
             "/api/commands"
@@ -117,6 +110,13 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
                       "models": [{"id": "\(sessionModel)", "name": "GPT 5.5"}]
                     }
                   ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [{"id": "\(profileDefault)", "name": "DeepSeek Chat v3 Free"}]
                 }
                 """, for: request)
             case "/api/reasoning":
@@ -189,6 +189,8 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
                     headerFields: ["Content-Type": "application/json"]
                 )
                 return (try XCTUnwrap(response), Data(#"{"error":"models unavailable"}"#.utf8))
+            case "/api/models/live":
+                return apiTestJSONResponse(#"{"provider": "openai", "models": []}"#, for: request)
             case "/api/commands":
                 return apiTestJSONResponse(#"{"commands": [{"name": "status"}]}"#, for: request)
             default:
@@ -207,7 +209,10 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         XCTAssertEqual(result.state.currentModel, "gpt-5.4")
         XCTAssertNil(result.state.currentModelProvider)
         XCTAssertEqual(result.state.agentCommands.map(\.name), ["status"])
-        XCTAssertEqual(requestPaths, ["/api/profiles", "/api/models", "/api/commands"])
+        XCTAssertEqual(requestPaths.first, "/api/profiles")
+        XCTAssertEqual(requestPaths.filter { $0 == "/api/models" }.count, 1)
+        XCTAssertEqual(requestPaths.filter { $0 == "/api/models/live" }.count, 1)
+        XCTAssertEqual(requestPaths.filter { $0 == "/api/commands" }.count, 1)
     }
 
     func testLoadStoresSingleProfileModeFromProfilesResponse() async throws {
@@ -225,6 +230,8 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
                 """, for: request)
             case "/api/models":
                 return apiTestJSONResponse(#"{"default_model": "gpt-5.4", "groups": []}"#, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse(#"{"provider": "openai", "models": []}"#, for: request)
             case "/api/reasoning":
                 return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
             case "/api/workspaces":

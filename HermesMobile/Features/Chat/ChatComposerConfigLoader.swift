@@ -71,111 +71,73 @@ struct ChatComposerConfigLoader {
         var selectedProfile: ProfileSummary?
         let operationID = UUID()
         let operationGeneration: UInt64 = 1
-
-        // The coordinator-backed initializer consumes the ordered
-        // `modelCatalogStream`; this direct compatibility-free path uses the
-        // same Networking-owned Sendable projections when no coordinator is
-        // injected (legacy callers still retain their request ordering).
         let requestedProfile = Self.nonEmpty(state.currentProfile)
-        var catalogResult: CatalogSnapshotResult?
 
-        if let requestedProfile {
-            let profileSnapshot = await client.profileContextSnapshot(
-                operationID: operationID,
-                operationGeneration: operationGeneration
+        // This compatibility initializer is retained for callers that do not
+        // inject the Chat coordinator. It still consumes the same neutral,
+        // coordinator-backed operation as the ordered `modelCatalogStream`:
+        // profile verification, base/live reads, and terminal fencing are owned
+        // by Networking. The loader never switches profiles or decodes legacy
+        // profile/catalog DTOs itself.
+        let catalogResult = await client.modelCatalogSnapshot(
+            requestedProfile: requestedProfile,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+
+        // Do not apply a snapshot after cancellation, an operation mismatch, or
+        // an authoritative gate-epoch change. This is the snapshot equivalent
+        // of the coordinator's accepts(metadata) check before MainActor apply.
+        guard !Task.isCancelled,
+              catalogResult.metadata.operationID == operationID,
+              catalogResult.metadata.operationGeneration == operationGeneration,
+              await client.acceptsCatalogSnapshot(catalogResult)
+        else {
+            configurationError = NSError(
+                domain: "ChatComposerConfigLoader",
+                code: ChatComposerConfigFailure.catalogUnavailable.code,
+                userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription]
             )
-            guard await client.acceptsCatalogMetadata(profileSnapshot.metadata) else {
-                configurationError = NSError(
-                    domain: "ChatComposerConfigLoader",
-                    code: ChatComposerConfigFailure.profileUnavailable.code,
-                    userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileUnavailable.localizedDescription]
-                )
-                return await finishDirectLoad(
-                    state: state,
-                    configurationError: configurationError,
-                    client: client
-                )
-            }
-
-            state.profileOptions = profileSnapshot.profiles
-            state.isSingleProfileMode = profileSnapshot.singleProfileMode
-            state.selectedProfileName = requestedProfile
-            selectedProfile = Self.profileSummary(matching: requestedProfile, in: state.profileOptions)
-            if state.currentModel == nil {
-                state.currentModel = Self.nonEmpty(selectedProfile?.model)
-            }
-
-            if profileSnapshot.activeProfile != requestedProfile {
-                do {
-                    let switchResponse = try await client.switchProfile(name: requestedProfile)
-                    state.profileOptions = switchResponse.profiles ?? state.profileOptions
-                    state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? requestedProfile
-                    state.currentProfile = state.selectedProfileName
-                    if state.currentWorkspace == nil {
-                        state.currentWorkspace = Self.nonEmpty(switchResponse.defaultWorkspace)
-                    }
-                    if state.currentModel == nil {
-                        state.currentModel = Self.nonEmpty(switchResponse.defaultModel)
-                    }
-                } catch {
-                    configurationError = error
-                }
-            }
-
-            if configurationError == nil {
-                catalogResult = await client.modelCatalogBaseOnlySnapshot(
-                    operationID: operationID,
-                    operationGeneration: operationGeneration,
-                    activeProfile: state.selectedProfileName
-                )
-            }
-        } else {
-            catalogResult = await client.modelCatalogBaseSnapshot(
-                requestedProfile: nil,
-                operationID: operationID,
-                operationGeneration: operationGeneration
+            return await finishDirectLoad(
+                state: state,
+                configurationError: configurationError,
+                client: client
             )
         }
 
-        if let catalogResult {
-            if !(await client.acceptsCatalogSnapshot(catalogResult)) {
-                configurationError = NSError(
-                    domain: "ChatComposerConfigLoader",
-                    code: ChatComposerConfigFailure.catalogUnavailable.code,
-                    userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription]
-                )
+        if let context = catalogResult.context {
+            state.profileOptions = context.profiles
+            state.isSingleProfileMode = context.singleProfileMode
+            state.selectedProfileName = Self.nonEmpty(context.activeProfile)
+                ?? context.requestedProfile
+            state.currentProfile = state.selectedProfileName
+            selectedProfile = Self.profileSummary(
+                matching: state.selectedProfileName,
+                in: state.profileOptions
+            )
+            if state.currentWorkspace == nil {
+                state.currentWorkspace = Self.nonEmpty(context.defaults.workspace)
             }
+            if state.currentModel == nil {
+                state.currentModel = Self.nonEmpty(context.defaults.model)
+                    ?? Self.nonEmpty(selectedProfile?.model)
+            }
+        }
 
-            if configurationError == nil, let context = catalogResult.context {
-                state.profileOptions = context.profiles
-                state.isSingleProfileMode = context.singleProfileMode
-                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                    ?? Self.nonEmpty(context.activeProfile)
-                    ?? context.requestedProfile
-                selectedProfile = Self.profileSummary(
-                    matching: state.selectedProfileName,
-                    in: state.profileOptions
-                )
-                if state.currentModel == nil {
-                    state.currentModel = Self.nonEmpty(selectedProfile?.model)
-                }
+        if let base = catalogResult.base {
+            state.modelCatalogGroups = base.groups
+            if state.currentModel == nil {
+                state.currentModel = base.defaultModel
             }
-
-            if configurationError == nil, let base = catalogResult.base {
-                state.modelCatalogGroups = base.groups
-                if state.currentModel == nil {
-                    state.currentModel = base.defaultModel
-                }
-                if Self.nonEmpty(state.currentModelProvider) == nil {
-                    state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
-                        ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
-                }
-                if let failure = catalogResult.failure {
-                    configurationError = Self.error(for: failure)
-                }
-            } else if configurationError == nil {
-                configurationError = Self.error(for: catalogResult.failure ?? .transport)
+            if Self.nonEmpty(state.currentModelProvider) == nil {
+                state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
+                    ?? Self.nonEmpty(base.activeProvider)
+                    ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
             }
+            // A live failure is non-terminal when a usable base was accepted.
+            // Preserve the cache-first/base-success behavior of the coordinator.
+        } else {
+            configurationError = Self.error(for: catalogResult.failure ?? .transport)
         }
 
         if configurationError == nil {
@@ -229,7 +191,7 @@ struct ChatComposerConfigLoader {
 
     private static func error(for failure: CatalogFailureCategory) -> Error {
         switch failure {
-        case .profileUnavailable, .unknownContext:
+        case .profileUnavailable, .profileMismatch, .unknownContext:
             return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileUnavailable.localizedDescription])
         case .profileSwitchRejected:
             return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileSwitchRejected.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileSwitchRejected.localizedDescription])
@@ -329,8 +291,7 @@ struct ChatComposerConfigLoader {
             case let .contextVerified(_, context):
                 sawContextVerified = true
                 state.profileOptions = context.profiles
-                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                    ?? Self.nonEmpty(context.activeProfile)
+                state.selectedProfileName = Self.nonEmpty(context.activeProfile)
                     ?? context.requestedProfile
                 state.isSingleProfileMode = context.singleProfileMode
                 state.currentProfile = state.selectedProfileName
