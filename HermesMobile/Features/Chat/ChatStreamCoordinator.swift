@@ -48,6 +48,73 @@ enum ChatRunTerminalOutcome: Equatable {
     case failed
 }
 
+/// Identity of one connection of a chat run: the logical run identity plus
+/// the connection generation. A replay/reconnect start keeps the logical
+/// generation and bumps only the connection generation; a replacement run
+/// bumps both (#18 Slice 3).
+struct ChatRunConnectionIdentity: Equatable, Sendable {
+    let streamID: String
+    let logicalGeneration: Int
+    let connectionGeneration: Int
+}
+
+/// Exactly-once cancellation acceptance ticket (#18 Slice 3): the accepted
+/// cancel's connection identity and a stable message ID. Reference type so
+/// the consuming boundary (view model / feedback helper) and the
+/// coordinator share the consumed state; all mutation happens on the main
+/// actor.
+final class ChatCancellationTicket: @unchecked Sendable {
+    let identity: ChatRunConnectionIdentity
+    let messageID: String
+    private(set) var isConsumed = false
+
+    init(identity: ChatRunConnectionIdentity, messageID: String) {
+        self.identity = identity
+        self.messageID = messageID
+    }
+
+    /// Consumes the ticket exactly once: the first call returns true, every
+    /// later call returns false.
+    @discardableResult
+    func consume() -> Bool {
+        guard !isConsumed else { return false }
+        isConsumed = true
+        return true
+    }
+}
+
+/// Outcome of a cancel request, resolved against the run identity captured
+/// before the request was sent (#18 Slice 3). A superseded request (the run
+/// was replaced or finalized while the request was in flight) is `.stale`
+/// regardless of the server's response: it must never surface as a current
+/// success, rejection, or error.
+enum ChatCancelDisposition: Equatable, Sendable {
+    case accepted(ChatCancellationTicket)
+    case stale
+    case rejected(ChatCancelResponse)
+    case thrown(Error)
+    case unconfirmed
+
+    static func == (lhs: ChatCancelDisposition, rhs: ChatCancelDisposition) -> Bool {
+        switch (lhs, rhs) {
+        case (.accepted(let lhsTicket), .accepted(let rhsTicket)):
+            return lhsTicket === rhsTicket
+        case (.stale, .stale):
+            return true
+        case (.rejected(let lhsResponse), .rejected(let rhsResponse)):
+            return lhsResponse == rhsResponse
+        case (.thrown(let lhsError), .thrown(let rhsError)):
+            return String(reflecting: lhsError) == String(reflecting: rhsError)
+        case (.unconfirmed, .unconfirmed):
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+extension ChatCancelResponse: Sendable {}
+
 @MainActor
 protocol ChatStreamCoordinatorDelegate: AnyObject {
     var streamCoordinatorSessionID: String? { get }
@@ -138,6 +205,13 @@ final class ChatStreamCoordinator {
     // double-finalized (PR #266 review #2).
     private var runGeneration = 0
 
+    // Connection-scoped identity counters (#18 Slice 3). The logical run
+    // generation bumps when a NEW logical run starts; the connection
+    // generation bumps on every connection — a replay/reconnect start keeps
+    // the logical generation and changes only the connection generation.
+    private var logicalRunGeneration = 0
+    private var connectionGeneration = 0
+
     /// Identity of the run finalized by an accepted `.done` (or a transcript
     /// refresh). The completing connection's own terminal events arrive AFTER
     /// finalization — when `runIdentity` is already nil — and must still pass
@@ -155,6 +229,19 @@ final class ChatStreamCoordinator {
     var runIdentity: ChatRunIdentity? {
         guard let activeStreamID else { return nil }
         return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
+    }
+
+    /// The current connection-scoped run identity, or nil while no run is
+    /// active. Adds the connection generation to `runIdentity` so a delayed
+    /// cancel result can distinguish a superseded connection from the
+    /// current one (#18 Slice 3).
+    var runConnectionIdentity: ChatRunConnectionIdentity? {
+        guard let activeStreamID else { return nil }
+        return ChatRunConnectionIdentity(
+            streamID: activeStreamID,
+            logicalGeneration: logicalRunGeneration,
+            connectionGeneration: connectionGeneration
+        )
     }
 
     /// Armed when a `.done` commits the terminal transition with the stream
@@ -211,6 +298,10 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
+        connectionGeneration &+= 1
+        if replayAfterSeq == nil {
+            logicalRunGeneration &+= 1
+        }
         // A stale deferred finish from a previous run must never be consumed
         // by this run's terminal events.
         pendingDeferredStreamFinish = false
@@ -257,12 +348,56 @@ final class ChatStreamCoordinator {
         delegate?.streamCoordinatorStartAuxiliaryMonitoring()
     }
 
-    func cancelActiveStream() async throws -> ChatCancelResponse? {
-        guard let activeStreamID else { return nil }
+    func cancelActiveStream() async -> ChatCancelDisposition {
+        guard let activeStreamID,
+              let connectionIdentity = runConnectionIdentity
+        else {
+            return .unconfirmed
+        }
+        let streamID = activeStreamID
 
-        let response = try await client.cancelChat(streamID: activeStreamID)
-        guard self.activeStreamID == activeStreamID else { return response }
-        guard response.ok != false else { return response }
+        let response: ChatCancelResponse
+        do {
+            response = try await client.cancelChat(streamID: streamID)
+        } catch {
+            // A superseded request's failure is swallowed as stale: only the
+            // current identity's transport failure is a real `.thrown` error.
+            guard isCurrentConnection(streamID: streamID, identity: connectionIdentity) else {
+                return .stale
+            }
+            return .thrown(error)
+        }
+
+        // Generation gate (#18 Slice 3): the run was replaced or finalized
+        // while the request was in flight. The delayed result is stale
+        // regardless of its content — never surface it as a current success,
+        // rejection, or error.
+        guard isCurrentConnection(streamID: streamID, identity: connectionIdentity) else {
+            return .stale
+        }
+
+        // Envelope precedence: stream-identity mismatch ⇒ stale; trimmed
+        // non-empty error ⇒ rejected; explicit ok:false ⇒ rejected; ok:true
+        // ⇒ accepted; nil/nil ⇒ unconfirmed. Contradictory booleans resolve
+        // by the same precedence.
+        if let responseStreamID = response.streamId, responseStreamID != streamID {
+            return .stale
+        }
+        let trimmedError = response.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedError, !trimmedError.isEmpty {
+            return .rejected(ChatCancelResponse(
+                ok: response.ok,
+                cancelled: response.cancelled,
+                streamId: response.streamId,
+                error: trimmedError
+            ))
+        }
+        if response.ok == false {
+            return .rejected(response)
+        }
+        guard response.ok == true else {
+            return .unconfirmed
+        }
 
         // Explicit cancel terminal candidate: routed through the centralized
         // transition so the first-valid-outcome-wins rule and idempotent
@@ -273,7 +408,18 @@ final class ChatStreamCoordinator {
             liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
             finishStream()
         }
-        return response
+        return .accepted(ChatCancellationTicket(
+            identity: connectionIdentity,
+            messageID: "cancelled-\(UUID().uuidString)"
+        ))
+    }
+
+    /// Whether the run connection that issued a cancel request is still the
+    /// current one — same active stream AND same connection identity. Any
+    /// replacement (new logical generation), replay (new connection
+    /// generation), or finalization makes the request stale (#18 Slice 3).
+    private func isCurrentConnection(streamID: String, identity: ChatRunConnectionIdentity) -> Bool {
+        activeStreamID == streamID && runConnectionIdentity == identity
     }
 
     func suspendActiveStreamConnection() {

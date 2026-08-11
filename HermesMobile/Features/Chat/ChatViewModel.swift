@@ -218,8 +218,28 @@ final class ChatViewModel {
     private(set) var isRegeneratingMessage = false
     private(set) var isCompressingSession = false
     private(set) var isCancellingStream = false
+    /// Number of cancellation requests in flight. `isCancellingStream` stays
+    /// true while ANY cancellation is pending, so a stale cancellation's
+    /// return cannot flip the projection off while the replacement run's
+    /// cancellation is still in flight (#18 Slice 3).
+    private var activeCancellationCount = 0
+    /// The terminal feedback ticket of the most recent accepted
+    /// cancellation, consumed exactly once at the view-model boundary
+    /// (#18 Slice 3).
+    private(set) var cancellationFeedbackTicket: ChatCancellationTicket?
+    /// UI-only: whether the user dismissed the active run's status
+    /// projection. A stale cancellation result must never touch it
+    /// (#18 Slice 3).
+    private(set) var activeRunDismissed = false
     private(set) var isViewingCachedData = false
     var activeStreamID: String? { streamCoordinator.activeStreamID }
+    /// UI projection of the active run (#18 Slice 3): non-nil while a run is
+    /// active; `dismissed` is the UI-only dismissal flag, unchanged by stale
+    /// cancellation results.
+    var activeRunSnapshot: ChatActiveRunSnapshot? {
+        guard activeStreamID != nil else { return nil }
+        return ChatActiveRunSnapshot(isActive: true, dismissed: activeRunDismissed)
+    }
     var activeStreamRecoveryState: ActiveStreamRecoveryState { streamCoordinator.recoveryState }
     var liveTokensPerSecond: Double? { streamCoordinator.liveTokensPerSecond }
     private(set) var errorMessage: String?
@@ -3607,22 +3627,50 @@ final class ChatViewModel {
     func cancelActiveStream() async -> Bool {
         guard activeStreamID != nil else { return false }
 
+        activeCancellationCount += 1
         isCancellingStream = true
         sendErrorMessage = nil
         lastError = nil
-        defer { isCancellingStream = false }
-
-        do {
-            guard let response = try await streamCoordinator.cancelActiveStream() else { return false }
-            if response.ok == false {
-                sendErrorMessage = response.error ?? String(localized: "The server could not stop the current response.")
-                return false
+        cancellationFeedbackTicket = nil
+        defer {
+            activeCancellationCount -= 1
+            if activeCancellationCount == 0 {
+                isCancellingStream = false
             }
+        }
 
+        switch await streamCoordinator.cancelActiveStream() {
+        case .accepted(let ticket):
+            // Consume the exact accepted ticket at the view-model boundary
+            // (#18 Slice 3): the stale path never reaches here, and the
+            // "Response cancelled" notice carries the ticket's stable
+            // message ID.
+            cancellationFeedbackTicket = ticket
+            if ticket.consume() {
+                messages.append(
+                    ChatMessage(
+                        role: "local_notice",
+                        content: String(localized: "Response cancelled"),
+                        timestamp: Date().timeIntervalSince1970,
+                        messageId: ticket.messageID
+                    )
+                )
+                scheduleStreamingScrollTrigger()
+            }
             return true
-        } catch {
+        case .stale:
+            // A superseded cancellation is a silent no-op: no error, no
+            // feedback ticket, no "Response cancelled" message — the
+            // replacement run's own cancellation owns the UI.
+            return false
+        case .rejected(let response):
+            sendErrorMessage = response.error ?? String(localized: "The server could not stop the current response.")
+            return false
+        case .thrown(let error):
             lastError = error
             sendErrorMessage = error.localizedDescription
+            return false
+        case .unconfirmed:
             return false
         }
     }
@@ -5189,6 +5237,14 @@ extension ChatViewModel: ChatStreamCoordinatorDelegate {
         appendLocalNoticeMessage(String(localized: "Steering hint was not consumed before the response ended, so it was queued for the next turn."))
         return true
     }
+}
+
+/// UI projection of the active run's snapshot state (#18 Slice 3): whether a
+/// run is active and whether its status projection was dismissed. Stale
+/// cancellation results must never mutate it.
+struct ChatActiveRunSnapshot: Equatable, Sendable {
+    let isActive: Bool
+    let dismissed: Bool
 }
 
 private struct ActiveChatStreamSnapshot: Equatable {

@@ -54,7 +54,7 @@ enum ChatHaptics {
         performer(feedback)
     }
 
-    private static func perform(_ feedback: ChatHapticFeedback) {
+    static func perform(_ feedback: ChatHapticFeedback) {
         switch feedback {
         case .lightImpact:
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -67,5 +67,24 @@ enum ChatHaptics {
         case .warning:
             UINotificationFeedbackGenerator().notificationOccurred(.warning)
         }
+    }
+}
+
+/// Cancellation feedback helper (#18 Slice 3): consumes the accepted
+/// cancellation ticket exactly once and fires the cancellation haptic only
+/// for that accepted result, returning the ticket's stable message ID. The
+/// stale path (result false, or nil/already-consumed ticket) is silent:
+/// zero haptic callbacks, nothing consumed, no message ID published.
+@MainActor
+enum ChatCancellationFeedback {
+    static func apply(
+        result: Bool,
+        ticket: ChatCancellationTicket?,
+        isHapticsEnabled: Bool,
+        performer: ChatHaptics.Performer = ChatHaptics.perform
+    ) -> String? {
+        guard result, let ticket, ticket.consume() else { return nil }
+        ChatHaptics.streamCancelled(isEnabled: isHapticsEnabled, performer: performer)
+        return ticket.messageID
     }
 }
