@@ -468,7 +468,7 @@ final class ChatViewModel {
         listenAudioSession: (any ListenAudioSessionControlling)? = nil,
         listenRemoteControlCenter: (any ListenRemoteControlControlling)? = nil,
         serverTTSAudioPlayerFactory: (@MainActor (Data) throws -> any ListenAudioPlaying)? = nil,
-        userDefaults: UserDefaults = .standard, modelCatalogCoordinator: ChatModelCatalogCoordinator? = nil
+        modelCatalogCoordinator: ChatModelCatalogCoordinator? = nil, userDefaults: UserDefaults = .standard
     ) {
         sessionID = session.sessionId
         currentWorkspace = session.workspace
