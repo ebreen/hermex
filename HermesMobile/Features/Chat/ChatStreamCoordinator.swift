@@ -115,7 +115,6 @@ enum ChatCancelDisposition: Equatable, Sendable {
 
 extension ChatCancelResponse: Sendable {}
 
-@MainActor
 protocol ChatStreamCoordinatorDelegate: AnyObject {
     var streamCoordinatorSessionID: String? { get }
     var streamCoordinatorDisplayTitle: String { get }
