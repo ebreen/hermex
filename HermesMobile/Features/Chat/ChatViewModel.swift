@@ -758,7 +758,7 @@ final class ChatViewModel {
     /// the await and before it mutates MainActor state; a profile switch that
     /// advances the authoritative epoch silently drops the old result.
     func refreshModelCatalogForPickerOpen() async {
-        let stream = client.modelCatalogStream(
+        let stream = await client.modelCatalogStream(
             requestedProfile: nil,
             operationID: UUID(),
             operationGeneration: 1
