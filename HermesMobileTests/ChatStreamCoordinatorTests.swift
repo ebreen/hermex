@@ -965,6 +965,235 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         XCTAssertEqual(delegate.finishCount, 0)
     }
 
+    // MARK: - Slice 2 (#18): central terminal transition and outcome precedence
+
+    // First-valid-authoritative-terminal-wins: `.done` then `.streamEnd`
+    // commits `completed` exactly once — one terminal record (identity +
+    // outcome), one terminal event, one finish, one Live Activity end, one
+    // snapshot removal, one cleanup pass. The completing connection's own
+    // terminal event arrives late, after finalization, through its retained
+    // callback (connection 0).
+    @MainActor
+    func testDoneThenStreamEndProducesOneCompletedTerminalAndOneInlineEvent() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.done(DoneStreamEvent()))
+        streamClient.emit(.streamEnd, fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .completed)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(delegate.completedNeedsTranscriptRefreshValues, [true])
+        XCTAssertEqual(delegate.removedSnapshotStreamIDs.count, 1)
+        XCTAssertEqual(delegate.stopMonitoringClearPromptValues.count, 1)
+        XCTAssertEqual(liveActivityManager.ends.map { $0.status }, [.complete])
+        XCTAssertEqual(streamClient.stopCount, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // `.streamEnd` then a late `.done` commits `completed`: the late done is
+    // not a candidate, appends no transcript payload, and finishes nothing.
+    @MainActor
+    func testStreamEndThenDoneProducesOneCompletedTerminalAndOneInlineEvent() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.streamEnd)
+        streamClient.emit(.done(DoneStreamEvent()), fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .completed)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertTrue(delegate.donePayloads.isEmpty)
+        XCTAssertEqual(delegate.removedSnapshotStreamIDs.count, 1)
+        XCTAssertEqual(delegate.stopMonitoringClearPromptValues.count, 1)
+        XCTAssertEqual(liveActivityManager.ends.map { $0.status }, [.complete])
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // `.cancelled` then `.error` commits `cancelled`: the late error is not a
+    // candidate and neither surfaces a message nor finishes twice.
+    @MainActor
+    func testCancelledThenErrorKeepsCancelledOutcome() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.cancelled)
+        streamClient.emit(.error("late failure"), fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertEqual(liveActivityManager.ends.map { $0.status }, [.cancelled])
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // `.error` then a late `.done` commits `failed`: the late done cannot
+    // resurrect the failed row, append a transcript payload, or finish twice.
+    @MainActor
+    func testErrorThenLateDoneKeepsFailedOutcome() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.error("server failed"))
+        streamClient.emit(.done(DoneStreamEvent()), fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .failed)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(delegate.errorMessages, ["server failed"])
+        XCTAssertTrue(delegate.donePayloads.isEmpty)
+        XCTAssertEqual(liveActivityManager.ends.map { $0.status }, [.failed])
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // A replayed terminal event is a no-op after the first valid candidate:
+    // one terminal record, one terminal event, one finish, one Live Activity
+    // end, one snapshot removal, one stream stop, one cleanup pass.
+    @MainActor
+    func testDuplicateTerminalEventsDoNotFinishTwice() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.cancelled)
+        streamClient.emit(.cancelled, fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+        XCTAssertEqual(liveActivityManager.ends.map { $0.status }, [.cancelled])
+        XCTAssertEqual(streamClient.stopCount, 1)
+        XCTAssertEqual(delegate.removedSnapshotStreamIDs.count, 1)
+        XCTAssertEqual(delegate.stopMonitoringClearPromptValues.count, 1)
+        XCTAssertNil(coordinator.activeStreamID)
+    }
+
+    // Once a terminal outcome is committed, a later callback from the same
+    // connection cannot resurrect active status: no token mutation, no active
+    // stream, no restarted connection, no second finish.
+    @MainActor
+    func testTerminalOutcomeCannotResurrectActiveStatus() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.cancelled)
+        streamClient.emit(.token("zombie token"), fromConnection: 0)
+
+        XCTAssertEqual(
+            delegate.terminalTransitions,
+            [RecordedTerminalTransition(identity: identity, outcome: .cancelled)]
+        )
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+        XCTAssertTrue(delegate.tokens.isEmpty)
+        XCTAssertNil(coordinator.activeStreamID)
+        XCTAssertNil(coordinator.runIdentity)
+        XCTAssertEqual(streamClient.startedURLs.count, 1)
+        XCTAssertEqual(delegate.finishCount, 1)
+    }
+
+    // A transport error is NOT a terminal candidate: the run suspends with
+    // the same logical generation and produces no terminal outcome, no
+    // terminal event, no finish, no error message, and no Live Activity end.
+    // The assertions run synchronously on the MainActor, before the deferred
+    // reconnect task can execute.
+    @MainActor
+    func testTransportErrorDoesNotProduceTerminalOutcome() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let liveActivityManager = CoordinatorSpyLiveActivityManager()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(
+            streamClient: streamClient,
+            liveActivityManager: liveActivityManager,
+            delegate: delegate
+        )
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+
+        streamClient.emit(.transportError("lost connection"))
+
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+        XCTAssertEqual(delegate.terminalEventCount, 0)
+        XCTAssertEqual(delegate.finishCount, 0)
+        XCTAssertTrue(delegate.errorMessages.isEmpty)
+        XCTAssertTrue(liveActivityManager.ends.isEmpty)
+        XCTAssertTrue(coordinator.isConnectionSuspended)
+        XCTAssertEqual(coordinator.activeStreamID, "stream-123")
+        XCTAssertEqual(coordinator.runIdentity, identity)
+        XCTAssertEqual(streamClient.stopCount, 1)
+    }
+
     @MainActor
     private func makeCoordinator(
         streamClient: CoordinatorSpySSEStreamingClient? = nil,
@@ -1004,6 +1233,16 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     }
 }
 
+/// One committed terminal transition recorded by the centralized terminal
+/// path (#18 Slice 2): the finalized run's identity and the first-valid
+/// outcome. `ChatRunTerminalOutcome` is the intended centralized terminal
+/// outcome type; GREEN adds it beside the run identity types and routes every
+/// terminal candidate through `transitionToTerminal`.
+private struct RecordedTerminalTransition: Equatable {
+    let identity: ChatRunIdentity
+    let outcome: ChatRunTerminalOutcome
+}
+
 @MainActor
 private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     var streamCoordinatorSessionID: String? = "session-abc"
@@ -1038,6 +1277,9 @@ private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     var restoredSnapshotEventID: String?
     var appendTokenResult = true
     var doneHasCompletedTranscript = false
+    // MARK: Slice 2 (#18): centralized terminal transition recording
+    private(set) var terminalTransitions: [RecordedTerminalTransition] = []
+    private(set) var terminalEventCount = 0
     var onLoadMessages: (() async -> Void)?
 
     func streamCoordinatorLoadMessages(modelContext: ModelContext?) async {
@@ -1134,6 +1376,19 @@ private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     func streamCoordinatorApplyDone(_ payload: DoneStreamEvent) -> Bool {
         donePayloads.append(payload)
         return doneHasCompletedTranscript
+    }
+
+    /// Centralized terminal-event delegate callback (#18 Slice 2): invoked
+    /// exactly once per committed terminal transition with the winning
+    /// outcome and the finalized run's identity. GREEN adds this requirement
+    /// to `ChatStreamCoordinatorDelegate` and invokes it from the idempotent
+    /// centralized terminal transition.
+    func streamCoordinatorDidCommitTerminalOutcome(
+        _ outcome: ChatRunTerminalOutcome,
+        identity: ChatRunIdentity
+    ) {
+        terminalTransitions.append(RecordedTerminalTransition(identity: identity, outcome: outcome))
+        terminalEventCount += 1
     }
 
     func streamCoordinatorApplyApprovalUpdate(_ update: ApprovalPendingResponse) {}
