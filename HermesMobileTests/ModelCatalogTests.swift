@@ -222,6 +222,48 @@ final class ModelCatalogTests: XCTestCase {
             groups
         )
     }
+
+    func testCatalogPreservesProviderIdentityForDuplicateModelIDs() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let response = try decoder.decode(
+            ModelsResponse.self,
+            from: Data("""
+            {
+              "groups": [
+                {
+                  "name": "OpenAI",
+                  "provider_id": "openai",
+                  "models": [{"id": "shared/model", "label": "OpenAI Shared"}]
+                },
+                {
+                  "name": "Anthropic",
+                  "provider_id": "anthropic",
+                  "models": [{"id": "shared/model", "label": "Anthropic Shared"}]
+                }
+              ]
+            }
+            """.utf8)
+        )
+
+        let options = response.catalogGroups.flatMap(\.models)
+
+        XCTAssertEqual(options.map(\.id), ["shared/model", "shared/model"])
+        XCTAssertEqual(options.map(\.providerID), ["openai", "anthropic"])
+        XCTAssertEqual(
+            options.map(\.favoriteKey),
+            [
+                ModelFavoriteKey(modelID: "shared/model", providerID: "openai"),
+                ModelFavoriteKey(modelID: "shared/model", providerID: "anthropic")
+            ]
+        )
+        let anthropic = try XCTUnwrap(options.dropFirst().first)
+        XCTAssertEqual(
+            options.firstMatchingSelection(modelID: "shared/model", providerID: "anthropic"),
+            anthropic
+        )
+        XCTAssertNil(options.firstMatchingSelection(modelID: "shared/model", providerID: nil))
+    }
 }
 
 final class PersonalityAutocompleteTests: XCTestCase {

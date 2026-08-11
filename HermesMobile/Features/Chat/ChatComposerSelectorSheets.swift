@@ -10,13 +10,22 @@ struct ComposerModelPickerSheet: View {
     let onToggleFavorite: (ModelCatalogOption) -> Void
     let onDeleteSavedCustom: (ModelCatalogOption) -> Void
 
+    private var pickerProjection: ComposerModelPickerProjection {
+        ComposerModelPickerProjection(
+            modelGroups: modelGroups,
+            selectedModelID: selectedModelID,
+            selectedModelProviderID: selectedModelProviderID,
+            favoriteModelKeys: favoriteModelKeys,
+            recentModelKeys: recentModelKeys
+        )
+    }
+
     @Environment(\.dismiss) private var dismiss
     @State private var searchText = ""
     @State private var customModelID = ""
     @State private var customProviderID = ""
     @State private var sectionExpansion = ComposerModelPickerSectionExpansionState()
 
-    private let currentCustomGroupID = "current-custom-model"
     private let savedCustomGroupID = "saved-custom-models"
 
     var body: some View {
@@ -49,9 +58,13 @@ struct ComposerModelPickerSheet: View {
             .onAppear {
                 initializeCustomProviderIfNeeded()
                 sectionExpansion.updateSearchText(searchText)
+                autoExpandCatalogIfNeeded()
             }
             .onChange(of: searchText) { _, newValue in
                 sectionExpansion.updateSearchText(newValue)
+            }
+            .onChange(of: modelGroups) { _, _ in
+                autoExpandCatalogIfNeeded()
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -256,90 +269,31 @@ struct ComposerModelPickerSheet: View {
     }
 
     private func isSelected(_ option: ModelCatalogOption) -> Bool {
-        option.matchesSelection(modelID: selectedModelID, providerID: selectedModelProviderID)
+        option.matchesSelection(
+            modelID: selectedModelID,
+            providerID: selectedModelProviderID
+        )
     }
 
     private var filteredModelGroups: [ModelCatalogGroup] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseGroups: [ModelCatalogGroup]
+        let baseGroups = pickerProjection.sheetGroups
 
-        if query.isEmpty {
-            baseGroups = modelGroups
-        } else {
-            baseGroups = modelGroups.compactMap { group in
-                let filteredModels = group.models.filter { option in
-                    matches(option, query: query)
-                }
+        guard !query.isEmpty else { return baseGroups }
 
-                guard !filteredModels.isEmpty else { return nil }
-
-                return ModelCatalogGroup(
-                    id: group.id,
-                    name: group.name,
-                    providerID: group.providerID,
-                    models: filteredModels
-                )
+        return baseGroups.compactMap { group in
+            let filteredModels = group.models.filter { option in
+                matches(option, query: query)
             }
-        }
+            guard !filteredModels.isEmpty else { return nil }
 
-        return customModelGroups + baseGroups
-    }
-
-    private var customModelGroups: [ModelCatalogGroup] {
-        var groups: [ModelCatalogGroup] = []
-
-        if let selectedCustomOption,
-           !storedCustomOptions.contains(where: { $0.favoriteKey == selectedCustomOption.favoriteKey }) {
-            groups.append(
-                ModelCatalogGroup(
-                    id: currentCustomGroupID,
-                    name: String(localized: "Current Custom"),
-                    providerID: nil,
-                    models: [selectedCustomOption]
-                )
+            return ModelCatalogGroup(
+                id: group.id,
+                name: group.name,
+                providerID: group.providerID,
+                models: filteredModels
             )
         }
-
-        if !storedCustomOptions.isEmpty {
-            groups.append(
-                ModelCatalogGroup(
-                    id: savedCustomGroupID,
-                    name: String(localized: "Saved Custom"),
-                    providerID: nil,
-                    models: storedCustomOptions
-                )
-            )
-        }
-
-        return groups
-    }
-
-    private var storedCustomOptions: [ModelCatalogOption] {
-        let catalogKeys = Set(modelGroups.flatMap(\.models).map(\.favoriteKey))
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        var seen = Set<ModelFavoriteKey>()
-        var result: [ModelCatalogOption] = []
-
-        func append(_ option: ModelCatalogOption?) {
-            guard let option,
-                  !catalogKeys.contains(option.favoriteKey),
-                  seen.insert(option.favoriteKey).inserted,
-                  query.isEmpty || matches(option, query: query) else { return }
-            result.append(option)
-        }
-
-        for option in ModelFavoritesStore.visibleFavoriteOptions(in: modelGroups, favoriteKeys: favoriteModelKeys) {
-            append(option)
-        }
-        for option in ModelRecentsStore.visibleRecentOptions(
-            in: modelGroups,
-            recentKeys: recentModelKeys,
-            favoriteKeys: favoriteModelKeys
-        ) {
-            append(option)
-        }
-
-        return result
     }
 
     private var customOption: ModelCatalogOption? {
@@ -349,31 +303,12 @@ struct ComposerModelPickerSheet: View {
         return ModelCatalogOption(id: modelID, displayName: modelID, providerID: providerID)
     }
 
-    private var selectedCustomOption: ModelCatalogOption? {
-        guard let selectedModelID, !selectedModelID.isEmpty else { return nil }
-        let catalogOptions = modelGroups.flatMap(\.models)
-        if catalogOptions.firstMatchingSelection(
-            modelID: selectedModelID,
-            providerID: selectedModelProviderID
-        ) != nil {
-            return nil
-        }
-
-        let option = ModelCatalogOption(
-            id: selectedModelID,
-            displayName: selectedModelID,
-            providerID: selectedModelProviderID
-        )
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard query.isEmpty || matches(option, query: query) else { return nil }
-        return option
-    }
 
     private var providerChoices: [ModelProviderChoice] {
         var seen = Set<String>()
         var result: [ModelProviderChoice] = []
 
-        for group in modelGroups {
+        for group in pickerProjection.catalogGroups {
             guard let providerID = group.providerID?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !providerID.isEmpty,
                   seen.insert(providerID.lowercased()).inserted else { continue }
@@ -394,7 +329,14 @@ struct ComposerModelPickerSheet: View {
 
     private func initializeCustomProviderIfNeeded() {
         guard customProviderID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        customProviderID = selectedModelProviderID ?? providerChoices.first?.id ?? ""
+        customProviderID = selectedModelProviderID ?? ""
+    }
+
+    private func autoExpandCatalogIfNeeded() {
+        sectionExpansion.autoExpandFirstNonEmptyGroup(
+            in: pickerProjection.catalogGroups,
+            usefulRowPresent: pickerProjection.usefulRowPresent
+        )
     }
 
     private func matches(_ option: ModelCatalogOption, query: String) -> Bool {
