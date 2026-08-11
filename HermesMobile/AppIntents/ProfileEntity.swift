@@ -117,11 +117,14 @@ enum ProfileEntityProvider {
         // an epoch-advanced result is discarded (the caller falls back to the
         // last cached profiles) instead of publishing stale names.
         let client = APIClient(baseURL: server, customHeaderProvider: { headers })
-        let envelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-        guard await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) else {
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        guard await client.acceptsCatalogMetadata(snapshot.metadata) else {
             return []
         }
-        return envelope.value.profiles ?? []
+        return snapshot.profiles
     }
 
     /// Loads the server's stored custom headers (scoped key first, then the pre-#16 global
