@@ -272,6 +272,9 @@ final class ChatStreamCoordinator {
     /// Set when the terminal transition already cleared auxiliary monitoring
     /// (`.completed`), so the deferred `finishStream()` does not clear twice.
     private var monitoringClearedAtTerminal = false
+    /// Whether `finishStream()` should refresh the completed response title
+    /// (journal-authority terminal commits suppress the extra session GET).
+    private var refreshesCompletedTitleOnFinish = true
 
     init(
         client: APIClient,
@@ -514,7 +517,7 @@ final class ChatStreamCoordinator {
             transitionToTerminal(
                 outcome: outcome,
                 identity: identity,
-                needsTranscriptRefresh: false
+                refreshesCompletedTitle: false
             )
         }
     }
@@ -1038,7 +1041,8 @@ final class ChatStreamCoordinator {
         identity: ChatRunIdentity,
         needsTranscriptRefresh: Bool = true,
         marksResponseCompleted: Bool = true,
-        defersStreamFinish: Bool = false
+        defersStreamFinish: Bool = false,
+        refreshesCompletedTitle: Bool = true
     ) -> Bool {
         guard runIdentity == identity else { return false }
 
@@ -1048,6 +1052,7 @@ final class ChatStreamCoordinator {
         completedRunIdentity = identity
         runGeneration &+= 1
         pendingDeferredStreamFinish = defersStreamFinish
+        refreshesCompletedTitleOnFinish = refreshesCompletedTitle
 
         switch outcome {
         case .completed:
@@ -1210,9 +1215,10 @@ final class ChatStreamCoordinator {
         isConnectionSuspended = false
         resetRecoveryState()
         delegate?.streamCoordinatorDrainQueuedSlashMessageIfIdle()
-        if completedNormally {
+        if completedNormally, refreshesCompletedTitleOnFinish {
             delegate?.streamCoordinatorRefreshCompletedResponseTitleIfNeeded()
         }
+        refreshesCompletedTitleOnFinish = true
     }
 
     private func markConnectionStarted(
