@@ -209,7 +209,6 @@ struct DefaultModelPickerView: View {
                   operationID: operationID,
                   operationGeneration: operationGeneration
               ),
-              snapshot.failure == nil,
               let base = snapshot.base else {
             errorMessage = String(localized: "Could Not Load Models")
             isLoading = false

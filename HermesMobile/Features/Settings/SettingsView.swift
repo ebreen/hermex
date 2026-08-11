@@ -1069,8 +1069,8 @@ struct SettingsView: View {
                    operationID: operationID,
                    operationGeneration: operationGeneration
                ),
-               catalog.failure == nil {
-                defaultModel = catalog.base?.defaultModel
+               let base = catalog.base {
+                defaultModel = base.defaultModel
             } else {
                 defaultModel = nil
             }

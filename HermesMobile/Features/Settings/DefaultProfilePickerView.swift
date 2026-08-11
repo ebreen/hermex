@@ -480,8 +480,8 @@ private struct CreateProfileSheet: View {
                   operationID: operationID,
                   operationGeneration: operationGeneration
               ),
-              snapshot.failure == nil else { return }
-        modelGroups = snapshot.live?.groups ?? snapshot.base?.groups ?? []
+              let base = snapshot.base else { return }
+        modelGroups = snapshot.live?.groups ?? base.groups
     }
 
     private func create() async {
