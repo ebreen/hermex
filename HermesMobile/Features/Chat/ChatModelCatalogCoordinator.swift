@@ -86,9 +86,39 @@ enum CatalogEvent: Equatable, Sendable {
     /// A different verified context is about to become visible; subscribers
     /// must drop previously published rows before the new rows arrive.
     case contextReset(CatalogEventMetadata)
-    /// Readiness transition (cold, loading, freshReady, freshEmpty,
-    /// staleRefreshing, staleFailed, coldFailed(category)).
+    /// Compatibility readiness hint. The associated state has no acceptance
+    /// metadata and is therefore never authoritative; consumers that need to
+    /// apply readiness must use `currentStateSnapshot()`.
     case state(CatalogCacheState)
+}
+
+private extension CatalogEvent {
+    var publicationMetadata: CatalogEventMetadata? {
+        switch self {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata),
+             let .contextReset(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot):
+            return snapshot.metadata
+        case let .live(snapshot):
+            return snapshot.metadata
+        case .state:
+            return nil
+        }
+    }
+}
+
+/// Metadata-bearing readiness projection for consumers. The compatibility
+/// `CatalogEvent.state` remains available for existing state-transition tests,
+/// but it is only a hint because its payload predates publication fencing.
+struct CatalogStateSnapshot: Equatable, Sendable {
+    let metadata: CatalogEventMetadata
+    let state: CatalogCacheState
 }
 
 /// Per-VM model catalog coordinator (issue #16 Slice 2).
@@ -124,6 +154,14 @@ actor ChatModelCatalogCoordinator {
     /// Readiness state; `.coldFailed` is terminal (not loading) and leaves
     /// retry accessible.
     private(set) var state: CatalogCacheState = .cold
+
+    /// The latest fenced readiness projection. This is the authoritative state
+    /// surface for consumers; the compatibility `.state` event is only a hint.
+    private(set) var stateSnapshot: CatalogStateSnapshot?
+
+    /// Monotonic cache revision used to fence a stale projection across the
+    /// authoritative gate-epoch await in the final publication check.
+    private var cacheRevision: UInt64 = 0
 
     /// The single in-flight (or terminal-but-not-yet-drained) operation.
     private var currentOperation: CurrentOperation?
@@ -165,6 +203,14 @@ actor ChatModelCatalogCoordinator {
         multicast.subscribe()
     }
 
+    /// Returns the last readiness snapshot accepted by the coordinator's
+    /// publication fence. Unlike the compatibility `.state` event, this value
+    /// carries the operation, generation, context, and gate-epoch token needed
+    /// by a consumer before applying state to its own projection.
+    func currentStateSnapshot() -> CatalogStateSnapshot? {
+        stateSnapshot
+    }
+
     /// Opens the picker for the current profile context.
     ///
     /// - Coalesces onto an in-flight operation whose starting gate epoch is
@@ -184,39 +230,74 @@ actor ChatModelCatalogCoordinator {
             if op.operationKey.startingGateEpoch == authoritativeEpoch {
                 return
             }
-            _ = await startOperation(startingGateEpoch: authoritativeEpoch)
+            let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
             if let visible = visibleContextKey, cache[visible] != nil {
-                setState(.staleRefreshing)
+                _ = await setState(
+                    .staleRefreshing,
+                    metadata: provisional,
+                    contextKey: visible
+                )
             } else {
-                setState(.loading)
+                _ = await setState(.loading, metadata: provisional)
             }
             return
         }
 
         // Completed cache for the visible context: fresh hit or stale refresh.
-        if let visible = visibleContextKey, let entry = cache[visible] {
+        if let visible = visibleContextKey,
+           let entry = cache[visible] {
             let age = configuration.now().timeIntervalSince(entry.publishedAt)
+            let revisionAtRead = cacheRevision
             if age < configuration.freshnessInterval,
-               cache.count < configuration.completedContextLimit {
-                // Fresh cache hit: republish the last-known rows, rebound to
-                // the context's last-known operation metadata. No network.
-                publish(
+               cache.count < configuration.completedContextLimit,
+               visible.gateEpoch == authoritativeEpoch {
+                // A fresh replay is a new fenced operation even though it does
+                // not perform network work. Cache entries contain projections
+                // only; never replay an old operation UUID/generation.
+                let replayMetadata = startCacheReplayOperation(
+                    contextKey: visible,
+                    startingGateEpoch: authoritativeEpoch
+                )
+                guard await publish(
                     .base(
                         CatalogBaseSnapshot(
-                            metadata: entry.lastKnownMetadata,
+                            metadata: replayMetadata,
                             groups: entry.groups,
                             defaultModel: entry.defaultModel,
                             activeProvider: entry.activeProvider
                         )
-                    )
-                )
-                setState(entry.groups.isEmpty ? .freshEmpty : .freshReady)
+                    ),
+                    metadata: replayMetadata,
+                    contextKey: visible,
+                    cacheRevision: revisionAtRead
+                ) else {
+                    currentOperation?.isTerminal = true
+                    return
+                }
+                guard await setState(
+                    entry.groups.isEmpty ? .freshEmpty : .freshReady,
+                    metadata: replayMetadata,
+                    contextKey: visible,
+                    cacheRevision: revisionAtRead
+                ) else {
+                    currentOperation?.isTerminal = true
+                    return
+                }
+                currentOperation?.isTerminal = true
                 return
             }
             // Stale (or at capacity): publish stale rows immediately, then
-            // start one refresh.
+            // start one refresh. Revalidate the captured cache revision after
+            // the provider await and again in the final publication fence.
             let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
-            publish(
+            guard let current = currentOperation,
+                  current.operationID == provisional.operationID,
+                  current.operationGeneration == provisional.operationGeneration,
+                  visibleContextKey == visible,
+                  cache[visible] != nil,
+                  cacheRevision == revisionAtRead
+            else { return }
+            guard await publish(
                 .base(
                     CatalogBaseSnapshot(
                         metadata: provisional,
@@ -224,15 +305,23 @@ actor ChatModelCatalogCoordinator {
                         defaultModel: entry.defaultModel,
                         activeProvider: entry.activeProvider
                     )
-                )
+                ),
+                metadata: provisional,
+                contextKey: visible,
+                cacheRevision: revisionAtRead
+            ) else { return }
+            _ = await setState(
+                .staleRefreshing,
+                metadata: provisional,
+                contextKey: visible,
+                cacheRevision: revisionAtRead
             )
-            setState(.staleRefreshing)
             return
         }
 
         // Cold start.
-        _ = await startOperation(startingGateEpoch: authoritativeEpoch)
-        setState(.loading)
+        let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
+        _ = await setState(.loading, metadata: provisional)
     }
 
     /// Forces a refresh of the visible catalog — the only refresh path that
@@ -257,19 +346,33 @@ actor ChatModelCatalogCoordinator {
     /// (provisional) or the verified context's gate epoch (verified) equals
     /// the process-global registry's current epoch.
     func accepts(_ metadata: CatalogEventMetadata) async -> Bool {
-        if let operation = currentOperation {
-            guard operation.operationID == metadata.operationID,
-                  operation.operationGeneration == metadata.operationGeneration
-            else { return false }
-        }
+        guard !Task.isCancelled,
+              let operation = currentOperation,
+              operation.operationID == metadata.operationID,
+              operation.operationGeneration == metadata.operationGeneration
+        else { return false }
+
+        let gate: ProfileContextGate
+        let expectedEpoch: UInt64
         switch metadata.identity {
         case let .provisional(key):
-            let gate = ProfileContextGateRegistry.shared.gate(for: key.gateKey)
-            return await gate.gateEpoch == key.startingGateEpoch
+            guard key == operation.operationKey else { return false }
+            gate = ProfileContextGateRegistry.shared.gate(for: key.gateKey)
+            expectedEpoch = key.startingGateEpoch
         case let .verified(key):
-            let gate = ProfileContextGateRegistry.shared.gate(for: key.gateKey)
-            return await gate.gateEpoch == key.gateEpoch
+            guard operation.verifiedContextKey == key else { return false }
+            gate = ProfileContextGateRegistry.shared.gate(for: key.gateKey)
+            expectedEpoch = key.gateEpoch
         }
+
+        let authoritativeEpoch = await gate.gateEpoch
+        guard !Task.isCancelled,
+              authoritativeEpoch == expectedEpoch,
+              let current = currentOperation,
+              current.operationID == metadata.operationID,
+              current.operationGeneration == metadata.operationGeneration
+        else { return false }
+        return true
     }
 
     // MARK: Network event handling
@@ -279,61 +382,36 @@ actor ChatModelCatalogCoordinator {
     /// and once against the authoritative gate epoch and the operation's own
     /// context key.
     private func handleNetworkEvent(operationID: UUID, event: CatalogNetworkEvent) async {
-        guard let op = currentOperation,
-              op.operationID == operationID,
-              !op.isTerminal
+        guard !Task.isCancelled,
+              let initial = currentOperation,
+              initial.operationID == operationID,
+              !initial.isTerminal
         else { return }
 
-        let gate = ProfileContextGateRegistry.shared.gate(for: op.operationKey.gateKey)
+        let gate = ProfileContextGateRegistry.shared.gate(for: initial.operationKey.gateKey)
         let authoritativeEpoch = await gate.gateEpoch
 
-        // Re-read after the await: the actor may have been reentered (e.g. a
-        // supersede replaced the operation) while we awaited the gate.
-        guard let op = currentOperation,
-              op.operationID == operationID,
-              !op.isTerminal,
+        // This pre-handler check is intentionally not the publication fence.
+        // Every branch below repeats the complete check immediately before its
+        // own multicast yield.
+        guard !Task.isCancelled,
+              authoritativeEpoch == initial.operationKey.startingGateEpoch,
+              let current = currentOperation,
+              current.operationID == operationID,
+              current.operationGeneration == initial.operationGeneration,
+              !current.isTerminal,
               let metadata = event.eventMetadata,
-              metadata.operationID == op.operationID,
-              metadata.operationGeneration == op.operationGeneration
+              metadata.operationID == current.operationID,
+              metadata.operationGeneration == current.operationGeneration
         else { return }
-
-        switch metadata.identity {
-        case let .provisional(key):
-            // Provisional metadata is now fully authoritative: the provider
-            // carries the operation's starting epoch, so no identity field may
-            // be admitted from an old or fabricated context.
-            guard key == op.operationKey else { return }
-        case let .verified(key):
-            // `.contextVerified` is the fence's write site: it carries the
-            // context key that later events must match. Exempt it from
-            // key-equality (the key is unknown until this very event) but
-            // bind the operation constants it must not be able to spoof.
-            if case .contextVerified = event {
-                guard key.gateEpoch == authoritativeEpoch,
-                      key.gateEpoch == op.operationKey.startingGateEpoch,
-                      key.gateKey == op.operationKey.gateKey,
-                      key.apiClientID == op.operationKey.apiClientID,
-                      key.authGeneration == op.operationKey.authGeneration
-                else { return }
-            } else {
-                guard key == op.verifiedContextKey, key.gateEpoch == authoritativeEpoch else { return }
-            }
-        }
 
         switch event {
         case let .contextVerified(metadata, context):
-            // Production emits `.contextVerified` with the operation's
-            // authoritative provisional identity; scripted tests may use a
-            // verified identity. Either way this event is the fence's write
-            // site: it establishes the context key that later base/live/
-            // failed events must match.
             let contextKey: CatalogContextKey
             switch metadata.identity {
             case let .verified(key):
                 contextKey = key
             case let .provisional(key):
-                // The provisional operation key carries the requested profile;
-                // the resolved active profile comes from the verified context.
                 contextKey = CatalogContextKey(
                     gateKey: key.gateKey,
                     apiClientID: key.apiClientID,
@@ -342,15 +420,40 @@ actor ChatModelCatalogCoordinator {
                     gateEpoch: key.startingGateEpoch
                 )
             }
-            currentOperation?.verifiedContextKey = contextKey
-            currentOperation?.profileContext = context
+
+            guard await acceptsPublication(
+                metadata: metadata,
+                contextKey: contextKey,
+                allowUnboundVerifiedContext: true
+            ) else { return }
+
             if let visible = visibleContextKey, visible != contextKey {
                 // A different context is about to become visible: reset the
                 // subscriber rows before the new context's rows.
-                publish(.contextReset(metadata))
+                guard await publish(
+                    .contextReset(metadata),
+                    metadata: metadata,
+                    contextKey: contextKey,
+                    allowUnboundVerifiedContext: true
+                ) else { return }
             }
+            guard await publish(
+                .contextVerified(metadata, context),
+                metadata: metadata,
+                contextKey: contextKey,
+                allowUnboundVerifiedContext: true
+            ) else { return }
+
+            // The context becomes coordinator-authoritative only after the
+            // fenced publications have landed.
+            guard let current = currentOperation,
+                  current.operationID == operationID,
+                  current.operationGeneration == metadata.operationGeneration,
+                  !Task.isCancelled
+            else { return }
+            currentOperation?.verifiedContextKey = contextKey
+            currentOperation?.profileContext = context
             visibleContextKey = contextKey
-            publish(.contextVerified(metadata, context))
             emitTelemetry(
                 surface: .context,
                 phase: .ended,
@@ -359,35 +462,66 @@ actor ChatModelCatalogCoordinator {
             )
 
         case let .base(snapshot):
-            // Production emits provisional identity for every event
-            // (ModelCatalogNetworking.swift:867); the context key was already
-            // established by the preceding `.contextVerified` write site.
-            guard let contextKey = op.verifiedContextKey,
-                  snapshot.metadata.operationID == op.operationID
+            guard let current = currentOperation,
+                  let contextKey = current.verifiedContextKey,
+                  snapshot.metadata.operationID == operationID,
+                  snapshot.metadata.operationGeneration == current.operationGeneration
             else { return }
-            // Cache the projection without event metadata; the last-known
-            // operation metadata is retained for future rebinding.
+            guard await acceptsPublication(
+                metadata: snapshot.metadata,
+                contextKey: contextKey
+            ) else { return }
+
+            guard let current = currentOperation,
+                  current.operationID == operationID,
+                  current.operationGeneration == snapshot.metadata.operationGeneration,
+                  !Task.isCancelled
+            else { return }
+
+            // Cache only the projection. Delivery metadata is always rebound
+            // from the current operation when the projection is replayed.
             cache[contextKey] = CachedContext(
                 groups: snapshot.groups,
                 defaultModel: snapshot.defaultModel,
                 activeProvider: snapshot.activeProvider,
-                publishedAt: configuration.now(),
-                lastKnownMetadata: snapshot.metadata
+                publishedAt: configuration.now()
             )
             cacheOrder.removeAll { $0 == contextKey }
             cacheOrder.append(contextKey)
+            cacheRevision &+= 1
             evictIfNeeded()
-            publish(.base(snapshot))
+            let revisionAfterCacheWrite = cacheRevision
+
+            guard await publish(
+                .base(snapshot),
+                metadata: snapshot.metadata,
+                contextKey: contextKey,
+                cacheRevision: revisionAfterCacheWrite
+            ) else { return }
+            guard let currentAfter = currentOperation,
+                  currentAfter.operationID == operationID,
+                  currentAfter.operationGeneration == snapshot.metadata.operationGeneration,
+                  !Task.isCancelled
+            else { return }
             currentOperation?.basePublished = true
             currentOperation?.lastBaseActiveProvider = snapshot.activeProvider
-            setState(snapshot.groups.isEmpty ? .freshEmpty : .freshReady)
+            guard await setState(
+                snapshot.groups.isEmpty ? .freshEmpty : .freshReady,
+                metadata: snapshot.metadata,
+                contextKey: contextKey,
+                cacheRevision: revisionAfterCacheWrite
+            ) else { return }
+
             // A live that arrived out of order is flushed now that the base
-            // is visible.
-            if let pending = currentOperation?.pendingLive {
+            // is visible. The second publication has its own final fence.
+            if let pending = currentOperation?.pendingLive,
+               liveProviderMatches(pending, baseActiveProvider: snapshot.activeProvider) {
+                guard await publish(
+                    .live(pending),
+                    metadata: pending.metadata,
+                    contextKey: contextKey
+                ) else { return }
                 currentOperation?.pendingLive = nil
-                if liveProviderMatches(pending, baseActiveProvider: snapshot.activeProvider) {
-                    publish(.live(pending))
-                }
             }
             emitTelemetry(
                 surface: .models,
@@ -399,20 +533,28 @@ actor ChatModelCatalogCoordinator {
             )
 
         case let .live(snapshot):
-            guard snapshot.metadata.operationID == op.operationID else { return }
-            if op.basePublished {
+            guard let current = currentOperation,
+                  let contextKey = current.verifiedContextKey,
+                  snapshot.metadata.operationID == operationID,
+                  snapshot.metadata.operationGeneration == current.operationGeneration,
+                  !Task.isCancelled
+            else { return }
+            if current.basePublished {
                 // Live must agree with the visible base's provider; a
                 // mismatched live is discarded, never published.
-                if liveProviderMatches(snapshot, baseActiveProvider: op.lastBaseActiveProvider) {
-                    publish(.live(snapshot))
-                    emitTelemetry(
-                        surface: .live,
-                        phase: .ended,
-                        outcome: .success,
-                        operationID: snapshot.metadata.operationID,
-                        rowCount: snapshot.groups.reduce(0) { $0 + $1.models.count }
-                    )
-                }
+                guard liveProviderMatches(snapshot, baseActiveProvider: current.lastBaseActiveProvider) else { return }
+                guard await publish(
+                    .live(snapshot),
+                    metadata: snapshot.metadata,
+                    contextKey: contextKey
+                ) else { return }
+                emitTelemetry(
+                    surface: .live,
+                    phase: .ended,
+                    outcome: .success,
+                    operationID: snapshot.metadata.operationID,
+                    rowCount: snapshot.groups.reduce(0) { $0 + $1.models.count }
+                )
             } else {
                 // Out-of-order live: buffer it until the base lands. A
                 // live-only publication is forbidden.
@@ -420,8 +562,12 @@ actor ChatModelCatalogCoordinator {
             }
 
         case let .liveFailed(metadata, category):
-            // The base stays the visible catalog; the failure is non-terminal.
-            publish(.liveFailed(metadata, category))
+            guard let contextKey = currentOperation?.verifiedContextKey else { return }
+            guard await publish(
+                .liveFailed(metadata, category),
+                metadata: metadata,
+                contextKey: contextKey
+            ) else { return }
             emitTelemetry(
                 surface: .live,
                 phase: .ended,
@@ -430,17 +576,36 @@ actor ChatModelCatalogCoordinator {
             )
 
         case let .failed(metadata, phase, category):
-            // Terminal. A previously verified snapshot for the same context
-            // is republished read-only as staleFailed; otherwise the catalog
-            // is cold-failed and loading is cleared.
+            // Mark terminal before the first terminal yield so late rows are
+            // rejected while the failed/stale/state sequence is being fenced.
+            guard let current = currentOperation,
+                  current.operationID == operationID,
+                  current.operationGeneration == metadata.operationGeneration
+            else { return }
             currentOperation?.isTerminal = true
             currentOperation?.pendingLive = nil
-            publish(.failed(metadata, phase, category))
-            if let contextKey = op.verifiedContextKey ?? visibleContextKey, cache[contextKey] != nil {
-                publishCachedRows(for: contextKey, metadata: metadata)
-                setState(.staleFailed)
+            guard await publish(
+                .failed(metadata, phase, category),
+                metadata: metadata,
+                contextKey: current.verifiedContextKey ?? visibleContextKey
+            ) else { return }
+
+            if let contextKey = current.verifiedContextKey ?? visibleContextKey,
+               cache[contextKey] != nil {
+                let revisionAtRead = cacheRevision
+                guard await publishCachedRows(
+                    for: contextKey,
+                    metadata: metadata,
+                    cacheRevision: revisionAtRead
+                ) else { return }
+                _ = await setState(
+                    .staleFailed,
+                    metadata: metadata,
+                    contextKey: contextKey,
+                    cacheRevision: revisionAtRead
+                )
             } else {
-                setState(.coldFailed(category))
+                _ = await setState(.coldFailed(category), metadata: metadata)
             }
             emitTelemetry(
                 surface: phase == .context ? .context : (phase == .live ? .live : .models),
@@ -450,14 +615,22 @@ actor ChatModelCatalogCoordinator {
             )
 
         case let .finished(metadata):
+            guard let current = currentOperation,
+                  current.operationID == operationID,
+                  current.operationGeneration == metadata.operationGeneration
+            else { return }
             currentOperation?.isTerminal = true
             currentOperation?.pendingLive = nil
-            publish(.finished(metadata))
+            _ = await publish(.finished(metadata), metadata: metadata)
 
         case let .cancelled(metadata):
+            guard let current = currentOperation,
+                  current.operationID == operationID,
+                  current.operationGeneration == metadata.operationGeneration
+            else { return }
             currentOperation?.isTerminal = true
             currentOperation?.pendingLive = nil
-            publish(.cancelled(metadata))
+            guard await publish(.cancelled(metadata), metadata: metadata) else { return }
             emitTelemetry(
                 surface: .picker,
                 phase: .cancelled,
@@ -471,7 +644,12 @@ actor ChatModelCatalogCoordinator {
     /// still belongs to this operation, so a superseded completion's cleanup
     /// can never remove a replacement operation.
     private func handleNetworkStreamFinished(operationID: UUID) {
-        if currentOperation?.operationID == operationID {
+        guard currentOperation?.operationID == operationID else { return }
+        // Keep a terminal record until the next operation replaces it so a
+        // consumer that receives a queued terminal/state event after the
+        // producer stream drains can still validate its metadata. An
+        // unterminated stream is not authoritative and is removed.
+        if currentOperation?.isTerminal != true {
             currentOperation = nil
         }
     }
@@ -524,13 +702,50 @@ actor ChatModelCatalogCoordinator {
         return provisional
     }
 
+    /// Starts a metadata-only operation for a fresh cache replay. This keeps
+    /// the replay's UUID/generation distinct from the completed network
+    /// operation while avoiding a second request.
+    private func startCacheReplayOperation(
+        contextKey: CatalogContextKey,
+        startingGateEpoch: UInt64
+    ) -> CatalogEventMetadata {
+        let operationID = UUID()
+        let operationGeneration = nextOperationGeneration
+        nextOperationGeneration += 1
+        let operationKey = CatalogOperationKey(
+            gateKey: gateKey,
+            apiClientID: apiClientID,
+            authGeneration: authGeneration,
+            requestedProfile: nil,
+            startingGateEpoch: startingGateEpoch
+        )
+        let metadata = CatalogEventMetadata(
+            identity: .verified(contextKey),
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        currentOperation = CurrentOperation(
+            operationID: operationID,
+            operationGeneration: operationGeneration,
+            operationKey: operationKey,
+            verifiedContextKey: contextKey,
+            profileContext: nil,
+            pendingLive: nil
+        )
+        return metadata
+    }
+
     // MARK: Cache policy
 
     /// Republishes the completed projection for a context, rebound to the
     /// given (current operation) metadata.
-    private func publishCachedRows(for contextKey: CatalogContextKey, metadata: CatalogEventMetadata) {
-        guard let entry = cache[contextKey] else { return }
-        publish(
+    private func publishCachedRows(
+        for contextKey: CatalogContextKey,
+        metadata: CatalogEventMetadata,
+        cacheRevision: UInt64
+    ) async -> Bool {
+        guard let entry = cache[contextKey], self.cacheRevision == cacheRevision else { return false }
+        return await publish(
             .base(
                 CatalogBaseSnapshot(
                     metadata: metadata,
@@ -538,7 +753,10 @@ actor ChatModelCatalogCoordinator {
                     defaultModel: entry.defaultModel,
                     activeProvider: entry.activeProvider
                 )
-            )
+            ),
+            metadata: metadata,
+            contextKey: contextKey,
+            cacheRevision: cacheRevision
         )
     }
 
@@ -563,14 +781,148 @@ actor ChatModelCatalogCoordinator {
 
     // MARK: Publication and state
 
-    private func publish(_ event: CatalogEvent) {
-        multicast.publish(event)
+    /// Complete acceptance fence for one coordinator publication. The
+    /// authoritative epoch is read across an actor await, then every caller
+    /// rechecks operation identity, context, cancellation, and cache revision
+    /// before yielding. `allowUnboundVerifiedContext` is used only for the
+    /// contextVerified write site, before that event establishes the context.
+    private func acceptsPublication(
+        metadata: CatalogEventMetadata,
+        contextKey: CatalogContextKey? = nil,
+        cacheRevision expectedCacheRevision: UInt64? = nil,
+        allowUnboundVerifiedContext: Bool = false
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              let operation = currentOperation,
+              operation.operationID == metadata.operationID,
+              operation.operationGeneration == metadata.operationGeneration
+        else { return false }
+
+        let expectedEpoch: UInt64
+        let metadataGateKey: ProfileContextGateKey
+        switch metadata.identity {
+        case let .provisional(key):
+            guard key == operation.operationKey else { return false }
+            expectedEpoch = key.startingGateEpoch
+            metadataGateKey = key.gateKey
+        case let .verified(key):
+            if allowUnboundVerifiedContext && operation.verifiedContextKey == nil {
+                guard key.gateKey == operation.operationKey.gateKey,
+                      key.apiClientID == operation.operationKey.apiClientID,
+                      key.authGeneration == operation.operationKey.authGeneration,
+                      key.gateEpoch == operation.operationKey.startingGateEpoch
+                else { return false }
+            } else {
+                guard operation.verifiedContextKey == key else { return false }
+            }
+            expectedEpoch = key.gateEpoch
+            metadataGateKey = key.gateKey
+        }
+
+        guard metadataGateKey == gateKey else { return false }
+        if let contextKey {
+            guard contextKey.gateKey == gateKey,
+                  contextKey.apiClientID == apiClientID,
+                  contextKey.authGeneration == authGeneration,
+                  contextKey.gateEpoch == expectedEpoch
+            else { return false }
+            if !allowUnboundVerifiedContext,
+               let verifiedContextKey = operation.verifiedContextKey {
+                guard verifiedContextKey == contextKey else { return false }
+            }
+        }
+        if let expectedCacheRevision {
+            guard cacheRevision == expectedCacheRevision else { return false }
+        }
+
+        let gate = ProfileContextGateRegistry.shared.gate(for: metadataGateKey)
+        let authoritativeEpoch = await gate.gateEpoch
+        guard !Task.isCancelled,
+              authoritativeEpoch == expectedEpoch,
+              let current = currentOperation,
+              current.operationID == metadata.operationID,
+              current.operationGeneration == metadata.operationGeneration
+        else { return false }
+        switch metadata.identity {
+        case let .provisional(key):
+            guard current.operationKey == key else { return false }
+        case let .verified(key):
+            if allowUnboundVerifiedContext && current.verifiedContextKey == nil {
+                guard key.gateEpoch == current.operationKey.startingGateEpoch else { return false }
+            } else {
+                guard current.verifiedContextKey == key else { return false }
+            }
+        }
+        if let contextKey {
+            if !allowUnboundVerifiedContext,
+               let verifiedContextKey = current.verifiedContextKey {
+                guard verifiedContextKey == contextKey else { return false }
+            }
+            guard contextKey.gateEpoch == expectedEpoch else { return false }
+        }
+        if let expectedCacheRevision {
+            guard cacheRevision == expectedCacheRevision else { return false }
+        }
+        return true
     }
 
-    private func setState(_ newState: CatalogCacheState) {
-        guard newState != state else { return }
-        state = newState
-        publish(.state(newState))
+    /// The final multicast boundary. Continuations are snapshotted without
+    /// yielding, then the complete fence is repeated immediately before each
+    /// individual continuation yield.
+    @discardableResult
+    private func publish(
+        _ event: CatalogEvent,
+        metadata: CatalogEventMetadata? = nil,
+        contextKey: CatalogContextKey? = nil,
+        cacheRevision: UInt64? = nil,
+        allowUnboundVerifiedContext: Bool = false
+    ) async -> Bool {
+        guard let resolvedMetadata = metadata ?? event.publicationMetadata,
+              await acceptsPublication(
+                  metadata: resolvedMetadata,
+                  contextKey: contextKey,
+                  cacheRevision: cacheRevision,
+                  allowUnboundVerifiedContext: allowUnboundVerifiedContext
+              )
+        else { return false }
+
+        let continuations = multicast.snapshot()
+        for continuation in continuations {
+            guard await acceptsPublication(
+                metadata: resolvedMetadata,
+                contextKey: contextKey,
+                cacheRevision: cacheRevision,
+                allowUnboundVerifiedContext: allowUnboundVerifiedContext
+            ) else { return false }
+            continuation.yield(event)
+        }
+        return true
+    }
+
+    @discardableResult
+    private func setState(
+        _ newState: CatalogCacheState,
+        metadata: CatalogEventMetadata,
+        contextKey: CatalogContextKey? = nil,
+        cacheRevision: UInt64? = nil
+    ) async -> Bool {
+        guard await acceptsPublication(
+            metadata: metadata,
+            contextKey: contextKey,
+            cacheRevision: cacheRevision
+        ) else { return false }
+
+        if newState != state {
+            guard await publish(
+                .state(newState),
+                metadata: metadata,
+                contextKey: contextKey,
+                cacheRevision: cacheRevision
+            ) else { return false }
+            state = newState
+        }
+        stateSnapshot = CatalogStateSnapshot(metadata: metadata, state: newState)
+        return true
     }
 
     private func emitTelemetry(
@@ -620,14 +972,13 @@ private struct CurrentOperation: Sendable {
     var isTerminal = false
 }
 
-/// Completed context entry: the projection WITHOUT event metadata, plus the
-/// last-known operation metadata used to rebind cache publications.
+/// Completed context entry: the projection WITHOUT event metadata. Delivery
+/// metadata is created afresh for every current operation.
 private struct CachedContext: Sendable {
     let groups: [ModelCatalogGroup]
     let defaultModel: String?
     let activeProvider: String?
     let publishedAt: Date
-    let lastKnownMetadata: CatalogEventMetadata
 }
 
 /// Lock-protected multicast fan-out. Each subscriber receives its own
@@ -658,13 +1009,11 @@ private final class CatalogEventMulticast: @unchecked Sendable {
         return stream
     }
 
-    func publish(_ event: CatalogEvent) {
+    func snapshot() -> [AsyncStream<CatalogEvent>.Continuation] {
         lock.lock()
         let continuations = Array(continuations.values)
         lock.unlock()
-        for continuation in continuations {
-            continuation.yield(event)
-        }
+        return continuations
     }
 
     /// Finish every subscriber stream exactly once.

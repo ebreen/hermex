@@ -568,7 +568,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
-    func testFreshCacheHitPublishesWithLastKnownMetadata() async throws {
+    func testFreshCacheHitPublishesWithFreshOperationMetadata() async throws {
         let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
         let harness = makeHarness(clock: { clock.now() })
         let subscriber = await makeSubscriber(harness.coordinator)
@@ -598,15 +598,22 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             }.count >= 2
         }
 
-        // The cache stores projections without event metadata; a cache-hit
-        // publication carries the last-known operation metadata for the context.
+        // The cache stores projections without event metadata; a fresh replay
+        // creates new operation metadata for the current publication.
         let cachedBase = try XCTUnwrap(lastBase(in: subscriber.collector.snapshot()))
         XCTAssertEqual(cachedBase.groups.map(\.id), ["openai"])
-        XCTAssertEqual(
+        XCTAssertNotEqual(
             cachedBase.metadata.operationID,
             originalCall.operationID,
-            "a fresh cache hit rebinds the last-known operation metadata"
+            "a fresh cache hit must not replay the old operation metadata"
         )
+        let stateSnapshot = await harness.coordinator.currentStateSnapshot()
+        XCTAssertNotNil(stateSnapshot)
+        if let stateSnapshot {
+            XCTAssertEqual(stateSnapshot.metadata.operationID, cachedBase.metadata.operationID)
+            XCTAssertEqual(stateSnapshot.state, .freshReady)
+            XCTAssertNotEqual(stateSnapshot.metadata.operationGeneration, originalCall.operationGeneration)
+        }
         await cancel(subscriber)
     }
 
