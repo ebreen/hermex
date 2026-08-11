@@ -1702,11 +1702,22 @@ final class ChatViewModel {
                 && !loadedMessagesContainEquivalentUserMessage(loadedMessages, localMessage: cachedMessage)
         }
 
-        guard !localUserMessages.isEmpty else {
+        // Cached terminal events (stable `term-v1-` message IDs, #18 Slice 5)
+        // merge through even when the server transcript omits them. They are
+        // deduped by message ID so a restored terminal event appears exactly
+        // once; a different logical generation/outcome is a different key and
+        // is NOT deduped away.
+        let loadedTerminalIDs = Set(loadedMessages.compactMap { $0.messageId }.filter { $0.hasPrefix("term-v1-") })
+        let cachedTerminalEvents = cachedMessages.filter { message in
+            guard let messageID = message.messageId, messageID.hasPrefix("term-v1-") else { return false }
+            return !loadedTerminalIDs.contains(messageID)
+        }
+
+        guard !localUserMessages.isEmpty || !cachedTerminalEvents.isEmpty else {
             return loadedMessages
         }
 
-        return localUserMessages.reduce(into: loadedMessages) { partialMessages, localMessage in
+        return (localUserMessages + cachedTerminalEvents).reduce(into: loadedMessages) { partialMessages, localMessage in
             insertLocalOptimisticMessage(localMessage, into: &partialMessages)
         }
     }
