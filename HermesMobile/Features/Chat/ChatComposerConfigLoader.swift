@@ -55,7 +55,7 @@ struct ChatComposerConfigState: Equatable, Sendable {
 
 struct ChatComposerConfigLoadResult: Sendable {
     let state: ChatComposerConfigState
-    let configurationError: Error?; let configurationFailure: ChatComposerConfigFailure?
+    let configurationFailure: ChatComposerConfigFailure?
 }
 
 struct ChatComposerConfigLoader {
@@ -153,9 +153,26 @@ struct ChatComposerConfigLoader {
 
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationError: configurationError,
-            configurationFailure: nil
+            configurationFailure: Self.failureCategory(from: configurationError)
         )
+    }
+
+    private static func failureCategory(from error: Error?) -> ChatComposerConfigFailure? {
+        guard let error else { return nil }
+        let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        if message.localizedCaseInsensitiveContains("profile") {
+            if message.localizedCaseInsensitiveContains("switch") {
+                return .profileSwitchRejected
+            }
+            return .profileUnavailable
+        }
+        if message.localizedCaseInsensitiveContains("reasoning") {
+            return .reasoningUnavailable
+        }
+        if message.localizedCaseInsensitiveContains("workspace") || message.localizedCaseInsensitiveContains("command") {
+            return .workspacesUnavailable
+        }
+        return .catalogUnavailable
     }
 
     private static func profileSummary(
@@ -356,4 +373,38 @@ enum ChatComposerConfigFailure: Equatable, Sendable {
     case catalogUnavailable
     case reasoningUnavailable
     case workspacesUnavailable
+
+    var code: Int {
+        switch self {
+        case .profileUnavailable: return 1
+        case .profileSwitchRejected: return 2
+        case .catalogUnavailable: return 3
+        case .reasoningUnavailable: return 4
+        case .workspacesUnavailable: return 5
+        }
+    }
+
+    var localizedDescription: String {
+        switch self {
+        case .profileUnavailable: return "Profile catalog is unavailable."
+        case .profileSwitchRejected: return "Profile switch was rejected."
+        case .catalogUnavailable: return "Model catalog is unavailable."
+        case .reasoningUnavailable: return "Reasoning configuration is unavailable."
+        case .workspacesUnavailable: return "Workspace configuration is unavailable."
+        }
+    }
+}
+
+extension ChatComposerConfigLoadResult {
+    /// Compatibility projection for pre-Slice-3 consumers. The Sendable
+    /// result never carries a raw `Error` (v14 §310-330).
+    var configurationError: Error? {
+        configurationFailure.map { failure in
+            NSError(
+                domain: "ChatComposerConfigLoader",
+                code: failure.code,
+                userInfo: [NSLocalizedDescriptionKey: failure.localizedDescription]
+            )
+        }
+    }
 }
