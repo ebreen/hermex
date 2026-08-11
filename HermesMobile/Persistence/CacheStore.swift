@@ -291,6 +291,37 @@ enum CacheStore {
     }
 }
 
+/// Production `ChatTerminalCacheWriter` (#18 §522): persists a terminal
+/// handoff through the existing `CacheStore.cacheMessages` over the handoff's
+/// post-append snapshot, keyed by the commit's server session ID. The
+/// terminal event is an ordinary `ChatMessage` whose `messageId` is the
+/// stable run-status-v1 key — no SwiftData model, schema field, or migration
+/// (#18 §498). A missing model context throws so the ViewModel retains the
+/// handoff for retry.
+@MainActor
+struct CacheStoreTerminalCacheWriter: ChatTerminalCacheWriter {
+    let serverURL: URL
+
+    func persistPendingTerminalPersistence(
+        for handoff: ChatTerminalPersistenceHandoff,
+        modelContext: ModelContext?
+    ) throws {
+        guard let modelContext else {
+            throw CacheStoreTerminalCacheWriterError.missingModelContext
+        }
+        try CacheStore.cacheMessages(
+            handoff.postAppendMessages,
+            serverURL: serverURL,
+            sessionID: handoff.commit.serverSessionID,
+            in: modelContext
+        )
+    }
+}
+
+enum CacheStoreTerminalCacheWriterError: Error {
+    case missingModelContext
+}
+
 private extension SessionSummary {
     init(cachedSession: CachedSession) {
         sessionId = cachedSession.sessionID

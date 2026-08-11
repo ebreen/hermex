@@ -2243,7 +2243,8 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
-            "Final answer loaded without leaving the chat."
+            "Final answer loaded without leaving the chat.",
+            "Response complete"
         ])
     }
 
@@ -2337,7 +2338,8 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Keep working",
-            "Final answer arrived after the stream was marked inactive."
+            "Final answer arrived after the stream was marked inactive.",
+            "Response complete"
         ])
     }
 
@@ -2412,7 +2414,7 @@ final class ChatViewModelSendTests: XCTestCase {
 
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(streamClient.stopCount, 1)
-            XCTAssertEqual(viewModel.messages.compactMap(\.role), ["user", "assistant", "tool"])
+            XCTAssertEqual(viewModel.messages.compactMap(\.role), ["user", "assistant", "tool", "local_notice"])
             XCTAssertEqual(viewModel.messages.first(where: { $0.role == "assistant" })?.toolCalls?.count, 1)
         }
     }
@@ -2494,9 +2496,13 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(viewModel.displayTitle, "Approval test")
         XCTAssertEqual(viewModel.messages.compactMap(\.content), [
             "Do it one more time",
-            "Same result -- approval gate triggered, then the usual JSON-is-not-bash errors."
+            "Same result -- approval gate triggered, then the usual JSON-is-not-bash errors.",
+            "Response complete"
         ])
-        XCTAssertEqual(viewModel.messages.last?.messageId, "assistant-1")
+        XCTAssertTrue(
+            viewModel.messages.last?.messageId?.hasPrefix("run-status-v1-") == true,
+            "The terminal event's messageId is the stable run-status-v1 key"
+        )
     }
 
     func testCompletedStreamSessionDoesNotRequireFollowUpTranscriptRefresh() {
@@ -2539,7 +2545,7 @@ final class ChatViewModelSendTests: XCTestCase {
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
             XCTAssertFalse(viewModel.responseCompletionNeedsTranscriptRefresh)
-            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done."])
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done.", "Response complete"])
         }
     }
 
@@ -2565,7 +2571,7 @@ final class ChatViewModelSendTests: XCTestCase {
             XCTAssertNil(viewModel.activeStreamID)
             XCTAssertEqual(viewModel.responseCompletionHapticTrigger, 1)
             XCTAssertTrue(viewModel.responseCompletionNeedsTranscriptRefresh)
-            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done."])
+            XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Summarize", "Done.", "Response complete"])
         }
     }
 
@@ -3870,7 +3876,11 @@ final class ChatViewModelSendTests: XCTestCase {
 
         XCTAssertNil(viewModel.activeStreamID)
         XCTAssertEqual(viewModel.activeStreamRecoveryState, .idle)
-        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Recovered full answer."])
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), [
+            "Keep working",
+            "Recovered full answer.",
+            "Response complete"
+        ])
         XCTAssertEqual(streamClient.stopCount, 1)
         XCTAssertEqual(requestPaths, ["/api/chat/start", "/api/chat/stream/status", "/api/session"])
     }
@@ -3939,7 +3949,7 @@ final class ChatViewModelSendTests: XCTestCase {
                 errorSummary: nil
             )
         ])
-        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Partial "])
+        XCTAssertEqual(viewModel.messages.compactMap(\.content), ["Keep working", "Partial ", "Response failed"])
     }
 
     @MainActor
@@ -6125,7 +6135,7 @@ final class ChatViewModelSendTests: XCTestCase {
         // reload, so only the locally appended message is present.
         XCTAssertFalse(didReloadMessages)
         XCTAssertNil(viewModel.activeStreamID)
-        XCTAssertEqual(viewModel.messages.map(\.content), ["Keep working"])
+        XCTAssertEqual(viewModel.messages.map(\.content), ["Keep working", "Response complete"])
         XCTAssertNil(viewModel.sendErrorMessage)
         XCTAssertEqual(streamClient.stopCount, 2)
     }
@@ -6502,7 +6512,8 @@ final class ChatViewModelSendTests: XCTestCase {
             "Recent question",
             "Recent answer",
             "Newest question",
-            "Newest answer"
+            "Newest answer",
+            "Response complete"
         ])
         XCTAssertEqual(viewModel.messagesOffset, 0)
         XCTAssertFalse(viewModel.hasOlderMessages)
@@ -7167,8 +7178,158 @@ final class ChatViewModelSendTests: XCTestCase {
         return userDefaults
     }
 
+    // MARK: - Slice 5 (#18): stable terminal event, generation store, commit
+    //
+    // The terminal event is an ordinary local message whose stable messageID
+    // is the run-status-v1 key (ChatRunStatusTerminalEventKey).
+    // appendRunStatusTerminalEvent(key:text:) dedupes by that stable message
+    // ID; the injected ChatRunGenerationStore persists/restores the logical
+    // run generation (#18 §473); and the coordinator invokes
+    // streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit)
+    // exactly once per terminal transition. All referenced production symbols
+    // are intended-missing and added in GREEN, so this file is native RED.
+
+    @MainActor
+    func testAppendRunStatusTerminalEventDedupesByStableMessageID() throws {
+        let viewModel = try makeViewModel { request in
+            XCTFail("No network request is expected: \(request.url?.path ?? "nil")")
+            throw URLError(.badURL)
+        }
+
+        let identity = ChatRunIdentity(sessionID: "session-abc", streamID: "stream-1", generation: 1)
+        let key = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed)
+
+        viewModel.appendRunStatusTerminalEvent(key: key, text: "Response complete")
+        viewModel.appendRunStatusTerminalEvent(key: key, text: "Response complete")
+
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == key.messageID }.count, 1,
+            "appendRunStatusTerminalEvent appends once when called twice with the same stable key"
+        )
+        XCTAssertEqual(
+            viewModel.messages.first { $0.messageId == key.messageID }?.content,
+            "Response complete"
+        )
+
+        // A different outcome is a different stable key: it appends a second,
+        // distinct terminal event instead of deduping globally.
+        let cancelledKey = ChatRunStatusTerminalEventKey(identity: identity, outcome: .cancelled)
+        viewModel.appendRunStatusTerminalEvent(key: cancelledKey, text: "Response cancelled")
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == key.messageID }.count, 1)
+        XCTAssertEqual(viewModel.messages.filter { $0.messageId == cancelledKey.messageID }.count, 1)
+    }
+
+    func testChatRunGenerationStorePersistsAndRestoresLogicalGeneration() throws {
+        // §473: the record (sessionID, streamID, lastIssuedGeneration,
+        // activeGeneration?) is replaced atomically as one complete record in
+        // the UserDefaults namespace hermex.chat.run-status-generation.v1.
+        let suiteName = "ChatViewModelSendTests.RunGeneration.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsRunGenerationStore(defaults: defaults)
+        XCTAssertNil(store.record(for: "session-A", streamID: "stream-1"))
+
+        store.replace(ChatRunGenerationRecord(
+            sessionID: "session-A",
+            streamID: "stream-1",
+            lastIssuedGeneration: 3,
+            activeGeneration: 3
+        ))
+
+        // Relaunch: a fresh store over the same namespace restores the exact
+        // persisted logical generation — it does not allocate a new one.
+        let relaunchedStore = UserDefaultsRunGenerationStore(defaults: defaults)
+        var record = try XCTUnwrap(relaunchedStore.record(for: "session-A", streamID: "stream-1"))
+        XCTAssertEqual(record.lastIssuedGeneration, 3, "Restore returns the persisted lastIssuedGeneration")
+        XCTAssertEqual(record.activeGeneration, 3, "Restore returns the persisted activeGeneration")
+
+        // Same-stream-ID replacement: max(lastIssued, current) + 1, persisted
+        // before the connection opens.
+        relaunchedStore.replace(ChatRunGenerationRecord(
+            sessionID: "session-A",
+            streamID: "stream-1",
+            lastIssuedGeneration: 4,
+            activeGeneration: 4
+        ))
+        record = try XCTUnwrap(relaunchedStore.record(for: "session-A", streamID: "stream-1"))
+        XCTAssertEqual(record.lastIssuedGeneration, 4)
+
+        // Terminal commit: retain lastIssuedGeneration, clear only
+        // activeGeneration.
+        relaunchedStore.replace(ChatRunGenerationRecord(
+            sessionID: "session-A",
+            streamID: "stream-1",
+            lastIssuedGeneration: 4,
+            activeGeneration: nil
+        ))
+        record = try XCTUnwrap(relaunchedStore.record(for: "session-A", streamID: "stream-1"))
+        XCTAssertEqual(record.lastIssuedGeneration, 4)
+        XCTAssertNil(record.activeGeneration)
+
+        // Other streams are untouched.
+        XCTAssertNil(relaunchedStore.record(for: "session-A", streamID: "stream-2"))
+    }
+
+    @MainActor
+    func testStreamCoordinatorDidCommitTerminalInvokedExactlyOncePerTerminalTransition() async throws {
+        let streamClient = SpySSEStreamingClient()
+        let viewModel = try makeViewModel(
+            runGenerationStore: InMemoryRunGenerationStore(),
+            streamClient: streamClient
+        ) { request in
+            switch request.url?.path {
+            case "/api/goal":
+                return apiTestJSONResponse(
+                    #"{"ok": true, "action": "set", "message": "Goal set.", "goal": {"goal": "Ship the build", "status": "active", "turns_used": 0, "max_turns": 20}, "kickoff_prompt": "Start executing the goal."}"#,
+                    for: request
+                )
+            case "/api/session":
+                return apiTestJSONResponse(
+                    #"{"session": {"session_id": "session-abc", "title": "Planning", "active_stream_id": "stream-goal", "messages": [{"role": "user", "content": "Start executing the goal.", "timestamp": 1770000100, "message_id": "user-goal"}]}}"#,
+                    for: request
+                )
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let didSubmit = await viewModel.submitGoal(args: "Ship the build")
+        XCTAssertTrue(didSubmit)
+        XCTAssertEqual(streamClient.startedURLs.count, 1)
+
+        // The fresh in-memory generation store allocates logical generation 1
+        // for the first run on this stream.
+        let identity = ChatRunIdentity(sessionID: "session-abc", streamID: "stream-goal", generation: 1)
+        let terminalID = ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed).messageID
+
+        // First terminal candidate: the centralized transition commits exactly
+        // once and the delegate appends the stable local event.
+        streamClient.emit(.done(DoneStreamEvent()))
+
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == terminalID }.count, 1,
+            "The terminal transition invokes streamCoordinatorDidCommitTerminal exactly once"
+        )
+        XCTAssertEqual(
+            viewModel.messages.first { $0.messageId == terminalID }?.content,
+            "Response complete"
+        )
+
+        // A second terminal candidate (.streamEnd) must not commit a second
+        // time: no duplicate event is appended.
+        streamClient.emit(.streamEnd)
+
+        XCTAssertEqual(
+            viewModel.messages.filter { $0.messageId == terminalID }.count, 1,
+            "A late terminal candidate does not invoke the commit callback again"
+        )
+    }
+
     @MainActor
     private func makeViewModel(
+        runGenerationStore: any ChatRunGenerationStore = InMemoryRunGenerationStore(),
         streamClient: SSEStreamingClient? = nil,
         approvalStreamClient: SSEStreamingClient? = nil,
         clarifyStreamClient: SSEStreamingClient? = nil,
@@ -7205,6 +7366,7 @@ final class ChatViewModelSendTests: XCTestCase {
             server: server,
             client: resolvedClient,
             streamClient: resolvedStreamClient,
+            runGenerationStore: runGenerationStore,
             approvalStreamClient: approvalStreamClient ?? SpySSEStreamingClient(),
             clarifyStreamClient: clarifyStreamClient ?? SpySSEStreamingClient(),
             liveActivityManager: liveActivityManager,

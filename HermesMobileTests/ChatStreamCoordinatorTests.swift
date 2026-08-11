@@ -871,7 +871,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         coordinator.start(streamID: "stream-123")
         let firstIdentity = try XCTUnwrap(coordinator.runIdentity)
         XCTAssertEqual(firstIdentity.streamID, "stream-123")
-        XCTAssertEqual(firstIdentity.logicalGeneration, 1)
+        XCTAssertEqual(firstIdentity.generation, 1)
 
         // Replacement run with the SAME stream ID: new logical generation, not a
         // continuation of the first run.
@@ -879,7 +879,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         let replacementIdentity = try XCTUnwrap(coordinator.runIdentity)
         XCTAssertEqual(streamClient.startedURLs.count, 2)
         XCTAssertEqual(replacementIdentity.streamID, "stream-123")
-        XCTAssertEqual(replacementIdentity.logicalGeneration, firstIdentity.logicalGeneration + 1)
+        XCTAssertEqual(replacementIdentity.generation, firstIdentity.generation + 1)
         XCTAssertNotEqual(replacementIdentity, firstIdentity)
     }
 
@@ -1943,7 +1943,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         // full active-stream cleanup (stream finished, Live Activity ended).
         XCTAssertEqual(delegate.terminalTransitions, [
             RecordedTerminalTransition(
-                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-123", generation: 1),
                 outcome: .completed
             )
         ])
@@ -1979,7 +1979,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
 
         XCTAssertEqual(delegate.terminalTransitions, [
             RecordedTerminalTransition(
-                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-123", generation: 1),
                 outcome: .failed
             )
         ])
@@ -2015,7 +2015,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
 
         XCTAssertEqual(delegate.terminalTransitions, [
             RecordedTerminalTransition(
-                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-123", generation: 1),
                 outcome: .cancelled
             )
         ])
@@ -2053,7 +2053,7 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
 
         XCTAssertEqual(delegate.terminalTransitions, [
             RecordedTerminalTransition(
-                identity: ChatRunIdentity(streamID: "stream-123", logicalGeneration: 1),
+                identity: ChatRunIdentity(sessionID: "session-abc", streamID: "stream-123", generation: 1),
                 outcome: .failed
             )
         ])
@@ -2419,12 +2419,169 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         return coordinator
     }
 
+    // MARK: - Slice 5 (#18): terminal commit and generation store
+
+    // The centralized terminal transition constructs exactly one complete
+    // ChatRunTerminalCommit (identity, outcome, stable event key, server IDs)
+    // and invokes streamCoordinatorDidCommitTerminal exactly once — a commit,
+    // never a pre-append handoff.
+    @MainActor
+    func testTerminalTransitionEmitsExactlyOneTerminalCommit() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        coordinator.start(streamID: "stream-123")
+        let identity = try XCTUnwrap(coordinator.runIdentity)
+        streamClient.emit(.done(DoneStreamEvent()))
+
+        XCTAssertEqual(delegate.terminalCommits.count, 1,
+                       "Exactly one terminal commit per accepted transition")
+        let commit = try XCTUnwrap(delegate.terminalCommits.first)
+        XCTAssertEqual(commit.identity, identity)
+        XCTAssertEqual(commit.outcome, .completed)
+        XCTAssertEqual(commit.serverSessionID, identity.sessionID)
+        XCTAssertEqual(commit.serverStreamID, identity.streamID)
+        XCTAssertEqual(commit.eventKey, ChatRunStatusTerminalEventKey(identity: identity, outcome: .completed))
+    }
+
+    // A late terminal event from the completing connection is admitted by the
+    // fence but performs no second transition and emits no second commit.
+    @MainActor
+    func testLateTerminalEventsDoNotEmitASecondCommit() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate)
+
+        coordinator.start(streamID: "stream-123")
+        streamClient.emit(.done(DoneStreamEvent()))
+        streamClient.emit(.streamEnd)
+        streamClient.emit(.cancelled)
+
+        XCTAssertEqual(delegate.terminalCommits.count, 1,
+                       "First-valid terminal wins; later candidates emit no commit")
+        XCTAssertEqual(delegate.terminalEventCount, 1)
+    }
+
+    // Same-stream-ID replacement: the generation store persists
+    // max(lastIssuedGeneration, current) + 1 BEFORE the connection opens.
+    @MainActor
+    func testSameStreamReplacementPersistsMaxPlusOneInGenerationStore() throws {
+        let store = InMemoryRunGenerationStore()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(delegate: delegate, runGenerationStore: store)
+
+        coordinator.start(streamID: "stream-123")
+        let first = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(first.generation, 1)
+
+        coordinator.start(streamID: "stream-123")
+        let replacement = try XCTUnwrap(coordinator.runIdentity)
+        XCTAssertEqual(replacement.generation, first.generation + 1)
+
+        let record = try XCTUnwrap(store.record(for: "session-abc", streamID: "stream-123"))
+        XCTAssertEqual(record.lastIssuedGeneration, 2,
+                       "Same-stream replacement persists the new logical generation")
+        XCTAssertEqual(record.activeGeneration, 2)
+    }
+
+    // Reconnect/relaunch with the same non-empty active stream ID as the
+    // store's activeGeneration RESTORES the exact logical generation before
+    // openConnection; it does not allocate a new one.
+    @MainActor
+    func testResumeRestoresPersistedActiveGenerationInsteadOfAllocating() throws {
+        let store = InMemoryRunGenerationStore()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(delegate: delegate, runGenerationStore: store)
+
+        coordinator.start(streamID: "stream-123")
+        let original = try XCTUnwrap(coordinator.runIdentity)
+        coordinator.suspendActiveStreamConnection()
+        let preparation = coordinator.prepareForSessionLoad()
+
+        // Authoritative session response: active stream ID matches the record's
+        // activeGeneration → the following resume start restores, not allocates.
+        coordinator.reconcileSessionLoad(
+            loadedActiveStreamID: "stream-123",
+            preparation: preparation,
+            usedCacheFallback: false
+        )
+        coordinator.start(streamID: "stream-123")
+
+        XCTAssertEqual(coordinator.runIdentity?.generation, original.generation,
+                       "Resume restores the exact persisted logical generation")
+        let record = try XCTUnwrap(store.record(for: "session-abc", streamID: "stream-123"))
+        XCTAssertEqual(record.lastIssuedGeneration, 1)
+        XCTAssertEqual(record.activeGeneration, 1)
+    }
+
+    // Terminal commit: retain lastIssuedGeneration, clear only activeGeneration.
+    @MainActor
+    func testTerminalCommitClearsActiveGenerationRetainsLastIssued() throws {
+        let streamClient = CoordinatorSpySSEStreamingClient()
+        let store = InMemoryRunGenerationStore()
+        let delegate = CoordinatorDelegateSpy()
+        let coordinator = makeCoordinator(streamClient: streamClient, delegate: delegate, runGenerationStore: store)
+
+        coordinator.start(streamID: "stream-123")
+        streamClient.emit(.done(DoneStreamEvent()))
+
+        var record = try XCTUnwrap(store.record(for: "session-abc", streamID: "stream-123"))
+        XCTAssertEqual(record.lastIssuedGeneration, 1)
+        XCTAssertNil(record.activeGeneration,
+                     "Terminal commit clears only activeGeneration")
+
+        // A subsequent same-stream run allocates max(lastIssued, current) + 1.
+        coordinator.start(streamID: "stream-123")
+        XCTAssertEqual(coordinator.runIdentity?.generation, 2)
+        record = try XCTUnwrap(store.record(for: "session-abc", streamID: "stream-123"))
+        XCTAssertEqual(record.lastIssuedGeneration, 2)
+        XCTAssertEqual(record.activeGeneration, 2)
+    }
+
+    // Production store: UserDefaults namespace `hermex.chat.run-status-generation.v1`,
+    // whole-record atomic replacement keyed by (sessionID, streamID).
+    func testUserDefaultsRunGenerationStoreRoundTripsWholeRecord() throws {
+        let suiteName = "RunGenerationStoreTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = UserDefaultsRunGenerationStore(defaults: defaults)
+
+        XCTAssertNil(store.record(for: "session-A", streamID: "stream-1"))
+
+        store.replace(ChatRunGenerationRecord(
+            sessionID: "session-A",
+            streamID: "stream-1",
+            lastIssuedGeneration: 7,
+            activeGeneration: 7
+        ))
+        var record = try XCTUnwrap(store.record(for: "session-A", streamID: "stream-1"))
+        XCTAssertEqual(record.lastIssuedGeneration, 7)
+        XCTAssertEqual(record.activeGeneration, 7)
+
+        // Whole-record replacement: the terminal commit retains lastIssued and
+        // clears only activeGeneration.
+        store.replace(ChatRunGenerationRecord(
+            sessionID: "session-A",
+            streamID: "stream-1",
+            lastIssuedGeneration: 7,
+            activeGeneration: nil
+        ))
+        record = try XCTUnwrap(store.record(for: "session-A", streamID: "stream-1"))
+        XCTAssertEqual(record.lastIssuedGeneration, 7)
+        XCTAssertNil(record.activeGeneration)
+
+        // Other streams are untouched.
+        XCTAssertNil(store.record(for: "session-A", streamID: "stream-2"))
+    }
+
     @MainActor
     private func makeCoordinator(
         streamClient: CoordinatorSpySSEStreamingClient? = nil,
         liveActivityManager: CoordinatorSpyLiveActivityManager? = nil,
         delegate: CoordinatorDelegateSpy? = nil,
         timing: ChatStreamCoordinatorTiming = .standard,
+        runGenerationStore: any ChatRunGenerationStore = InMemoryRunGenerationStore(),
         handler: @escaping (URLRequest) throws -> (HTTPURLResponse, Data) = { request in
             apiTestJSONResponse(#"{"active": true}"#, for: request)
         }
@@ -2437,7 +2594,8 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
             streamClient: streamClient,
             liveActivityManager: liveActivityManager,
             showsLiveActivityResponseExcerpts: false,
-            timing: timing
+            timing: timing,
+            runGenerationStore: runGenerationStore
         )
         coordinator.attach(delegate: delegate)
         return coordinator
@@ -2504,6 +2662,8 @@ private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     // MARK: Slice 2 (#18): centralized terminal transition recording
     private(set) var terminalTransitions: [RecordedTerminalTransition] = []
     private(set) var terminalEventCount = 0
+    // MARK: Slice 5 (#18): complete terminal commits (identity + key + server IDs)
+    private(set) var terminalCommits: [ChatRunTerminalCommit] = []
     var onLoadMessages: (() async -> Void)?
 
     func streamCoordinatorLoadMessages(modelContext: ModelContext?) async {
@@ -2613,6 +2773,12 @@ private final class CoordinatorDelegateSpy: ChatStreamCoordinatorDelegate {
     ) {
         terminalTransitions.append(RecordedTerminalTransition(identity: identity, outcome: outcome))
         terminalEventCount += 1
+    }
+
+    /// Terminal-commit callback (#18 Slice 5): invoked exactly once per
+    /// accepted terminal transition with the complete run commit.
+    func streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit) {
+        terminalCommits.append(commit)
     }
 
     func streamCoordinatorApplyApprovalUpdate(_ update: ApprovalPendingResponse) {}

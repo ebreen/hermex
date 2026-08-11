@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 import OSLog
@@ -33,19 +34,184 @@ struct ChatStreamLoadPreparation: Equatable {
 
 /// Identity of one logical run of a chat stream. A replacement run for the
 /// same stream ID is a new logical generation: the identity changes even
-/// though the stream ID does not (#18 Slice 1).
-struct ChatRunIdentity: Equatable {
+/// though the stream ID does not (#18 Slice 1). The logical generation is
+/// persisted through `ChatRunGenerationStore` so cross-relaunch reconnect
+/// dedupes deterministically (#18 §473).
+struct ChatRunIdentity: Equatable, Hashable {
+    let sessionID: String
     let streamID: String
-    let logicalGeneration: Int
+    let generation: Int
+
+    /// Slice 3/4 compatibility alias: the logical run generation.
+    var logicalGeneration: Int { generation }
 }
 
 /// The outcome of a finalized chat run, committed exactly once by the
 /// centralized terminal transition. The FIRST valid terminal candidate for a
-/// run wins; every later candidate is a no-op (#18 Slice 2).
-enum ChatRunTerminalOutcome: Equatable {
+/// run wins; every later candidate is a no-op (#18 Slice 2). The one-byte
+/// stable code is part of the run-status-v1 terminal event key encoding
+/// (#18 §471): completed = 0x01, failed = 0x02, cancelled = 0x03.
+enum ChatRunTerminalOutcome: Equatable, Hashable {
     case completed
     case cancelled
     case failed
+
+    /// The single outcome byte in the canonical run-status-v1 byte stream.
+    var fixedV1Code: UInt8 {
+        switch self {
+        case .completed: return 0x01
+        case .failed: return 0x02
+        case .cancelled: return 0x03
+        }
+    }
+}
+
+/// Stable identity of one terminal transcript event (#18 §446-471): the
+/// complete logical run identity plus the winning outcome. The `messageID` is
+/// `run-status-v1-` + lowercase-hex SHA-256 over the contract's exact
+/// canonical bytes — domain `hermex.chat.run-status-terminal/v1\0`, 4-byte BE
+/// session-byte length + session UTF-8, 4-byte BE stream-byte length + stream
+/// UTF-8, 8-byte BE logical generation, and one outcome byte. The encoding is
+/// fixed and versioned; `connectionGeneration`, timestamps, UUIDs, localized
+/// text, and callback names are excluded, so reconnect/replay produces the
+/// same ID while a same-stream replacement (new logical generation) or a
+/// different outcome produces a different one.
+struct ChatRunStatusTerminalEventKey: Hashable {
+    let identity: ChatRunIdentity
+    let outcome: ChatRunTerminalOutcome
+
+    var messageID: String {
+        let domain = Data("hermex.chat.run-status-terminal/v1".utf8) + Data([0])
+        let session = Data(identity.sessionID.utf8)
+        let stream = Data(identity.streamID.utf8)
+        var bytes = domain
+        bytes.append(contentsOf: UInt32(session.count).bigEndianBytes)
+        bytes.append(session)
+        bytes.append(contentsOf: UInt32(stream.count).bigEndianBytes)
+        bytes.append(stream)
+        bytes.append(contentsOf: UInt64(identity.generation).bigEndianBytes)
+        bytes.append(outcome.fixedV1Code)
+        let digest = SHA256.hash(data: bytes)
+        return "run-status-v1-" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// One finalized run's complete terminal commit: the logical run identity, the
+/// winning outcome, the stable event key, and the server session/stream IDs
+/// the event is cached under (#18 §500-509). Constructed exactly once by the
+/// centralized terminal transition and delivered through
+/// `streamCoordinatorDidCommitTerminal(commit:)`.
+struct ChatRunTerminalCommit: Equatable, Hashable {
+    let identity: ChatRunIdentity
+    let outcome: ChatRunTerminalOutcome
+    let eventKey: ChatRunStatusTerminalEventKey
+    let serverSessionID: String
+    let serverStreamID: String
+}
+
+/// One persisted logical-generation record for a `(sessionID, streamID)` run
+/// (#18 §473): `lastIssuedGeneration` is monotonic across replacements and
+/// relaunches; `activeGeneration` is the exact generation of the run the
+/// server currently reports active. A terminal commit retains
+/// `lastIssuedGeneration` and clears only `activeGeneration`. Writes replace
+/// the whole record atomically.
+struct ChatRunGenerationRecord: Equatable, Codable {
+    let sessionID: String
+    let streamID: String
+    let lastIssuedGeneration: Int
+    let activeGeneration: Int?
+}
+
+/// Persistence seam for the logical run generation (#18 §473): the coordinator
+/// persists max(lastIssuedGeneration, current) + 1 BEFORE opening a
+/// same-stream replacement connection, restores the exact persisted active
+/// generation on reconnect/relaunch, and clears only the active generation on
+/// terminal commit. Production uses the UserDefaults-backed
+/// `UserDefaultsRunGenerationStore`; tests inject in-memory implementations.
+protocol ChatRunGenerationStore {
+    func record(for sessionID: String, streamID: String) -> ChatRunGenerationRecord?
+    func replace(_ record: ChatRunGenerationRecord)
+}
+
+/// In-memory `ChatRunGenerationStore` for tests and previews: whole-record
+/// replacement keyed by `(sessionID, streamID)`.
+final class InMemoryRunGenerationStore: ChatRunGenerationStore {
+    private var records: [String: ChatRunGenerationRecord] = [:]
+
+    func record(for sessionID: String, streamID: String) -> ChatRunGenerationRecord? {
+        records[Self.key(sessionID: sessionID, streamID: streamID)]
+    }
+
+    func replace(_ record: ChatRunGenerationRecord) {
+        records[Self.key(sessionID: record.sessionID, streamID: record.streamID)] = record
+    }
+
+    private static func key(sessionID: String, streamID: String) -> String {
+        "\(sessionID)|\(streamID)"
+    }
+}
+
+/// Production `ChatRunGenerationStore` backed by `UserDefaults` under the
+/// fixed namespace `hermex.chat.run-status-generation.v1` (#18 §473). Each
+/// `(sessionID, streamID)` key holds exactly one complete JSON record;
+/// `replace` swaps it atomically.
+struct UserDefaultsRunGenerationStore: ChatRunGenerationStore {
+    private static let namespace = "hermex.chat.run-status-generation.v1"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+    }
+
+    func record(for sessionID: String, streamID: String) -> ChatRunGenerationRecord? {
+        guard let data = defaults.data(forKey: Self.key(sessionID: sessionID, streamID: streamID)) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ChatRunGenerationRecord.self, from: data)
+    }
+
+    func replace(_ record: ChatRunGenerationRecord) {
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        defaults.set(data, forKey: Self.key(sessionID: record.sessionID, streamID: record.streamID))
+    }
+
+    private static func key(sessionID: String, streamID: String) -> String {
+        "\(namespace)|\(sessionID)|\(streamID)"
+    }
+}
+
+/// The identity-keyed persistence handoff the ViewModel sends to the injected
+/// `ChatTerminalCacheWriter` AFTER appending the stable local notice: the
+/// complete commit, the immutable post-append message snapshot, and the
+/// monotonic handoff generation (#18 §521). One handoff per terminal event key;
+/// a failed write retains the exact handoff for retry.
+struct ChatTerminalPersistenceHandoff {
+    let commit: ChatRunTerminalCommit
+    let postAppendMessages: [ChatMessage]
+    let handoffGeneration: Int
+}
+
+/// Persistence seam for terminal commits (#18 §522-523). The session-scoped
+/// ViewModel is the sole owner of `pendingTerminalPersistenceByKey` and
+/// routes exactly one keyed handoff per attempt through this writer; a
+/// throwing writer keeps the handoff pending for retry, records the error
+/// against that key, and never re-appends the local notice. Production
+/// injects the CacheStore-backed writer; unit tests inject recording/throwing
+/// spies.
+protocol ChatTerminalCacheWriter {
+    func persistPendingTerminalPersistence(
+        for handoff: ChatTerminalPersistenceHandoff,
+        modelContext: ModelContext?
+    ) throws
+}
+
+private extension FixedWidthInteger {
+    /// Big-endian byte representation of this integer, used by the canonical
+    /// run-status-v1 terminal event key encoding (#18 §471).
+    var bigEndianBytes: Data {
+        var value = bigEndian
+        return withUnsafeBytes(of: &value) { Data($0) }
+    }
 }
 
 /// Identity of one connection of a chat run: the logical run identity plus
@@ -185,6 +351,13 @@ protocol ChatStreamCoordinatorDelegate: AnyObject {
         _ outcome: ChatRunTerminalOutcome,
         identity: ChatRunIdentity
     )
+
+    /// Terminal-commit callback (#18 Slice 5, v7): invoked EXACTLY once by the
+    /// centralized terminal transition after the first-valid compare-and-set,
+    /// with the complete run commit (identity, outcome, stable event key,
+    /// server IDs). Even if invoked for an already-terminal state, the
+    /// conformer performs no second commit.
+    func streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit)
 }
 
 extension ChatStreamCoordinatorDelegate {
@@ -194,6 +367,10 @@ extension ChatStreamCoordinatorDelegate {
         _ outcome: ChatRunTerminalOutcome,
         identity: ChatRunIdentity
     ) {}
+
+    /// Default no-op (#18 Slice 5): only the view model persists terminal
+    /// commits (append stable event, keyed handoff, one-writer retry).
+    func streamCoordinatorDidCommitTerminal(_ commit: ChatRunTerminalCommit) {}
 }
 
 @MainActor
@@ -225,8 +402,20 @@ final class ChatStreamCoordinator {
     // generation bumps when a NEW logical run starts; the connection
     // generation bumps on every connection — a replay/reconnect start keeps
     // the logical generation and changes only the connection generation.
+    // The logical generation is persisted through `runGenerationStore` so a
+    // same-stream replacement allocates max(lastIssued, current) + 1 BEFORE
+    // the connection opens and a reconnect/relaunch restores the exact
+    // persisted active generation (#18 §473).
     private var logicalRunGeneration = 0
     private var connectionGeneration = 0
+    private let runGenerationStore: any ChatRunGenerationStore
+
+    /// Stream ID whose persisted `activeGeneration` the next non-replay
+    /// `start` must RESTORE instead of allocating (#18 §473). Set when an
+    /// authoritative session load (or reconnect status) confirms the same
+    /// non-empty active stream ID the store records as active; consumed by
+    /// the next `start` for that stream.
+    private var pendingResumeStreamID: String?
 
     /// Identity of the run finalized by an accepted `.done` (or a transcript
     /// refresh). The completing connection's own terminal events arrive AFTER
@@ -237,14 +426,18 @@ final class ChatStreamCoordinator {
     private var completedRunIdentity: ChatRunIdentity?
 
     /// The current logical run identity, or nil while no run is active.
-    /// Derived from the active stream ID and the run-generation counter so it
-    /// stays consistent with every start/finalize transition. Each connection
-    /// captures its own identity at creation; a callback whose captured
-    /// identity no longer matches this value is fenced before any mutation
-    /// (#18 Slice 1).
+    /// Derived from the active stream ID, the delegate session ID, and the
+    /// persisted logical generation so it stays consistent with every
+    /// start/finalize transition. Each connection captures its own identity
+    /// at creation; a callback whose captured identity no longer matches this
+    /// value is fenced before any mutation (#18 Slice 1).
     var runIdentity: ChatRunIdentity? {
         guard let activeStreamID else { return nil }
-        return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
+        return ChatRunIdentity(
+            sessionID: delegate?.streamCoordinatorSessionID ?? "",
+            streamID: activeStreamID,
+            generation: logicalRunGeneration
+        )
     }
 
     /// The current connection-scoped run identity, or nil while no run is
@@ -281,13 +474,15 @@ final class ChatStreamCoordinator {
         streamClient: SSEStreamingClient,
         liveActivityManager: any AgentLiveActivityManaging,
         showsLiveActivityResponseExcerpts: Bool,
-        timing: ChatStreamCoordinatorTiming = .standard
+        timing: ChatStreamCoordinatorTiming = .standard,
+        runGenerationStore: any ChatRunGenerationStore = InMemoryRunGenerationStore()
     ) {
         self.client = client
         self.streamClient = streamClient
         self.liveActivityManager = liveActivityManager
         self.showsLiveActivityResponseExcerpts = showsLiveActivityResponseExcerpts
         self.timing = timing
+        self.runGenerationStore = runGenerationStore
     }
 
     func attach(delegate: any ChatStreamCoordinatorDelegate) {
@@ -317,16 +512,47 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         // A new logical run bumps the run-generation fence epoch (every
-        // start AND every finish) and the logical identity generation.
+        // start AND every finish). The logical identity generation is
+        // persisted BEFORE the connection opens: a same-stream replacement
+        // allocates max(lastIssued, current) + 1, while a resume after an
+        // authoritative session load restores the exact persisted active
+        // generation (#18 §473).
         runGeneration &+= 1
         if replayAfterSeq == nil {
-            logicalRunGeneration &+= 1
+            logicalRunGeneration = allocateLogicalGeneration(streamID: streamID)
         }
         openConnection(
             streamID: streamID,
             replayAfterSeq: replayAfterSeq,
             recoveryState: recoveryState
         )
+    }
+
+    /// Allocates the logical generation for a new run on `streamID` (#18
+    /// §473). When the last authoritative session load confirmed the same
+    /// non-empty active stream ID the store records as active, the persisted
+    /// active generation is RESTORED (reconnect/relaunch reattaches the same
+    /// logical run — no new allocation). Otherwise a first run or a
+    /// same-stream-ID replacement persists max(lastIssuedGeneration,
+    /// currentGeneration) + 1 BEFORE the connection opens.
+    private func allocateLogicalGeneration(streamID: String) -> Int {
+        let sessionID = delegate?.streamCoordinatorSessionID ?? ""
+        if pendingResumeStreamID == streamID {
+            pendingResumeStreamID = nil
+            if let activeGeneration = runGenerationStore.record(for: sessionID, streamID: streamID)?.activeGeneration {
+                return activeGeneration
+            }
+        }
+
+        let lastIssued = runGenerationStore.record(for: sessionID, streamID: streamID)?.lastIssuedGeneration ?? 0
+        let next = max(lastIssued, logicalRunGeneration) + 1
+        runGenerationStore.replace(ChatRunGenerationRecord(
+            sessionID: sessionID,
+            streamID: streamID,
+            lastIssuedGeneration: next,
+            activeGeneration: next
+        ))
+        return next
     }
 
     /// Replay/resume entry point (#18 Slice 4): opens a NEW connection
@@ -343,7 +569,11 @@ final class ChatStreamCoordinator {
         // by this run's terminal events.
         pendingDeferredStreamFinish = false
         connectionGeneration &+= 1
-        let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
+        let connectionIdentity = ChatRunIdentity(
+            sessionID: delegate?.streamCoordinatorSessionID ?? "",
+            streamID: streamID,
+            generation: logicalRunGeneration
+        )
         activeStreamID = streamID
         isConnectionSuspended = false
         if replayAfterSeq == nil {
@@ -567,6 +797,11 @@ final class ChatStreamCoordinator {
             delegate?.streamCoordinatorStreamingAssistantMessageID = nil
             if let streamID = loadedActiveStreamID, !streamID.isEmpty {
                 activeStreamID = streamID
+                // Authoritative session response: the server still reports
+                // this stream active. The next `start` restores the persisted
+                // active generation instead of allocating a new one (#18
+                // §473).
+                pendingResumeStreamID = streamID
                 delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
                 isConnectionSuspended = true
                 restoreSnapshotIfAvailable(streamID: streamID)
@@ -611,6 +846,10 @@ final class ChatStreamCoordinator {
                     delegate?.streamCoordinatorStreamingAssistantMessageID = delegate?.streamCoordinatorLatestAssistantMessageID()
                 }
                 isConnectionSuspended = false
+                // The status response confirms the same active stream: the
+                // resume start restores the persisted active generation
+                // (#18 §473).
+                pendingResumeStreamID = streamIDToResume
                 start(streamID: streamIDToResume)
             } else if response.replayAvailable == true {
                 // #18 Slice 4: journal authority resolves BEFORE any replay —
@@ -889,6 +1128,17 @@ final class ChatStreamCoordinator {
                 delegate?.streamCoordinatorDidReceiveErrorMessage(message)
             }
             finishDeferredStreamIfPending()
+        case .terminal(let commit):
+            // An explicit terminal commit carried by the SSE stream (#18
+            // Slice 5). A commit matching the ACTIVE run commits the
+            // centralized transition exactly once (first outcome wins); the
+            // ViewModel observes it through `streamCoordinatorDidCommitTerminal`
+            // invoked by the transition. A commit admitted after finalization
+            // (the completing connection's own late terminal event) performs
+            // no transition and emits no second commit.
+            if let identity = runIdentity, identity == commit.identity {
+                transitionToTerminal(outcome: commit.outcome, identity: identity)
+            }
         case .transportError(let message):
             handleTransportError(message)
         case .heartbeat:
@@ -1078,6 +1328,23 @@ final class ChatStreamCoordinator {
 
         delegate?.streamCoordinatorDidCommitTerminalOutcome(outcome, identity: identity)
 
+        // Exactly-once terminal commit (#18 §500-520): the centralized
+        // transition constructs ONE complete ChatRunTerminalCommit (identity,
+        // outcome, stable event key, server IDs) and invokes the commit
+        // delegate exactly once — after the first-valid compare-and-set, so
+        // an already-terminal state never emits a second commit. The
+        // ViewModel appends the stable local event and persists the keyed
+        // handoff from this callback; no pre-append handoff is ever emitted.
+        let commit = ChatRunTerminalCommit(
+            identity: identity,
+            outcome: outcome,
+            eventKey: ChatRunStatusTerminalEventKey(identity: identity, outcome: outcome),
+            serverSessionID: identity.sessionID,
+            serverStreamID: identity.streamID
+        )
+        delegate?.streamCoordinatorDidCommitTerminal(commit)
+        clearActiveGeneration(for: identity)
+
         activeStreamID = nil
         lastEventID = nil
         liveTokensPerSecond = nil
@@ -1086,6 +1353,22 @@ final class ChatStreamCoordinator {
             finishStream()
         }
         return true
+    }
+
+    /// Terminal commit retains `lastIssuedGeneration` and clears only
+    /// `activeGeneration` (#18 §473): a subsequent same-stream run allocates
+    /// max(lastIssued, current) + 1 instead of restoring the finished run's
+    /// generation.
+    private func clearActiveGeneration(for identity: ChatRunIdentity) {
+        guard let record = runGenerationStore.record(for: identity.sessionID, streamID: identity.streamID) else {
+            return
+        }
+        runGenerationStore.replace(ChatRunGenerationRecord(
+            sessionID: record.sessionID,
+            streamID: record.streamID,
+            lastIssuedGeneration: record.lastIssuedGeneration,
+            activeGeneration: nil
+        ))
     }
 
     private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
@@ -1121,7 +1404,7 @@ final class ChatStreamCoordinator {
     /// a completed transcript (#18 Slice 1).
     private func isTerminalEvent(_ event: SSEEvent) -> Bool {
         switch event {
-        case .streamEnd, .cancelled, .error:
+        case .streamEnd, .cancelled, .error, .terminal:
             return true
         default:
             return false

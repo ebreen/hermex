@@ -842,6 +842,70 @@ final class CacheStoreTests: XCTestCase {
         )
     }
 
+    // MARK: - Slice 5 (#18): terminal event cache round trips by stable message ID
+    //
+    // The terminal event is an ordinary ChatMessage whose messageId is the
+    // stable run-status-v1 key (ChatRunStatusTerminalEventKey). It round-trips
+    // through the existing CacheStore: cacheMessages then cachedMessages
+    // returns the terminal event with the SAME stable messageID. Per the v7
+    // contract there is no SwiftData model, schema field, or migration for
+    // terminal events (#18 §498) — the event is cached exactly like any other
+    // message.
+
+    func testTerminalCacheRoundTripCompleted() throws {
+        try assertTerminalCacheRoundTrip(outcome: .completed, text: "Response complete")
+    }
+
+    func testTerminalCacheRoundTripFailed() throws {
+        try assertTerminalCacheRoundTrip(outcome: .failed, text: "Response failed")
+    }
+
+    func testTerminalCacheRoundTripCancelled() throws {
+        try assertTerminalCacheRoundTrip(outcome: .cancelled, text: "Response cancelled")
+    }
+
+    private func assertTerminalCacheRoundTrip(outcome: ChatRunTerminalOutcome, text: String) throws {
+        let context = try makeContext()
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let sessionID = "session-abc"
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let now = cachedAt.addingTimeInterval(60)
+
+        let key = ChatRunStatusTerminalEventKey(
+            identity: ChatRunIdentity(sessionID: sessionID, streamID: "stream-abc", generation: 1),
+            outcome: outcome
+        )
+        let terminalEvent = ChatMessage(
+            role: "local_notice",
+            content: text,
+            timestamp: 1_770_000_000,
+            messageId: key.messageID
+        )
+
+        try CacheStore.cacheMessages(
+            [terminalEvent],
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            cachedAt: cachedAt
+        )
+
+        let restored = try CacheStore.cachedMessages(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: now
+        )
+
+        XCTAssertEqual(
+            restored.map(\.messageId),
+            [key.messageID],
+            "cacheMessages then cachedMessages returns the terminal event with the SAME stable messageID"
+        )
+        XCTAssertEqual(restored.map(\.content), [text])
+        XCTAssertEqual(restored.count, 1)
+    }
+
     private func makeContext() throws -> ModelContext {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
         let container = try ModelContainer(

@@ -343,6 +343,9 @@ struct ChatView: View {
         _viewModel = State(initialValue: ChatViewModel(
             session: session,
             server: server,
+            // Production terminal persistence: the real CacheStore-backed
+            // writer — never a no-op (#18 §522).
+            terminalCacheWriter: CacheStoreTerminalCacheWriter(serverURL: server),
             showsLiveActivityResponseExcerpts: UserDefaults.standard.bool(
                 forKey: AgentRunLiveActivityPrivacy.showsResponseExcerptsKey
             )
@@ -1305,6 +1308,10 @@ struct ChatView: View {
 
     private func prepareInitialAppearance() {
         viewModel.setShowsLiveActivityResponseExcerpts(showsLiveActivityResponseExcerpts)
+        // Supply the context the terminal persistence seam caches through
+        // (#18 §522). Setting the property never triggers persistence by
+        // itself; commits route through the ViewModel-owned one-writer map.
+        viewModel.modelContext = modelContext
         if loadsInitialMessages {
             viewModel.prepareInitialMessageLoad(modelContext: modelContext)
         }
@@ -1911,10 +1918,6 @@ struct ChatView: View {
     }
 
     private func handleResponseCompletionSideEffects() {
-        if !viewModel.responseCompletionNeedsTranscriptRefresh {
-            viewModel.cacheCompletedResponse(modelContext: modelContext)
-        }
-
         guard let completionContext = responseCompletionNotificationTracker.completionContext(
             completionTrigger: viewModel.responseCompletionHapticTrigger,
             sceneIsActive: scenePhase == .active

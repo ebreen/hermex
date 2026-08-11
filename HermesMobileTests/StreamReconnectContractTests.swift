@@ -148,7 +148,7 @@ final class StreamReconnectContractTests: APIClientTestCase {
         // locally streamed partial is what the client holds.
         XCTAssertEqual(
             viewModel.messages.compactMap(\.content),
-            ["Keep working", "Alpha bravo "]
+            ["Keep working", "Alpha bravo ", "Response complete"]
         )
         XCTAssertEqual(assistantContents(of: viewModel), ["Alpha bravo "])
         XCTAssertEqual(viewModel.activeStreamRecoveryState, .idle)
