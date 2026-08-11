@@ -58,6 +58,23 @@ struct ChatRunConnectionIdentity: Equatable, Sendable {
     let connectionGeneration: Int
 }
 
+/// Identity token for a recovery transcript load (#18 Slice 4). Captured
+/// when a run connection starts; a transcript load that completes after the
+/// run was replaced or finalized is stale and must not mutate the
+/// replacement run.
+struct ChatRunRecoveryLoadToken: Equatable, Sendable {
+    let identity: ChatRunConnectionIdentity
+}
+
+/// Resolution of the server's recovery journal for an inactive stream
+/// (#18 Slice 4). The journal is the ONLY terminal authority: `.terminal`
+/// commits the documented outcome; `.nonTerminal` keeps the run suspended
+/// and never infers completion from a refreshed transcript.
+enum ChatRunRecoveryJournalResolution: Equatable {
+    case terminal(ChatRunTerminalOutcome)
+    case nonTerminal(reason: String)
+}
+
 /// Exactly-once cancellation acceptance ticket (#18 Slice 3): the accepted
 /// cancel's connection identity and a stable message ID. Reference type so
 /// the consuming boundary (view model / feedback helper) and the
@@ -255,6 +272,9 @@ final class ChatStreamCoordinator {
     /// Set when the terminal transition already cleared auxiliary monitoring
     /// (`.completed`), so the deferred `finishStream()` does not clear twice.
     private var monitoringClearedAtTerminal = false
+    /// Whether `finishStream()` should refresh the completed response title
+    /// (journal-authority terminal commits suppress the extra session GET).
+    private var refreshesCompletedTitleOnFinish = true
 
     init(
         client: APIClient,
@@ -296,14 +316,33 @@ final class ChatStreamCoordinator {
     ) {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
+        // A new logical run bumps the run-generation fence epoch (every
+        // start AND every finish) and the logical identity generation.
         runGeneration &+= 1
-        connectionGeneration &+= 1
         if replayAfterSeq == nil {
             logicalRunGeneration &+= 1
         }
+        openConnection(
+            streamID: streamID,
+            replayAfterSeq: replayAfterSeq,
+            recoveryState: recoveryState
+        )
+    }
+
+    /// Replay/resume entry point (#18 Slice 4): opens a NEW connection
+    /// generation for the SAME logical run. Unlike `start`, it keeps the
+    /// logical identity — the run-generation fence epoch and the logical
+    /// generation are untouched — and creates no pending state: the run was
+    /// already active and merely suspended.
+    func openConnection(
+        streamID: String,
+        replayAfterSeq: Int? = nil,
+        recoveryState: ActiveStreamRecoveryState = .idle
+    ) {
         // A stale deferred finish from a previous run must never be consumed
         // by this run's terminal events.
         pendingDeferredStreamFinish = false
+        connectionGeneration &+= 1
         let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
         activeStreamID = streamID
         isConnectionSuspended = false
@@ -421,6 +460,68 @@ final class ChatStreamCoordinator {
         activeStreamID == streamID && runConnectionIdentity == identity
     }
 
+    /// Closed journal-authority mapping (#18 Slice 4). Only the documented
+    /// vocabulary — after whitespace/ASCII-case normalization — resolves to a
+    /// terminal outcome, and only while the journal reports the run inactive.
+    /// `lost-worker-bookkeeping` is the one documented exception that is
+    /// authoritative even when `journal.terminal == false`. Every other
+    /// authority absence (nil/true active, missing journal, missing/nil
+    /// terminalState, terminal != true, unknown vocabulary, aliases) stays
+    /// non-terminal: completion is never inferred from a refreshed
+    /// transcript.
+    func resolveRecoveryJournal(
+        active: Bool?,
+        journal: RunJournalStatus?
+    ) -> ChatRunRecoveryJournalResolution {
+        guard active == false else {
+            return .nonTerminal(reason: "active is not false")
+        }
+        guard let journal else {
+            return .nonTerminal(reason: "missing journal")
+        }
+        guard let rawTerminalState = journal.terminalState else {
+            return .nonTerminal(reason: "missing terminalState")
+        }
+
+        let terminalState = rawTerminalState
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        // Documented bookkeeping exception: authoritative failure even when
+        // journal.terminal == false.
+        if terminalState == "lost-worker-bookkeeping" {
+            return .terminal(.failed)
+        }
+
+        guard journal.terminal == true else {
+            return .nonTerminal(reason: "terminal is not true")
+        }
+
+        switch terminalState {
+        case "completed":
+            return .terminal(.completed)
+        case "errored", "interrupted-by-crash":
+            return .terminal(.failed)
+        case "interrupted-by-user":
+            return .terminal(.cancelled)
+        default:
+            return .nonTerminal(reason: "unknown terminalState vocabulary")
+        }
+    }
+
+    /// Finalizes the suspended run from journal authority (#18 Slice 4):
+    /// one centralized terminal transition (outcome, terminal event, Live
+    /// Activity end, cleanup) with NO transcript reload consulted.
+    private func finalizeFromJournal(outcome: ChatRunTerminalOutcome) {
+        if let identity = runIdentity {
+            transitionToTerminal(
+                outcome: outcome,
+                identity: identity,
+                refreshesCompletedTitle: false
+            )
+        }
+    }
+
     func suspendActiveStreamConnection() {
         guard activeStreamID != nil, !hasCompletedCurrentResponse, !isConnectionSuspended else { return }
 
@@ -512,20 +613,30 @@ final class ChatStreamCoordinator {
                 isConnectionSuspended = false
                 start(streamID: streamIDToResume)
             } else if response.replayAvailable == true {
-                let replayAfterSeq = Self.runJournalReplayAfterSeq(from: lastEventID) ?? 0
-                self.activeStreamID = activeStreamID
-                isConnectionSuspended = false
-                start(streamID: activeStreamID, replayAfterSeq: replayAfterSeq)
+                // #18 Slice 4: journal authority resolves BEFORE any replay —
+                // a terminal journal entry finalizes the run instead of
+                // reconnecting it.
+                switch resolveRecoveryJournal(active: response.active, journal: response.journal) {
+                case .terminal(let outcome):
+                    finalizeFromJournal(outcome: outcome)
+                case .nonTerminal:
+                    let replayAfterSeq = Self.runJournalReplayAfterSeq(from: lastEventID) ?? 0
+                    self.activeStreamID = activeStreamID
+                    isConnectionSuspended = false
+                    start(streamID: activeStreamID, replayAfterSeq: replayAfterSeq)
+                }
             } else {
-                await delegate?.streamCoordinatorLoadMessages(modelContext: modelContext)
-                // Bail if a concurrent completion/cancel/new run finalized or
-                // replaced this run during the load (see canFinalizeRunAfterLoad).
-                guard canFinalizeRunAfterLoad(streamID: activeStreamID, capturedGeneration: generation) else { return }
-
-                // #246: the server reports the run is over. Finalize it (and end
-                // the Live Activity) instead of re-arming and leaving it dangling
-                // on "running" when no assistant reply surfaced.
-                finalizeInactiveStream(streamID: activeStreamID)
+                // #18 Slice 4: the journal is the ONLY terminal authority for
+                // an inactive run. A documented terminal entry commits the
+                // outcome WITHOUT a transcript reload; every authority-absent
+                // case stays non-terminal and suspended — completion is never
+                // inferred from a refreshed transcript.
+                switch resolveRecoveryJournal(active: response.active, journal: response.journal) {
+                case .terminal(let outcome):
+                    finalizeFromJournal(outcome: outcome)
+                case .nonTerminal:
+                    return
+                }
             }
         } catch {
             if (error as? APIError)?.indicatesMissingStream == true,
@@ -930,7 +1041,8 @@ final class ChatStreamCoordinator {
         identity: ChatRunIdentity,
         needsTranscriptRefresh: Bool = true,
         marksResponseCompleted: Bool = true,
-        defersStreamFinish: Bool = false
+        defersStreamFinish: Bool = false,
+        refreshesCompletedTitle: Bool = true
     ) -> Bool {
         guard runIdentity == identity else { return false }
 
@@ -940,6 +1052,7 @@ final class ChatStreamCoordinator {
         completedRunIdentity = identity
         runGeneration &+= 1
         pendingDeferredStreamFinish = defersStreamFinish
+        refreshesCompletedTitleOnFinish = refreshesCompletedTitle
 
         switch outcome {
         case .completed:
@@ -1102,9 +1215,10 @@ final class ChatStreamCoordinator {
         isConnectionSuspended = false
         resetRecoveryState()
         delegate?.streamCoordinatorDrainQueuedSlashMessageIfIdle()
-        if completedNormally {
+        if completedNormally, refreshesCompletedTitleOnFinish {
             delegate?.streamCoordinatorRefreshCompletedResponseTitleIfNeeded()
         }
+        refreshesCompletedTitleOnFinish = true
     }
 
     private func markConnectionStarted(
