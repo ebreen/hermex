@@ -291,7 +291,8 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let liveActivityManager = CoordinatorSpyLiveActivityManager()
         let delegate = CoordinatorDelegateSpy()
-        let coordinator = makeCoordinator(
+        var coordinator: ChatStreamCoordinator!
+        coordinator = makeCoordinator(
             streamClient: streamClient,
             liveActivityManager: liveActivityManager,
             delegate: delegate
