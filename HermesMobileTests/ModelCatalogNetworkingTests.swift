@@ -246,10 +246,23 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         }
 
         let inventory = legacyCatalogInventory(root: root)
-        XCTAssertTrue(
-            inventory.isEmpty,
-            "Slice 4 is the final typed catalog crossing boundary: production must have no models()/modelsLive() callers or definitions"
-        )
+        XCTAssertEqual(inventory.count, 9, "Slice 0 freezes nine legacy catalog matches")
+        let callers = inventory.filter { !$0.path.hasSuffix("APIClient+ServerPanels.swift") }
+        XCTAssertEqual(callers.count, 7, "Slice 0 permits seven legacy production callers")
+
+        let expectedLocations: Set<String> = [
+            "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift:114",
+            "HermesMobile/Features/Chat/ChatViewModel.swift:763",
+            "HermesMobile/Features/Chat/ChatViewModel.swift:771",
+            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:200",
+            "HermesMobile/Features/Settings/DefaultModelPickerView.swift:221",
+            "HermesMobile/Features/Settings/DefaultProfilePickerView.swift:468",
+            "HermesMobile/Features/Settings/SettingsView.swift:1062",
+            "HermesMobile/Networking/APIClient+ServerPanels.swift:4",
+            "HermesMobile/Networking/APIClient+ServerPanels.swift:11"
+        ]
+        let actualLocations = Set(inventory.map { "\($0.path):\($0.line)" })
+        XCTAssertEqual(actualLocations, expectedLocations)
 
         let networkingFile = root
             .appendingPathComponent("HermesMobile", isDirectory: true)
@@ -269,6 +282,18 @@ final class ModelCatalogNetworkingTests: XCTestCase {
                 "Neutral networking must not import Chat"
             )
         }
+    }
+
+    func testFinalTreeHasNoTypedCatalogDefinitionsOrCallers() throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+
+        XCTAssertTrue(
+            typedCatalogInventory(root: root).isEmpty,
+            "Slice 4 final tree must have zero production models()/modelsLive() definitions or callers"
+        )
     }
 
     // MARK: - Slice 1 gate protocol (RED)
@@ -1272,6 +1297,62 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         )
     }
 
+    func testFailureShapedProfileSnapshotCannotClearVerifiedAppIntentCache() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installProfilesOnly(
+            #"{"profiles":[{"name":"a","isActive":true},{"name":"b","isActive":true}],"single_profile_mode":false}"#
+        )
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertFalse(snapshot.isAuthoritative)
+        XCTAssertTrue(snapshot.profiles.isEmpty)
+        XCTAssertTrue(snapshot.activeProfile.isEmpty)
+
+        let suite = "test.profileentitycache.failure.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cache = ProfileEntityCache(defaults: defaults)
+        let verifiedProfile = ProfileSummary(
+            name: "verified",
+            path: nil,
+            isDefault: nil,
+            isActive: true,
+            gatewayRunning: nil,
+            model: nil,
+            provider: nil,
+            hasEnv: nil,
+            skillCount: nil
+        )
+        XCTAssertTrue(cache.save([verifiedProfile]))
+        let beforeFailure = cache.loadEntities()
+
+        XCTAssertFalse(cache.save(snapshot), "failure-shaped snapshots are not cache writes")
+        XCTAssertEqual(cache.loadEntities(), beforeFailure)
+    }
+
+    func testAuthoritativeVerifiedProfileSnapshotMayUpdateAppIntentCache() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertTrue(snapshot.isAuthoritative)
+        XCTAssertEqual(snapshot.activeProfile, "default")
+
+        let suite = "test.profileentitycache.verified.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cache = ProfileEntityCache(defaults: defaults)
+
+        XCTAssertTrue(cache.save(snapshot), "only a verified snapshot may update the cache")
+        XCTAssertEqual(cache.loadEntities().map(\.id), ["default"])
+    }
+
     private func assertNeutralCatalogCaller(
         relativePath: String,
         requiredCall: String
@@ -1640,10 +1721,38 @@ final class ModelCatalogNetworkingTests: XCTestCase {
     }
 
     private func legacyCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
-        // Slice 4 is the serialized deletion boundary. Keep the older
-        // compatibilityModels declarations available to their frozen tests,
-        // but audit only the removed typed API surface here: no production
-        // caller or typed method definition may remain.
+        // Slice 1 routing swapped the seven production typed calls for the
+        // Networking compatibility adapters one-for-one in the same files.
+        // The frozen inventory contract is count/location equality (nine
+        // matches: two compatibility definitions + seven production sites);
+        // it must never GROW. Slice 4 alone proves zero production typed
+        // callers and deletes the typed methods.
+        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|\.compatibilityModels(Live)?\([^)]*\)|func (models|modelsLive)\(\)"#)
+        let appRoot = root.appendingPathComponent("HermesMobile", isDirectory: true)
+        let fileManager = FileManager.default
+        let relativePaths = (fileManager.subpaths(atPath: appRoot.path) ?? [])
+            .filter { $0.hasSuffix(".swift") }
+            .sorted()
+        var inventory: [LegacyCatalogMatch] = []
+        for relativePath in relativePaths {
+            let fileURL = appRoot.appendingPathComponent(relativePath)
+            guard let source = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            for (index, line) in source.components(separatedBy: .newlines).enumerated() {
+                let range = NSRange(line.startIndex..<line.endIndex, in: line)
+                if pattern.firstMatch(in: line, range: range) != nil {
+                    inventory.append(
+                        LegacyCatalogMatch(
+                            path: "HermesMobile/\(relativePath)",
+                            line: index + 1
+                        )
+                    )
+                }
+            }
+        }
+        return inventory
+    }
+
+    private func typedCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
         let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|func (models|modelsLive)\(\)"#)
         let appRoot = root.appendingPathComponent("HermesMobile", isDirectory: true)
         let fileManager = FileManager.default

@@ -8,6 +8,10 @@ struct CatalogProfileReadSnapshot: Equatable, Sendable {
     let profiles: [ProfileSummary]
     let activeProfile: String
     let singleProfileMode: Bool
+    /// True only when the profile response passed strict authoritative
+    /// verification. Failure-shaped snapshots are deliberately non-authoritative
+    /// even when their provisional metadata still matches the current epoch.
+    let isAuthoritative: Bool
 }
 
 extension APIClient {
@@ -43,7 +47,8 @@ extension APIClient {
                     ),
                     profiles: profiles,
                     activeProfile: activeProfile,
-                    singleProfileMode: singleProfileMode
+                    singleProfileMode: singleProfileMode,
+                    isAuthoritative: true
                 )
             case .unavailable, .mismatch:
                 return emptyProfileContextSnapshot(
@@ -295,7 +300,8 @@ extension APIClient {
             ),
             profiles: [],
             activeProfile: "",
-            singleProfileMode: false
+            singleProfileMode: false,
+            isAuthoritative: false
         )
     }
 

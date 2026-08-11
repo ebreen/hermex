@@ -77,14 +77,18 @@ enum ProfileEntityProviderError: LocalizedError, Equatable {
 /// Resolves the current profile list for App Intents, live-first with a cached fallback.
 /// Kept separate from the `EntityQuery` so the fetch/cache policy is reusable (e.g. by #8).
 enum ProfileEntityProvider {
+    private enum LiveProfileFetchFailure: Error {
+        case unavailable
+        case unverified
+    }
+
     static func currentEntities() async throws -> [ProfileEntity] {
-        // A successful fetch always mirrors into the cache: a non-empty result is stored and
-        // returned, while an empty result clears the cache (the server genuinely has no
-        // profiles) so a stale list can't linger. A *failed* fetch (nil) leaves the cache
-        // untouched, so a transient network/auth blip falls back to the last-known profiles.
+        // Only an authoritative, epoch-accepted snapshot may mirror into the cache. A failed
+        // or unverified fetch leaves the verified cache untouched, so a transient network/auth
+        // blip or ambiguous profile response falls back to the last-known profiles.
         if let live = try? await fetchLiveProfiles() {
             ProfileEntityCache.shared.save(live)
-            let entities = live.compactMap(ProfileEntity.init)
+            let entities = live.profiles.compactMap(ProfileEntity.init)
             if !entities.isEmpty { return entities }
         }
         return try cachedEntities(from: ProfileEntityCache.shared.loadEntitiesAttempt())
@@ -99,8 +103,9 @@ enum ProfileEntityProvider {
         }
     }
 
-    /// Best-effort live fetch against the saved server. Returns `[]` (not an error) when no
-    /// server is configured; a network/auth failure throws so the caller falls back to cache.
+    /// Best-effort live fetch against the saved server. An unavailable server, transport/auth
+    /// failure, unverified profile response, or stale epoch all throw so the caller falls back
+    /// to the verified cache without writing an empty failure-shaped snapshot.
     ///
     /// Runs out-of-process (App Intents), where `CustomHeaderStore.shared` — which
     /// `AuthManager` hydrates only on a foreground launch — is empty. So we read the server's
@@ -109,8 +114,10 @@ enum ProfileEntityProvider {
     /// and the picker can never refresh live. (The session cookie is also absent out-of-process,
     /// so a cookie-auth server still falls back to the cache — this just stops the ad-hoc client
     /// from silently dropping the headers every other client in the app carries.)
-    private static func fetchLiveProfiles() async throws -> [ProfileSummary] {
-        guard let server = savedServerURL() else { return [] }
+    private static func fetchLiveProfiles() async throws -> CatalogProfileReadSnapshot {
+        guard let server = savedServerURL() else {
+            throw LiveProfileFetchFailure.unavailable
+        }
         let headers = customHeaders(for: server)
         // Raw profile read under the Networking compatibility lease (issue #16
         // Slice 1): the read shares the gate with in-app profile switches, and
@@ -121,10 +128,13 @@ enum ProfileEntityProvider {
             operationID: UUID(),
             operationGeneration: 1
         )
-        guard await client.acceptsCatalogMetadata(snapshot.metadata) else {
-            return []
+        guard snapshot.isAuthoritative else {
+            throw LiveProfileFetchFailure.unverified
         }
-        return snapshot.profiles
+        guard await client.acceptsCatalogMetadata(snapshot.metadata) else {
+            throw LiveProfileFetchFailure.unverified
+        }
+        return snapshot
     }
 
     /// Loads the server's stored custom headers (scoped key first, then the pre-#16 global
@@ -200,10 +210,18 @@ struct ProfileEntityCache {
         return UserDefaults(suiteName: appGroupIdentifier)
     }
 
-    /// Mirrors the profiles into the cache: writes a compact snapshot when non-empty, clears
-    /// the entry when empty so a stale list can't linger after the server reports none.
-    /// Returns whether the stored snapshot actually changed, so the caller can avoid
-    /// re-indexing App Shortcuts when nothing moved.
+    /// An unverified/failure-shaped snapshot is never a cache mutation. An authoritative
+    /// snapshot may clear the entry only when its verified profile list is explicitly empty.
+    @discardableResult
+    func save(_ snapshot: CatalogProfileReadSnapshot) -> Bool {
+        guard snapshot.isAuthoritative else { return false }
+        return save(snapshot.profiles)
+    }
+
+    /// Mirrors a verified profile list into the cache: writes a compact snapshot when
+    /// non-empty, clears the entry when empty so a stale list can't linger after the server
+    /// authoritatively reports none. Returns whether the stored snapshot actually changed, so
+    /// the caller can avoid re-indexing App Shortcuts when nothing moved.
     @discardableResult
     func save(_ profiles: [ProfileSummary]) -> Bool {
         guard let defaults else { return false }
