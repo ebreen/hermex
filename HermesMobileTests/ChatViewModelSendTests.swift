@@ -7701,7 +7701,7 @@ final class ChatViewModelSendTests: XCTestCase {
     private func startGatedRecoveryLoad(
         gate: CancelResponseGate,
         context: ModelContext
-    ) throws -> (viewModel: ChatViewModel, server: URL, loadTask: Task<Void, Never>) {
+    ) async throws -> (viewModel: ChatViewModel, server: URL, loadTask: Task<Void, Never>) {
         let gatedSession: URLSession = {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.protocolClasses = [GatedURLProtocol.self]
