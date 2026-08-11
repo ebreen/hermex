@@ -49,7 +49,12 @@ struct ChatRunIdentity: Equatable, Hashable {
 /// Lifecycle projected by the coordinator-driven run-status presentation.
 enum ChatRunStatusLifecycle: Equatable, Hashable {
     case active
+    case checking
+    case reconnecting
     case completed
+    case failed
+    case cancelled
+    case dismissed
 }
 
 typealias ChatActiveRunStatusLifecycle = ChatRunStatusLifecycle
