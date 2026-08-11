@@ -768,20 +768,30 @@ final class ChatViewModel {
     /// the await and before it mutates MainActor state; a profile switch that
     /// advances the authoritative epoch silently drops the old result.
     func refreshModelCatalogForPickerOpen() async {
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         let stream = await client.modelCatalogStream(
             requestedProfile: nil,
-            operationID: UUID(),
-            operationGeneration: 1
+            operationID: operationID,
+            operationGeneration: operationGeneration
         )
         for await event in stream {
             switch event {
             case let .base(snapshot):
-                guard await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+                guard await client.acceptsCatalogMetadata(
+                    snapshot.metadata,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                ) else { return }
                 if !snapshot.groups.isEmpty {
                     modelCatalogGroups = snapshot.groups
                 }
             case let .live(snapshot):
-                guard await client.acceptsCatalogMetadata(snapshot.metadata) else { return }
+                guard await client.acceptsCatalogMetadata(
+                    snapshot.metadata,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                ) else { return }
                 if !snapshot.groups.isEmpty {
                     modelCatalogGroups = snapshot.groups
                 }
