@@ -801,6 +801,10 @@ final class ChatStreamCoordinator {
                     needsTranscriptRefresh: needsTranscriptRefresh
                 )
             }
+            // The approval/clarification prompt is resolved by the completed
+            // response even when the stream finish is deferred (pre-#18
+            // `.done` finished immediately and cleared the prompt here).
+            delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
             liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
         case .cancelled:
             liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
