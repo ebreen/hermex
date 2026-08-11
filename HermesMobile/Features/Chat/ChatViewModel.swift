@@ -218,28 +218,8 @@ final class ChatViewModel {
     private(set) var isRegeneratingMessage = false
     private(set) var isCompressingSession = false
     private(set) var isCancellingStream = false
-    /// Number of cancellation requests in flight. `isCancellingStream` stays
-    /// true while ANY cancellation is pending, so a stale cancellation's
-    /// return cannot flip the projection off while the replacement run's
-    /// cancellation is still in flight (#18 Slice 3).
-    private var activeCancellationCount = 0
-    /// The terminal feedback ticket of the most recent accepted
-    /// cancellation, consumed exactly once at the view-model boundary
-    /// (#18 Slice 3).
-    private(set) var cancellationFeedbackTicket: ChatCancellationTicket?
-    /// UI-only: whether the user dismissed the active run's status
-    /// projection. A stale cancellation result must never touch it
-    /// (#18 Slice 3).
-    private(set) var activeRunDismissed = false
     private(set) var isViewingCachedData = false
     var activeStreamID: String? { streamCoordinator.activeStreamID }
-    /// UI projection of the active run (#18 Slice 3): non-nil while a run is
-    /// active; `dismissed` is the UI-only dismissal flag, unchanged by stale
-    /// cancellation results.
-    var activeRunSnapshot: ChatActiveRunSnapshot? {
-        guard activeStreamID != nil else { return nil }
-        return ChatActiveRunSnapshot(isActive: true, dismissed: activeRunDismissed)
-    }
     var activeStreamRecoveryState: ActiveStreamRecoveryState { streamCoordinator.recoveryState }
     var liveTokensPerSecond: Double? { streamCoordinator.liveTokensPerSecond }
     private(set) var errorMessage: String?
@@ -802,6 +782,27 @@ final class ChatViewModel {
     }
 
     // MARK: Slice 3 coordinator-owned catalog (#16)
+
+    /// Number of cancellation requests in flight. `isCancellingStream` stays
+    /// true while ANY cancellation is pending, so a stale cancellation's
+    /// return cannot flip the projection off while the replacement run's
+    /// cancellation is still in flight (#18 Slice 3).
+    private var activeCancellationCount = 0
+    /// The terminal feedback ticket of the most recent accepted
+    /// cancellation, consumed exactly once at the view-model boundary
+    /// (#18 Slice 3).
+    private(set) var cancellationFeedbackTicket: ChatCancellationTicket?
+    /// UI-only: whether the user dismissed the active run's status
+    /// projection. A stale cancellation result must never touch it
+    /// (#18 Slice 3).
+    private(set) var activeRunDismissed = false
+    /// UI projection of the active run (#18 Slice 3): non-nil while a run is
+    /// active; `dismissed` is the UI-only dismissal flag, unchanged by stale
+    /// cancellation results.
+    var activeRunSnapshot: ChatActiveRunSnapshot? {
+        guard activeStreamID != nil else { return nil }
+        return ChatActiveRunSnapshot(isActive: true, dismissed: activeRunDismissed)
+    }
 
     private let modelCatalogCoordinator: ChatModelCatalogCoordinator?
     @ObservationIgnored private var catalogMonitorTask: Task<Void, Never>?
