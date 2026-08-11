@@ -96,9 +96,10 @@ final class StreamReconnectContractTests: APIClientTestCase {
                     for: request
                 )
             case "/api/chat/stream/status":
-                // A restarted server has neither the live stream nor its replay journal.
+                // A restarted server has no replay buffer, but its persisted
+                // recovery journal records the run's terminal state (#18 Slice 4).
                 return apiTestJSONResponse(
-                    #"{"active": false, "stream_id": "stream-123", "replay_available": false}"#,
+                    #"{"active": false, "stream_id": "stream-123", "replay_available": false, "journal": {"terminal": true, "terminal_state": "completed"}}"#,
                     for: request
                 )
             case "/api/session":
@@ -137,16 +138,19 @@ final class StreamReconnectContractTests: APIClientTestCase {
         XCTAssertEqual(assistantContents(of: viewModel), ["Alpha bravo "])
         XCTAssertTrue(viewModel.isActiveStreamConnectionSuspended)
 
-        // The async reconnect probe finds the stream gone, refreshes the
-        // transcript, and completes the response from the server copy.
+        // The async reconnect probe finds the stream gone; the journal's
+        // completed entry commits the terminal transition WITHOUT a transcript
+        // reload or a replay attempt (#18 Slice 4).
         try await waitUntil { viewModel.activeStreamID == nil }
 
         XCTAssertEqual(streamClient.startedURLs.count, 1)
+        // Journal-terminal commits without reloading the transcript, so the
+        // locally streamed partial is what the client holds.
         XCTAssertEqual(
             viewModel.messages.compactMap(\.content),
-            ["Keep working", "Alpha bravo charlie delta."]
+            ["Keep working", "Alpha bravo "]
         )
-        XCTAssertEqual(assistantContents(of: viewModel), ["Alpha bravo charlie delta."])
+        XCTAssertEqual(assistantContents(of: viewModel), ["Alpha bravo "])
         XCTAssertEqual(viewModel.activeStreamRecoveryState, .idle)
         XCTAssertFalse(viewModel.isActiveStreamConnectionSuspended)
         XCTAssertNil(viewModel.streamingAssistantMessageID)

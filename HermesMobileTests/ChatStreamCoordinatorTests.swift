@@ -133,14 +133,19 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let liveActivityManager = CoordinatorSpyLiveActivityManager()
         let delegate = CoordinatorDelegateSpy()
-        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = true
+        // The transcript is diagnostic only: journal authority must not depend
+        // on the assistant-after-latest-user flag to finalize.
+        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
         let coordinator = makeCoordinator(
             streamClient: streamClient,
             liveActivityManager: liveActivityManager,
             delegate: delegate
         ) { request in
             XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
-            return apiTestJSONResponse(#"{"active": false, "stream_id": "stream-123"}"#, for: request)
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "completed"}}"#,
+                for: request
+            )
         }
 
         coordinator.start(streamID: "stream-123")
@@ -148,9 +153,14 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
 
         await coordinator.reconnectIfNeeded()
 
+        // #18 Slice 4: the journal is the ONLY terminal authority. The terminal
+        // entry commits completion WITHOUT a transcript reload (loadMessages
+        // never fires); the completion notification still requests the
+        // transcript refresh (needsTranscriptRefresh: true) because the final
+        // content was not streamed to the client.
         XCTAssertNil(coordinator.activeStreamID)
-        XCTAssertEqual(delegate.loadMessagesCount, 1)
-        XCTAssertEqual(delegate.completedNeedsTranscriptRefreshValues, [false])
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertEqual(delegate.completedNeedsTranscriptRefreshValues, [true])
         XCTAssertEqual(liveActivityManager.ends.last?.status, .complete)
     }
 
@@ -159,7 +169,9 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let liveActivityManager = CoordinatorSpyLiveActivityManager()
         let delegate = CoordinatorDelegateSpy()
-        // The reloaded transcript surfaced no assistant reply after the user message.
+        // The transcript is diagnostic only: the journal's "errored" entry is
+        // the terminal authority, independent of the assistant-after-latest-user
+        // flag.
         delegate.latestServerLoadHadAssistantResponseAfterLatestUser = false
         let coordinator = makeCoordinator(
             streamClient: streamClient,
@@ -167,7 +179,10 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
             delegate: delegate
         ) { request in
             XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
-            return apiTestJSONResponse(#"{"active": false, "stream_id": "stream-123"}"#, for: request)
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "errored"}}"#,
+                for: request
+            )
         }
 
         coordinator.start(streamID: "stream-123")
@@ -176,10 +191,12 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
         await coordinator.reconnectIfNeeded()
 
         // #246: this path previously re-armed and returned, leaving the Live
-        // Activity stuck on "running". It must now finalize as failed and end it.
+        // Activity stuck on "running". #18 Slice 4: the journal's errored entry
+        // is the ONLY terminal authority — it finalizes as failed and ends the
+        // activity WITHOUT a transcript reload.
         XCTAssertNil(coordinator.activeStreamID)
         XCTAssertFalse(coordinator.isConnectionSuspended)
-        XCTAssertEqual(delegate.loadMessagesCount, 1)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
         XCTAssertEqual(liveActivityManager.ends.last?.status, .failed)
     }
 
@@ -270,21 +287,30 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
     }
 
     @MainActor
-    func testForegroundReconnectInactiveCompletedStreamDoesNotFinishReplacementAfterLoad() async throws {
+    func testForegroundReconnectInactiveCompletedStreamDoesNotFinishReplacementRun() async throws {
         let streamClient = CoordinatorSpySSEStreamingClient()
         let liveActivityManager = CoordinatorSpyLiveActivityManager()
         let delegate = CoordinatorDelegateSpy()
-        delegate.latestServerLoadHadAssistantResponseAfterLatestUser = true
         let coordinator = makeCoordinator(
             streamClient: streamClient,
             liveActivityManager: liveActivityManager,
             delegate: delegate
         ) { request in
             XCTAssertEqual(request.url?.path, "/api/chat/stream/status")
-            return apiTestJSONResponse(#"{"active": false, "stream_id": "stream-123"}"#, for: request)
-        }
-        delegate.onLoadMessages = {
-            coordinator.start(streamID: "stream-new")
+            // The MockURLProtocol handler runs on URLSession's protocol thread
+            // while the coordinator's status-poll await has suspended the main
+            // actor, so a main-queue sync hop starts the replacement run
+            // deterministically *mid-flight* — before the poll's continuation
+            // resumes (same technique as the PR #238 heartbeat tests).
+            DispatchQueue.main.sync {
+                MainActor.assumeIsolated {
+                    coordinator.start(streamID: "stream-new")
+                }
+            }
+            return apiTestJSONResponse(
+                #"{"active": false, "stream_id": "stream-123", "journal": {"terminal": true, "terminal_state": "completed"}}"#,
+                for: request
+            )
         }
 
         coordinator.start(streamID: "stream-123")
@@ -292,9 +318,16 @@ final class ChatStreamCoordinatorTests: APIClientTestCase {
 
         await coordinator.reconnectIfNeeded()
 
+        // #18 Slice 4: the old stream's journal-terminal status arrives while a
+        // REPLACEMENT run is already active. The post-probe guard bails — the
+        // old journal must not finalize, end, or clean up anything belonging to
+        // the replacement (PR #266 intent preserved under journal authority).
         XCTAssertEqual(coordinator.activeStreamID, "stream-new")
         XCTAssertFalse(coordinator.isConnectionSuspended)
         XCTAssertEqual(streamClient.startedURLs.count, 2)
+        XCTAssertEqual(delegate.loadMessagesCount, 0)
+        XCTAssertTrue(delegate.terminalTransitions.isEmpty)
+        XCTAssertEqual(delegate.finishCount, 0)
         XCTAssertTrue(delegate.completedNeedsTranscriptRefreshValues.isEmpty)
         XCTAssertTrue(liveActivityManager.ends.isEmpty)
     }

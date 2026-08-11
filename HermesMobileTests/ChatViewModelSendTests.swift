@@ -6079,7 +6079,11 @@ final class ChatViewModelSendTests: XCTestCase {
                 return apiTestJSONResponse("""
                 {
                   "active": false,
-                  "stream_id": "stream-123"
+                  "stream_id": "stream-123",
+                  "journal": {
+                    "terminal": true,
+                    "terminal_state": "completed"
+                  }
                 }
                 """, for: request)
             case "/api/session":
@@ -6112,13 +6116,16 @@ final class ChatViewModelSendTests: XCTestCase {
 
         streamClient.emit(.transportError("The network connection was lost."))
         try await waitUntil {
-            didRequestStatus && didReloadMessages
+            didRequestStatus && viewModel.activeStreamID == nil
         }
 
         XCTAssertTrue(didRequestStatus)
-        XCTAssertTrue(didReloadMessages)
+        // #18 Slice 4: the journal is the ONLY terminal authority for an
+        // inactive stream — the terminal entry commits WITHOUT a transcript
+        // reload, so only the locally appended message is present.
+        XCTAssertFalse(didReloadMessages)
         XCTAssertNil(viewModel.activeStreamID)
-        XCTAssertEqual(viewModel.messages.map(\.content), ["Recovered transcript."])
+        XCTAssertEqual(viewModel.messages.map(\.content), ["Keep working"])
         XCTAssertNil(viewModel.sendErrorMessage)
         XCTAssertEqual(streamClient.stopCount, 2)
     }

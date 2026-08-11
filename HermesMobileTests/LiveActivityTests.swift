@@ -746,7 +746,9 @@ final class LiveActivityTests: XCTestCase {
                 nextStreamNumber += 1
                 return Self.jsonResponse(#"{"stream_id":"\#(streamID)","session_id":"session-abc"}"#, for: request)
             case "/api/chat/stream/status":
-                return Self.jsonResponse(#"{"active":false,"stream_id":"stream-1","replay_available":false}"#, for: request)
+                // #18 Slice 4: the recovery journal records the completed run,
+                // so the reconnect commits it without a transcript reload.
+                return Self.jsonResponse(#"{"active":false,"stream_id":"stream-1","replay_available":false,"journal":{"terminal":true,"terminal_state":"completed"}}"#, for: request)
             case "/api/session":
                 return Self.jsonResponse("""
                 {
