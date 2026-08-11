@@ -39,6 +39,15 @@ struct ChatRunIdentity: Equatable {
     let logicalGeneration: Int
 }
 
+/// The outcome of a finalized chat run, committed exactly once by the
+/// centralized terminal transition. The FIRST valid terminal candidate for a
+/// run wins; every later candidate is a no-op (#18 Slice 2).
+enum ChatRunTerminalOutcome: Equatable {
+    case completed
+    case cancelled
+    case failed
+}
+
 @MainActor
 protocol ChatStreamCoordinatorDelegate: AnyObject {
     var streamCoordinatorSessionID: String? { get }
@@ -84,6 +93,24 @@ protocol ChatStreamCoordinatorDelegate: AnyObject {
     func streamCoordinatorApplyClarificationUpdate(_ update: ClarificationPendingResponse)
     @discardableResult
     func streamCoordinatorEnqueuePendingSteerLeftover(_ text: String) -> Bool
+
+    /// Centralized terminal-event callback (#18 Slice 2): invoked exactly
+    /// once per committed terminal transition with the winning outcome and
+    /// the finalized run's identity. Conformers that do not observe terminal
+    /// transitions inherit the default no-op implementation.
+    func streamCoordinatorDidCommitTerminalOutcome(
+        _ outcome: ChatRunTerminalOutcome,
+        identity: ChatRunIdentity
+    )
+}
+
+extension ChatStreamCoordinatorDelegate {
+    /// Default no-op: only observers that care about terminal transitions
+    /// (e.g. the coordinator test spy) need to implement this (#18 Slice 2).
+    func streamCoordinatorDidCommitTerminalOutcome(
+        _ outcome: ChatRunTerminalOutcome,
+        identity: ChatRunIdentity
+    ) {}
 }
 
 @MainActor
@@ -130,6 +157,19 @@ final class ChatStreamCoordinator {
         return ChatRunIdentity(streamID: activeStreamID, logicalGeneration: runGeneration)
     }
 
+    /// Armed when a `.done` commits the terminal transition with the stream
+    /// finish deferred to the completing connection's own terminal event
+    /// (`.streamEnd`, `.cancelled`, or `.error`). The finishing event is
+    /// admitted by the generation fence and performs no transition work —
+    /// it only runs the deferred `finishStream()` exactly once, so the
+    /// stream client is not stopped before that event is delivered and a
+    /// `.done` without a trailing terminal event leaves the view-model
+    /// transcript-refresh flag untouched (Slice 2 regression guards).
+    private var pendingDeferredStreamFinish = false
+    /// Set when the terminal transition already cleared auxiliary monitoring
+    /// (`.completed`), so the deferred `finishStream()` does not clear twice.
+    private var monitoringClearedAtTerminal = false
+
     init(
         client: APIClient,
         streamClient: SSEStreamingClient,
@@ -171,6 +211,9 @@ final class ChatStreamCoordinator {
         hasCompletedCurrentResponse = false
         liveTokensPerSecond = nil
         runGeneration &+= 1
+        // A stale deferred finish from a previous run must never be consumed
+        // by this run's terminal events.
+        pendingDeferredStreamFinish = false
         let connectionIdentity = ChatRunIdentity(streamID: streamID, logicalGeneration: runGeneration)
         activeStreamID = streamID
         isConnectionSuspended = false
@@ -221,8 +264,15 @@ final class ChatStreamCoordinator {
         guard self.activeStreamID == activeStreamID else { return response }
         guard response.ok != false else { return response }
 
-        liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
-        finishStream()
+        // Explicit cancel terminal candidate: routed through the centralized
+        // transition so the first-valid-outcome-wins rule and idempotent
+        // cleanup apply (#18 Slice 2).
+        if let identity = runIdentity {
+            transitionToTerminal(outcome: .cancelled, identity: identity)
+        } else {
+            liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
+            finishStream()
+        }
         return response
     }
 
@@ -527,7 +577,20 @@ final class ChatStreamCoordinator {
             liveTokensPerSecond = payload.displayableTokensPerSecond
         case .done(let payload):
             let hasCompletedTranscript = delegate?.streamCoordinatorApplyDone(payload) == true
-            completeCurrentResponse(needsTranscriptRefresh: !hasCompletedTranscript)
+            if let identity = runIdentity {
+                // The `.done` commits the terminal transition but defers
+                // `finishStream()` to the completing connection's own terminal
+                // event: stopping the client here would drop that event before
+                // delivery, and finishing here would clear the view-model
+                // transcript-refresh flag a bare `.done` must leave visible
+                // (Slice 2 regression guards).
+                transitionToTerminal(
+                    outcome: .completed,
+                    identity: identity,
+                    needsTranscriptRefresh: !hasCompletedTranscript,
+                    defersStreamFinish: true
+                )
+            }
         case .approvalPending(let update):
             liveActivityManager.update(.waitingForApproval)
             delegate?.streamCoordinatorApplyApprovalUpdate(update)
@@ -541,19 +604,35 @@ final class ChatStreamCoordinator {
                 markProgress()
             }
         case .streamEnd:
-            if !hasCompletedCurrentResponse {
-                liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
+            // Server closed the stream: a terminal `.completed` candidate. A
+            // late `.streamEnd` from the completing connection after
+            // finalization is admitted by the fence but no-ops in the
+            // centralized transition (first outcome wins). A bare `.streamEnd`
+            // (no `.done`) finishes the stream WITHOUT marking the response
+            // completed — the pre-#18 semantics the queued-message drain and
+            // title-refresh paths rely on.
+            if let identity = runIdentity {
+                transitionToTerminal(
+                    outcome: .completed,
+                    identity: identity,
+                    marksResponseCompleted: false
+                )
             }
-            finishStream()
+            finishDeferredStreamIfPending()
         case .cancelled:
-            liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
-            finishStream()
+            if let identity = runIdentity {
+                transitionToTerminal(outcome: .cancelled, identity: identity)
+            }
+            finishDeferredStreamIfPending()
         case .error(let message):
-            if !hasCompletedCurrentResponse {
+            // The failure message is surfaced only when THIS call commits the
+            // transition — a late error after a cancelled/completed outcome is
+            // a no-op and must not surface a message or finish twice.
+            if let identity = runIdentity,
+               transitionToTerminal(outcome: .failed, identity: identity) {
                 delegate?.streamCoordinatorDidReceiveErrorMessage(message)
             }
-            liveActivityManager.end(status: .failed, activity: String(localized: "Response failed"), errorSummary: nil)
-            finishStream()
+            finishDeferredStreamIfPending()
         case .transportError(let message):
             handleTransportError(message)
         case .heartbeat:
@@ -678,22 +757,103 @@ final class ChatStreamCoordinator {
         )
     }
 
-    private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
+    /// Centralized terminal transition (#18 Slice 2). Every terminal candidate
+    /// — `.done`, `.streamEnd`, `.cancelled`, `.error`, and the explicit
+    /// recovery/cancel finalize paths — funnels through here. The FIRST valid
+    /// candidate for a run commits: Live Activity end, terminal delegate
+    /// callback, snapshot removal, monitoring stop, and coordinator cleanup
+    /// all happen exactly once. Later candidates — duplicate terminal events
+    /// or terminal events from the completing connection arriving after
+    /// finalization — are no-ops.
+    ///
+    /// `.completed` has two refinements preserving pre-#18 semantics:
+    /// - `marksResponseCompleted: false` (bare `.streamEnd`): finishes the
+    ///   stream without firing `streamCoordinatorDidCompleteCurrentResponse`
+    ///   or marking the response completed, so the queued-message drain and
+    ///   title refresh keep their legacy behavior.
+    /// - `defersStreamFinish: true` (`.done`): the terminal transition is
+    ///   committed but `finishStream()` waits for the completing connection's
+    ///   own terminal event, so the client is not stopped before that event
+    ///   is delivered and a `.done` with no trailing terminal event leaves
+    ///   the view-model transcript-refresh flag untouched.
+    ///
+    /// Transport errors are NOT terminal candidates and never reach this
+    /// transition. Returns whether this call committed.
+    @discardableResult
+    private func transitionToTerminal(
+        outcome: ChatRunTerminalOutcome,
+        identity: ChatRunIdentity,
+        needsTranscriptRefresh: Bool = true,
+        marksResponseCompleted: Bool = true,
+        defersStreamFinish: Bool = false
+    ) -> Bool {
+        guard runIdentity == identity else { return false }
+
         // Capture the completing run's identity BEFORE the active stream is
         // cleared: the completing connection's own terminal events arrive
         // after finalization and must still pass the generation fence.
-        completedRunIdentity = runIdentity
+        completedRunIdentity = identity
         runGeneration &+= 1
-        liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
-        delegate?.streamCoordinatorRemoveSnapshot(streamID: activeStreamID)
-        delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+        pendingDeferredStreamFinish = defersStreamFinish
+
+        switch outcome {
+        case .completed:
+            if marksResponseCompleted, !hasCompletedCurrentResponse {
+                hasCompletedCurrentResponse = true
+                delegate?.streamCoordinatorDidCompleteCurrentResponse(
+                    needsTranscriptRefresh: needsTranscriptRefresh
+                )
+            }
+            // The approval/clarification prompt is resolved by the completed
+            // response even when the stream finish is deferred (pre-#18
+            // `.done` finished immediately and cleared the prompt here). The
+            // deferred `finishStream()` skips its own clear when this flag is
+            // set, so the prompt clears exactly once.
+            monitoringClearedAtTerminal = true
+            delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+            liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
+        case .cancelled:
+            liveActivityManager.end(status: .cancelled, activity: String(localized: "Response cancelled"), errorSummary: nil)
+        case .failed:
+            liveActivityManager.end(status: .failed, activity: String(localized: "Response failed"), errorSummary: nil)
+        }
+
+        delegate?.streamCoordinatorDidCommitTerminalOutcome(outcome, identity: identity)
+
         activeStreamID = nil
         lastEventID = nil
         liveTokensPerSecond = nil
         delegate?.streamCoordinatorStreamingAssistantMessageID = nil
-        hasCompletedCurrentResponse = true
-        delegate?.streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: needsTranscriptRefresh)
-        resetRecoveryState()
+        if !defersStreamFinish {
+            finishStream()
+        }
+        return true
+    }
+
+    private func completeCurrentResponse(needsTranscriptRefresh: Bool) {
+        if let identity = runIdentity {
+            transitionToTerminal(
+                outcome: .completed,
+                identity: identity,
+                needsTranscriptRefresh: needsTranscriptRefresh
+            )
+        } else {
+            // No active run identity (e.g. the run was reconciled to nil
+            // during a transcript load): fall back to the pre-#18 completion
+            // bookkeeping without a terminal transition record.
+            completedRunIdentity = nil
+            runGeneration &+= 1
+            liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
+            delegate?.streamCoordinatorRemoveSnapshot(streamID: activeStreamID)
+            delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+            activeStreamID = nil
+            lastEventID = nil
+            liveTokensPerSecond = nil
+            delegate?.streamCoordinatorStreamingAssistantMessageID = nil
+            hasCompletedCurrentResponse = true
+            delegate?.streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: needsTranscriptRefresh)
+            resetRecoveryState()
+        }
     }
 
     /// Terminal SSE events that may legitimately arrive from the completing
@@ -711,9 +871,25 @@ final class ChatStreamCoordinator {
     }
 
     private func completeResponseFromRefreshedTranscriptAndFinishStream(streamID completedStreamID: String?) {
-        completeCurrentResponse(needsTranscriptRefresh: false)
-        delegate?.streamCoordinatorRemoveSnapshot(streamID: completedStreamID)
-        finishStream()
+        if let identity = runIdentity {
+            // The transition commits completion AND finishes the stream in one
+            // idempotent pass (single snapshot removal, single stream stop).
+            transitionToTerminal(
+                outcome: .completed,
+                identity: identity,
+                needsTranscriptRefresh: false
+            )
+        } else {
+            // No active run identity (the run was reconciled to nil during the
+            // transcript load): the run still completed, so end the Live
+            // Activity and notify the response-completion observers exactly as
+            // the pre-#18 completion path did — a foreground-reconnect
+            // completion must never leave the Live Activity on "running".
+            liveActivityManager.end(status: .complete, activity: String(localized: "Response complete"), errorSummary: nil)
+            delegate?.streamCoordinatorDidCompleteCurrentResponse(needsTranscriptRefresh: false)
+            delegate?.streamCoordinatorRemoveSnapshot(streamID: completedStreamID)
+            finishStream()
+        }
     }
 
     /// Whether `self` may still finalize the run captured before an awaited
@@ -741,18 +917,35 @@ final class ChatStreamCoordinator {
     private func finalizeInactiveStream(streamID: String?) {
         if delegate?.streamCoordinatorLatestServerLoadHadAssistantResponseAfterLatestUser == true {
             completeResponseFromRefreshedTranscriptAndFinishStream(streamID: streamID)
+        } else if let identity = runIdentity {
+            // Recovery terminal candidate: no assistant reply surfaced, so the
+            // inactive run finalizes as failed through the central transition.
+            transitionToTerminal(outcome: .failed, identity: identity)
         } else {
             liveActivityManager.end(status: .failed, activity: String(localized: "Response failed"), errorSummary: nil)
             finishStream()
         }
     }
 
+    /// Runs the deferred `finishStream()` when the completing connection's own
+    /// terminal event arrives after a `.done` committed the transition. The
+    /// event performs no transition work (first outcome wins) but must still
+    /// finish the stream exactly once.
+    private func finishDeferredStreamIfPending() {
+        guard pendingDeferredStreamFinish else { return }
+        finishStream()
+    }
+
     private func finishStream() {
+        pendingDeferredStreamFinish = false
         runGeneration &+= 1
         let completedNormally = hasCompletedCurrentResponse
         let finishedStreamID = activeStreamID
         streamClient.stop()
-        delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+        if !monitoringClearedAtTerminal {
+            delegate?.streamCoordinatorStopAuxiliaryMonitoring(clearPrompt: true)
+        }
+        monitoringClearedAtTerminal = false
         delegate?.streamCoordinatorFlushPinnedLocalNoticesToTranscript()
         delegate?.streamCoordinatorRemoveSnapshot(streamID: finishedStreamID)
         activeStreamID = nil
