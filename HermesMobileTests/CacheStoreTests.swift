@@ -842,83 +842,68 @@ final class CacheStoreTests: XCTestCase {
         )
     }
 
-    // MARK: - Slice 5 (#18): terminal event cache round trips (RED — references
-    // intended-missing ChatTerminalCommit, ChatTerminalPersistenceHandoff,
-    // ChatTerminalCacheWriter, the CacheStore.persistTerminalHandoff /
-    // CacheStore.terminalHandoff seams and the CachedTerminalHandoff model).
+    // MARK: - Slice 5 (#18): terminal event cache round trips by stable message ID
+    //
+    // The terminal event is an ordinary ChatMessage whose messageId is the
+    // stable run-status-v1 key (ChatRunStatusTerminalEventKey). It round-trips
+    // through the existing CacheStore: cacheMessages then cachedMessages
+    // returns the terminal event with the SAME stable messageID. Per the v7
+    // contract there is no SwiftData model, schema field, or migration for
+    // terminal events (#18 §498) — the event is cached exactly like any other
+    // message.
 
     func testTerminalCacheRoundTripCompleted() throws {
-        try assertTerminalCacheRoundTrip(outcome: .completed, notice: "Done.")
+        try assertTerminalCacheRoundTrip(outcome: .completed, text: "Response complete")
     }
 
     func testTerminalCacheRoundTripFailed() throws {
-        try assertTerminalCacheRoundTrip(outcome: .failed, notice: "Run failed.")
+        try assertTerminalCacheRoundTrip(outcome: .failed, text: "Response failed")
     }
 
     func testTerminalCacheRoundTripCancelled() throws {
-        try assertTerminalCacheRoundTrip(outcome: .cancelled, notice: "Run cancelled.")
+        try assertTerminalCacheRoundTrip(outcome: .cancelled, text: "Response cancelled")
     }
 
-    private func assertTerminalCacheRoundTrip(outcome: ChatTerminalOutcome, notice: String) throws {
+    private func assertTerminalCacheRoundTrip(outcome: ChatRunTerminalOutcome, text: String) throws {
         let context = try makeContext()
-        let writer = RecordingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 1)
-        let noticeID = stableTerminalEventMessageID(identity: identity, outcome: outcome)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: outcome),
-            snapshotMessages: [ChatMessage(role: "assistant", content: notice,
-                                           timestamp: 1_770_000_000, messageId: noticeID)],
-            generation: 1
+        let serverURL = try XCTUnwrap(URL(string: "https://example.test"))
+        let sessionID = "session-abc"
+        let cachedAt = Date(timeIntervalSince1970: 1_770_000_000)
+        let now = cachedAt.addingTimeInterval(60)
+
+        let key = ChatRunStatusTerminalEventKey(
+            identity: ChatRunIdentity(sessionID: sessionID, streamID: "stream-abc", generation: 1),
+            outcome: outcome
+        )
+        let terminalEvent = ChatMessage(
+            role: "local_notice",
+            content: text,
+            timestamp: 1_770_000_000,
+            messageId: key.messageID
         )
 
-        try CacheStore.persistTerminalHandoff(handoff, in: context, writer: writer)
-        // Persisting the same terminal event key again must not duplicate it.
-        try CacheStore.persistTerminalHandoff(handoff, in: context, writer: writer)
-
-        let restored = try XCTUnwrap(CacheStore.terminalHandoff(identity: identity, in: context))
-        XCTAssertEqual(restored.commit.identity, identity)
-        XCTAssertEqual(restored.snapshotMessages.map(\.messageId), [noticeID])
-        XCTAssertEqual(restored.generation, 1)
-        XCTAssertNil(
-            try CacheStore.terminalHandoff(identity: ChatRunIdentity(streamID: "other-stream", logicalGeneration: 1), in: context),
-            "The terminal event is keyed by the run identity"
+        try CacheStore.cacheMessages(
+            [terminalEvent],
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            cachedAt: cachedAt
         )
 
-        // One identity-keyed handoff, no duplicate event. The cache seam takes
-        // only (handoff, identity, context, writer) — there is no ChatView
-        // onChange/trigger dependency.
-        let stored = try context.fetch(FetchDescriptor<CachedTerminalHandoff>())
-        XCTAssertEqual(stored.count, 1, "Exactly one identity-keyed handoff is stored")
-    }
-
-    func testThrowingTerminalCacheWriterRetainsPendingRequestForRetry() throws {
-        let context = try makeContext()
-        let writer = ThrowingTerminalCacheWriter()
-        let identity = ChatRunIdentity(streamID: "stream-abc", logicalGeneration: 2)
-        let handoff = ChatTerminalPersistenceHandoff(
-            commit: ChatTerminalCommit(identity: identity, outcome: .failed),
-            snapshotMessages: [ChatMessage(role: "assistant", content: "Run failed.", timestamp: 1_770_000_000,
-                                           messageId: stableTerminalEventMessageID(identity: identity, outcome: .failed))],
-            generation: 2
+        let restored = try CacheStore.cachedMessages(
+            serverURL: serverURL,
+            sessionID: sessionID,
+            in: context,
+            now: now
         )
 
-        writer.failNextWrite = true
-        XCTAssertThrowsError(try CacheStore.persistTerminalHandoff(handoff, in: context, writer: writer))
-        XCTAssertEqual(writer.pendingHandoffs.count, 1, "A failed cache write retains the pending handoff for retry")
-        XCTAssertEqual(writer.handoffs.count, 0, "No duplicate event is written on failure")
-        XCTAssertNil(
-            try CacheStore.terminalHandoff(identity: identity, in: context),
-            "A failed write must not leave a partial cache entry"
+        XCTAssertEqual(
+            restored.map(\.messageId),
+            [key.messageID],
+            "cacheMessages then cachedMessages returns the terminal event with the SAME stable messageID"
         )
-
-        writer.failNextWrite = false
-        try CacheStore.persistTerminalHandoff(handoff, in: context, writer: writer)
-
-        XCTAssertEqual(writer.handoffs.count, 1, "Retry lands exactly one identity-keyed handoff")
-        XCTAssertTrue(writer.pendingHandoffs.isEmpty, "Retry state is cleared after success")
-        let restored = try XCTUnwrap(CacheStore.terminalHandoff(identity: identity, in: context))
-        XCTAssertEqual(restored.snapshotMessages.map(\.messageId), handoff.snapshotMessages.map(\.messageId))
-        XCTAssertEqual(restored.generation, 2)
+        XCTAssertEqual(restored.map(\.content), [text])
+        XCTAssertEqual(restored.count, 1)
     }
 
     private func makeContext() throws -> ModelContext {
