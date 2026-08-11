@@ -352,13 +352,6 @@ final class ChatViewModel {
     var uploadAttachmentErrorMessage: String? { attachmentCoordinator.uploadAttachmentErrorMessage }
     var localAttachmentPreviews: [String: [String: Data]] { attachmentCoordinator.localAttachmentPreviews }
     private(set) var pinnedLocalNotices: [String] = []
-
-    /// The recovery-load token of the current run connection (#18 Slice 4).
-    /// A transcript load that completes after the run was replaced or
-    /// finalized is stale and must not mutate the replacement run;
-    /// `loadMessages` revalidates the captured token against this value
-    /// after every await.
-    private(set) var activeRecoveryLoadToken: ChatRunRecoveryLoadToken?
     var approvalPrompt: ApprovalPromptState? { pendingActionCoordinator.approvalPrompt }
     var isRespondingToApproval: Bool { pendingActionCoordinator.isRespondingToApproval }
     var approvalErrorMessage: String? { pendingActionCoordinator.approvalErrorMessage }
@@ -789,6 +782,13 @@ final class ChatViewModel {
     }
 
     // MARK: Slice 3 coordinator-owned catalog (#16)
+
+    /// The recovery-load token of the current run connection (#18 Slice 4).
+    /// A transcript load that completes after the run was replaced or
+    /// finalized is stale and must not mutate the replacement run;
+    /// `loadMessages` revalidates the captured token against this value
+    /// after every await.
+    private(set) var activeRecoveryLoadToken: ChatRunRecoveryLoadToken?
 
     /// Number of cancellation requests in flight. `isCancellingStream` stays
     /// true while ANY cancellation is pending, so a stale cancellation's
