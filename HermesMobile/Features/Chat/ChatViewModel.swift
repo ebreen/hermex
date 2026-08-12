@@ -754,7 +754,26 @@ final class ChatViewModel {
                 continue
             }
 
-            applyComposerConfigurationState(result.state, preservingSelectionFrom: initialState)
+            guard await acceptsComposerConfigurationCatalog(result) else {
+                needsComposerConfigurationReload = true
+                continue
+            }
+
+            var stateToApply = result.state
+            if !result.catalogValuesAuthorized {
+                // Preserve the last verified catalog projection while still
+                // applying reasoning/workspace/command results and reporting a
+                // current catalog failure.
+                stateToApply.currentWorkspace = initialState.currentWorkspace
+                stateToApply.currentModel = initialState.currentModel
+                stateToApply.currentModelProvider = initialState.currentModelProvider
+                stateToApply.currentProfile = initialState.currentProfile
+                stateToApply.selectedProfileName = initialState.selectedProfileName
+                stateToApply.modelCatalogGroups = initialState.modelCatalogGroups
+                stateToApply.profileOptions = initialState.profileOptions
+                stateToApply.isSingleProfileMode = initialState.isSingleProfileMode
+            }
+            applyComposerConfigurationState(stateToApply, preservingSelectionFrom: initialState)
 
             if let error = result.configurationError {
                 lastError = error
@@ -931,6 +950,41 @@ final class ChatViewModel {
         case .contextVerified, .finished, .cancelled, .state:
             break
         }
+    }
+
+    private func acceptsComposerConfigurationCatalog(
+        _ result: ChatComposerConfigLoadResult
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+
+        if let snapshot = result.catalogSnapshot,
+           let operationID = result.catalogOperationID,
+           let operationGeneration = result.catalogOperationGeneration {
+            if snapshot.context != nil || snapshot.base != nil {
+                return await client.acceptsCatalogSnapshot(
+                    snapshot,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            }
+            // A current failure-shaped snapshot may publish its scoped error and
+            // clear loading state, but it must not authorize catalog values.
+            return await client.acceptsCatalogMetadata(
+                snapshot.metadata,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+        }
+
+        if let metadata = result.catalogMetadata,
+           let modelCatalogCoordinator {
+            return await modelCatalogCoordinator.accepts(metadata)
+        }
+
+        // A result without an accepted catalog token is a catalog failure. Keep
+        // failure observability intact; there is no catalog-derived state to
+        // authorize or overwrite.
+        return result.catalogMetadata == nil && result.catalogSnapshot == nil
     }
 
     /// Loads the composer configuration through the coordinator-owned catalog

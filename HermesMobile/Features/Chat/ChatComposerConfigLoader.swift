@@ -56,6 +56,18 @@ struct ChatComposerConfigState: Equatable, Sendable {
 struct ChatComposerConfigLoadResult: Sendable {
     let state: ChatComposerConfigState
     let configurationFailure: ChatComposerConfigFailure?
+    /// Whether the catalog-derived fields in this result were backed by a
+    /// verified base snapshot. A failure may still carry current metadata for
+    /// error publication, but it cannot authorize profile/catalog mutation.
+    let catalogValuesAuthorized: Bool
+    /// The last catalog event metadata accepted while building this result.
+    /// Coordinator callers must revalidate it after later awaits.
+    let catalogMetadata: CatalogEventMetadata?
+    /// The direct neutral snapshot, when the fallback path produced this result.
+    /// Direct callers must revalidate it with the captured operation identity.
+    let catalogSnapshot: CatalogSnapshotResult?
+    let catalogOperationID: UUID?
+    let catalogOperationGeneration: UInt64?
 }
 
 struct ChatComposerConfigLoader {
@@ -124,7 +136,10 @@ struct ChatComposerConfigLoader {
             return await finishDirectLoad(
                 state: state,
                 configurationError: configurationError,
-                client: client
+                client: client,
+                catalogSnapshot: catalogResult,
+                catalogOperationID: operationID,
+                catalogOperationGeneration: operationGeneration
             )
         }
 
@@ -191,14 +206,20 @@ struct ChatComposerConfigLoader {
         return await finishDirectLoad(
             state: state,
             configurationError: configurationError,
-            client: client
+            client: client,
+            catalogSnapshot: catalogResult,
+            catalogOperationID: operationID,
+            catalogOperationGeneration: operationGeneration
         )
     }
 
     private func finishDirectLoad(
         state: ChatComposerConfigState,
         configurationError: Error?,
-        client: APIClient
+        client: APIClient,
+        catalogSnapshot: CatalogSnapshotResult,
+        catalogOperationID: UUID,
+        catalogOperationGeneration: UInt64
     ) async -> ChatComposerConfigLoadResult {
         var state = state
         do {
@@ -208,7 +229,12 @@ struct ChatComposerConfigLoader {
         }
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationFailure: Self.failureCategory(from: configurationError)
+            configurationFailure: Self.failureCategory(from: configurationError),
+            catalogValuesAuthorized: catalogSnapshot.base != nil,
+            catalogMetadata: nil,
+            catalogSnapshot: catalogSnapshot,
+            catalogOperationID: catalogOperationID,
+            catalogOperationGeneration: catalogOperationGeneration
         )
     }
 
@@ -311,6 +337,7 @@ struct ChatComposerConfigLoader {
         // invoked exactly once, immediately after parsing/defaulting and
         // before any reasoning request is awaited.
         var publishedSnapshot: CatalogBaseSnapshot?
+        var acceptedCatalogMetadata: CatalogEventMetadata?
         var sawContextVerified = false
         var sawBase = false
         for await event in catalogEvents {
@@ -324,7 +351,8 @@ struct ChatComposerConfigLoader {
             }
 
             switch event {
-            case let .contextVerified(_, context):
+            case let .contextVerified(metadata, context):
+                acceptedCatalogMetadata = metadata
                 sawContextVerified = true
                 state.profileOptions = context.profiles
                 state.selectedProfileName = Self.nonEmpty(context.activeProfile)
@@ -342,6 +370,7 @@ struct ChatComposerConfigLoader {
                     state.currentModelProvider = Self.nonEmpty(profile.provider)
                 }
             case let .base(snapshot):
+                acceptedCatalogMetadata = snapshot.metadata
                 sawBase = true
                 state.modelCatalogGroups = snapshot.groups
                 if state.currentModel == nil {
@@ -406,7 +435,12 @@ struct ChatComposerConfigLoader {
 
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationFailure: configurationFailure
+            configurationFailure: configurationFailure,
+            catalogValuesAuthorized: publishedSnapshot != nil,
+            catalogMetadata: acceptedCatalogMetadata,
+            catalogSnapshot: nil,
+            catalogOperationID: acceptedCatalogMetadata?.operationID,
+            catalogOperationGeneration: acceptedCatalogMetadata?.operationGeneration
         )
     }
 
