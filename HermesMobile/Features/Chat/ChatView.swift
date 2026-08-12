@@ -349,6 +349,7 @@ struct ChatView: View {
             gateKey: catalogGateKey,
             apiClientID: resolvedClient.apiClientID,
             authGeneration: 0,
+            requestedProfile: session.profile,
             provider: { requestedProfile, operationID, operationGeneration in
                 await resolvedClient.modelCatalogStream(
                     requestedProfile: requestedProfile,

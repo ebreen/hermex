@@ -682,6 +682,33 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         XCTAssertEqual(stateSnapshot?.state, .freshReady)
     }
 
+    func testRequestedProfileIsForwardedToEveryCoordinatorOperation() async throws {
+        let harness = makeHarness(requestedProfile: "work")
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        XCTAssertEqual(harness.provider.call(0).requestedProfile, "work")
+
+        completeOperation(
+            call: harness.provider.call(0),
+            harness: harness,
+            activeProfile: "work",
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])]
+        )
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .finished = event { return true }
+                return false
+            }
+        }
+
+        await harness.coordinator.retry()
+        await harness.provider.waitForCallCount(2)
+        XCTAssertEqual(harness.provider.call(1).requestedProfile, "work")
+        await cancel(subscriber)
+    }
+
     func testInitialLoadAndPickerRefreshShareOneOperation() async throws {
         let harness = makeHarness()
         let subscriber = await makeSubscriber(harness.coordinator)
@@ -1447,6 +1474,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
     }
 
     private func makeHarness(
+        requestedProfile: String? = nil,
         clock: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_700_000_000) },
         freshnessInterval: TimeInterval = 300,
         completedContextLimit: Int = 4
@@ -1458,6 +1486,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             gateKey: gateKey,
             apiClientID: apiClientID,
             authGeneration: 0,
+            requestedProfile: requestedProfile,
             provider: provider.makeProvider(),
             configuration: ChatModelCatalogCoordinator.Configuration(
                 now: clock,

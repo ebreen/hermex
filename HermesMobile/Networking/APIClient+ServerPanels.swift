@@ -191,41 +191,133 @@ extension APIClient {
             )
         }
 
-        let response = profileEnvelope.value
-        let profiles = response.profiles ?? []
-        let verification = CatalogProfileVerifier.verify(
-            profiles: profiles,
-            explicitActive: response.active,
-            singleProfileMode: response.singleProfileMode ?? false,
-            requestedProfile: requestedProfile
+        let normalizedRequestedProfile = requestedProfile
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let initialResponse = profileEnvelope.value
+        let initialProfiles = initialResponse.profiles ?? []
+        let initialVerification = CatalogProfileVerifier.verify(
+            profiles: initialProfiles,
+            explicitActive: initialResponse.active,
+            singleProfileMode: initialResponse.singleProfileMode ?? false,
+            requestedProfile: normalizedRequestedProfile
         )
-        guard case let .verified(activeProfile, singleProfileMode) = verification else {
-            let category: CatalogFailureCategory = verification == .mismatch
-                ? .profileMismatch
-                : .profileUnavailable
+
+        let authoritativeProfileEnvelope: CatalogCompatibilityEnvelope<ProfilesResponse>
+        let profiles: [ProfileSummary]
+        let activeProfile: String
+        let singleProfileMode: Bool
+        let defaults: CatalogProfileDefaults
+        let switchResult: CatalogProfileSwitchResult
+
+        switch initialVerification {
+        case .unavailable:
             return await failedCatalogSnapshot(
                 operationID: operationID,
                 operationGeneration: operationGeneration,
                 gateKey: profileEnvelope.gateKey,
                 gateEpoch: profileEnvelope.gateEpoch,
-                category: category
+                category: .profileUnavailable
             )
+        case let .verified(verifiedProfile, verifiedSingleProfileMode):
+            authoritativeProfileEnvelope = profileEnvelope
+            profiles = initialProfiles
+            activeProfile = verifiedProfile
+            singleProfileMode = verifiedSingleProfileMode
+            defaults = CatalogProfileDefaults(model: nil, workspace: nil)
+            switchResult = normalizedRequestedProfile == nil ? .notRequested : .alreadyActive
+        case .mismatch:
+            guard let normalizedRequestedProfile else {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: profileEnvelope.gateEpoch,
+                    category: .profileMismatch
+                )
+            }
+
+            let switchResponse: ProfileSwitchResponse
+            do {
+                switchResponse = try await switchProfile(name: normalizedRequestedProfile)
+            } catch let failure as ProfileContextSwitchFailure {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: catalogFailure(forProfileSwitch: failure)
+                )
+            } catch {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: .transport
+                )
+            }
+
+            do {
+                authoritativeProfileEnvelope = try await compatibilityProfiles(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            } catch {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: .profileUnavailable
+                )
+            }
+
+            let switchedResponse = authoritativeProfileEnvelope.value
+            let switchedProfiles = switchedResponse.profiles ?? []
+            let switchedVerification = CatalogProfileVerifier.verify(
+                profiles: switchedProfiles,
+                explicitActive: switchedResponse.active,
+                singleProfileMode: switchedResponse.singleProfileMode ?? false,
+                requestedProfile: normalizedRequestedProfile
+            )
+            guard case let .verified(verifiedProfile, verifiedSingleProfileMode) = switchedVerification else {
+                let category: CatalogFailureCategory = switchedVerification == .mismatch
+                    ? .profileMismatch
+                    : .profileUnavailable
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: authoritativeProfileEnvelope.gateKey,
+                    gateEpoch: authoritativeProfileEnvelope.gateEpoch,
+                    category: category
+                )
+            }
+
+            profiles = switchedProfiles
+            activeProfile = verifiedProfile
+            singleProfileMode = verifiedSingleProfileMode
+            defaults = CatalogProfileDefaults(
+                model: switchResponse.defaultModel,
+                workspace: switchResponse.defaultWorkspace
+            )
+            switchResult = .switched(defaults: defaults)
         }
 
         let metadata = catalogMetadata(
             operationID: operationID,
             operationGeneration: operationGeneration,
-            gateKey: profileEnvelope.gateKey,
-            gateEpoch: profileEnvelope.gateEpoch,
+            gateKey: authoritativeProfileEnvelope.gateKey,
+            gateEpoch: authoritativeProfileEnvelope.gateEpoch,
             activeProfile: activeProfile
         )
         let context = CatalogProfileContext(
             profiles: profiles,
             activeProfile: activeProfile,
-            requestedProfile: requestedProfile,
+            requestedProfile: normalizedRequestedProfile,
             singleProfileMode: singleProfileMode,
-            defaults: CatalogProfileDefaults(model: nil, workspace: nil),
-            switchResult: .notRequested
+            defaults: defaults,
+            switchResult: switchResult
         )
 
         do {
@@ -368,6 +460,21 @@ extension APIClient {
             singleProfileMode: false,
             isAuthoritative: false
         )
+    }
+
+    private func catalogFailure(forProfileSwitch failure: ProfileContextSwitchFailure) -> CatalogFailureCategory {
+        switch failure {
+        case .rejected:
+            return .profileSwitchRejected
+        case .transport:
+            return .transport
+        case .unauthorized:
+            return .unauthorized
+        case .decoding:
+            return .decoding
+        case .cancelled:
+            return .cancelled
+        }
     }
 
     private func failedCatalogSnapshot(

@@ -146,6 +146,8 @@ actor ChatModelCatalogCoordinator {
     private let gateKey: ProfileContextGateKey
     private let apiClientID: UUID
     private let authGeneration: UInt64
+    /// The session profile requested by every coordinator-owned catalog operation.
+    private let requestedProfile: String?
     private let provider: @Sendable (String?, UUID, UInt64) async -> AsyncStream<CatalogNetworkEvent>
     private let configuration: Configuration
 
@@ -184,12 +186,15 @@ actor ChatModelCatalogCoordinator {
         gateKey: ProfileContextGateKey,
         apiClientID: UUID,
         authGeneration: UInt64,
+        requestedProfile: String? = nil,
         provider: @escaping @Sendable (String?, UUID, UInt64) async -> AsyncStream<CatalogNetworkEvent>,
         configuration: Configuration
     ) {
         self.gateKey = gateKey
         self.apiClientID = apiClientID
         self.authGeneration = authGeneration
+        let normalizedProfile = requestedProfile?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.requestedProfile = normalizedProfile?.isEmpty == false ? normalizedProfile : nil
         self.provider = provider
         self.configuration = configuration
     }
@@ -227,10 +232,14 @@ actor ChatModelCatalogCoordinator {
         // An in-flight operation: coalesce under the same epoch, supersede
         // under a stale epoch.
         if let op = currentOperation, !op.isTerminal {
-            if op.operationKey.startingGateEpoch == authoritativeEpoch {
+            if op.operationKey.startingGateEpoch == authoritativeEpoch,
+               op.operationKey.requestedProfile == requestedProfile {
                 return
             }
-            let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
+            let provisional = await startOperation(
+                requestedProfile: requestedProfile,
+                startingGateEpoch: authoritativeEpoch
+            )
             if let visible = visibleContextKey, cache[visible] != nil {
                 _ = await setState(
                     .staleRefreshing,
@@ -245,6 +254,7 @@ actor ChatModelCatalogCoordinator {
 
         // Completed cache for the visible context: fresh hit or stale refresh.
         if let visible = visibleContextKey,
+           (requestedProfile == nil || visible.activeProfile == requestedProfile),
            let entry = cache[visible] {
             let age = configuration.now().timeIntervalSince(entry.publishedAt)
             let revisionAtRead = cacheRevision
@@ -301,7 +311,10 @@ actor ChatModelCatalogCoordinator {
             // Stale (or at capacity): publish stale rows immediately, then
             // start one refresh. Revalidate the captured cache revision after
             // the provider await and again in the final publication fence.
-            let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
+            let provisional = await startOperation(
+                requestedProfile: requestedProfile,
+                startingGateEpoch: authoritativeEpoch
+            )
             guard let current = currentOperation,
                   current.operationID == provisional.operationID,
                   current.operationGeneration == provisional.operationGeneration,
@@ -332,7 +345,10 @@ actor ChatModelCatalogCoordinator {
         }
 
         // Cold start.
-        let provisional = await startOperation(startingGateEpoch: authoritativeEpoch)
+        let provisional = await startOperation(
+            requestedProfile: requestedProfile,
+            startingGateEpoch: authoritativeEpoch
+        )
         _ = await setState(.loading, metadata: provisional)
     }
 
@@ -350,7 +366,10 @@ actor ChatModelCatalogCoordinator {
            op.operationKey.startingGateEpoch == authoritativeEpoch {
             return
         }
-        _ = await startOperation(startingGateEpoch: authoritativeEpoch)
+        _ = await startOperation(
+            requestedProfile: currentOperation?.operationKey.requestedProfile ?? requestedProfile,
+            startingGateEpoch: authoritativeEpoch
+        )
     }
 
     /// ChatViewModel-facing authority check: true when the event metadata's
@@ -675,7 +694,10 @@ actor ChatModelCatalogCoordinator {
     /// consume task. Returns the provisional metadata so callers can rebind
     /// immediate (stale) publications to the new operation.
     @discardableResult
-    private func startOperation(startingGateEpoch: UInt64) async -> CatalogEventMetadata {
+    private func startOperation(
+        requestedProfile: String?,
+        startingGateEpoch: UInt64
+    ) async -> CatalogEventMetadata {
         let operationID = UUID()
         let operationGeneration = nextOperationGeneration
         nextOperationGeneration += 1
@@ -683,7 +705,7 @@ actor ChatModelCatalogCoordinator {
             gateKey: gateKey,
             apiClientID: apiClientID,
             authGeneration: authGeneration,
-            requestedProfile: nil,
+            requestedProfile: requestedProfile,
             startingGateEpoch: startingGateEpoch
         )
         let provisional = CatalogEventMetadata(
@@ -705,7 +727,7 @@ actor ChatModelCatalogCoordinator {
             outcome: nil,
             operationID: operationID
         )
-        let stream = await provider(nil, operationID, operationGeneration)
+        let stream = await provider(requestedProfile, operationID, operationGeneration)
         // Detached consume task: it only observes the stream and hops back to
         // this actor; canceling subscribers never cancels the operation.
         Task { [weak self] in
@@ -732,7 +754,7 @@ actor ChatModelCatalogCoordinator {
             gateKey: gateKey,
             apiClientID: apiClientID,
             authGeneration: authGeneration,
-            requestedProfile: nil,
+            requestedProfile: profileContext.requestedProfile,
             startingGateEpoch: startingGateEpoch
         )
         let metadata = CatalogEventMetadata(

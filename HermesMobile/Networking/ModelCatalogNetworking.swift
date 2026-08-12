@@ -240,6 +240,64 @@ struct CatalogLeaseAdmission: Equatable, Sendable {
     let gateEpoch: UInt64
 }
 
+/// Tracks the one reader admission owned by a catalog operation. A requested
+/// profile switch transfers ownership: the reader is released before the
+/// exclusive writer, then replaced with a fresh reader admission after the
+/// writer advances the authoritative gate epoch.
+private final class CatalogOperationExecution: @unchecked Sendable {
+    let gate: ProfileContextGate
+    let operationID: UUID
+    var metadata: CatalogEventMetadata
+    var operationKey: CatalogOperationKey
+    var admissionMetadata: CatalogLeaseAdmissionMetadata?
+    private var readerAdmission: CatalogLeaseAdmission?
+
+    init(
+        gate: ProfileContextGate,
+        operationID: UUID,
+        metadata: CatalogEventMetadata,
+        operationKey: CatalogOperationKey,
+        admission: CatalogLeaseAdmission
+    ) {
+        self.gate = gate
+        self.operationID = operationID
+        self.metadata = metadata
+        self.operationKey = operationKey
+        self.readerAdmission = admission
+        self.admissionMetadata = CatalogLeaseAdmissionMetadata(
+            admissionID: admission.admissionID,
+            gateEpoch: admission.gateEpoch
+        )
+    }
+
+    func releaseReader() async {
+        guard let admission = readerAdmission else { return }
+        readerAdmission = nil
+        admissionMetadata = nil
+        await gate.releaseReader(operationID: operationID, admission: admission)
+    }
+
+    func acquireReader() async throws -> CatalogLeaseAdmission {
+        let admission = try await gate.acquireReader(operationID: operationID)
+        readerAdmission = admission
+        admissionMetadata = CatalogLeaseAdmissionMetadata(
+            admissionID: admission.admissionID,
+            gateEpoch: admission.gateEpoch
+        )
+        return admission
+    }
+
+    func rebind(
+        metadata: CatalogEventMetadata,
+        operationKey: CatalogOperationKey,
+        admission: CatalogLeaseAdmissionMetadata?
+    ) {
+        self.metadata = metadata
+        self.operationKey = operationKey
+        self.admissionMetadata = admission
+    }
+}
+
 enum CatalogGateLeaseState: Equatable, Sendable {
     case waitingReader
     case waitingWriter
@@ -1012,19 +1070,24 @@ private extension APIClient {
             return
         }
 
-        let terminal = await runCatalogOperationBody(
+        let execution = CatalogOperationExecution(
+            gate: gate,
+            operationID: metadata.operationID,
             metadata: admittedMetadata,
             operationKey: admittedOperationKey,
-            continuation: continuation,
-            telemetrySink: telemetrySink,
-            admission: admissionMetadata
+            admission: admission
         )
-        await gate.releaseReader(operationID: metadata.operationID, admission: admission)
+        let terminal = await runCatalogOperationBody(
+            execution: execution,
+            continuation: continuation,
+            telemetrySink: telemetrySink
+        )
+        await execution.releaseReader()
         await gate.unregisterCancellation(operationID: metadata.operationID)
         await finish(
             with: terminal,
-            metadata: admittedMetadata,
-            operationKey: admittedOperationKey
+            metadata: execution.metadata,
+            operationKey: execution.operationKey
         )
     }
 
@@ -1032,15 +1095,22 @@ private extension APIClient {
     /// Returns the terminal event; the caller finishes the stream exactly once
     /// after releasing the shared lease.
     private func runCatalogOperationBody(
-        metadata: CatalogEventMetadata,
-        operationKey: CatalogOperationKey,
+        execution: CatalogOperationExecution,
         continuation: AsyncStream<CatalogNetworkEvent>.Continuation,
-        telemetrySink: (any CatalogTelemetrySink)?,
-        admission: CatalogLeaseAdmissionMetadata
+        telemetrySink: (any CatalogTelemetrySink)?
     ) async -> CatalogNetworkEvent {
-        let gate = ProfileContextGateRegistry.shared.gate(for: operationKey.gateKey)
+        var metadata = execution.metadata
+        var operationKey = execution.operationKey
+        guard let initialAdmission = execution.admissionMetadata else {
+            return .cancelled(metadata)
+        }
+        var admission = initialAdmission
+        let gate = execution.gate
 
-        // Phase 1: strict profile verification under the shared lease.
+        // Phase 1: strict profile verification under the shared lease. A
+        // requested-profile mismatch is an identity-changing flow: release the
+        // reader, switch under APIClient's writer lease, reacquire a reader at
+        // the new epoch, and verify the returned profile list again.
         let profilesResult = await fetchCatalogData(endpoint: .profiles)
         switch profilesResult {
         case let .failure(category):
@@ -1061,31 +1131,150 @@ private extension APIClient {
                 singleProfileMode: response.singleProfileMode ?? false,
                 requestedProfile: operationKey.requestedProfile
             )
+            let context: CatalogProfileContext
             switch verification {
             case .unavailable:
                 return .failed(metadata, .context, .profileUnavailable)
             case .mismatch:
-                return .failed(metadata, .context, .profileMismatch)
+                guard let requestedProfile = operationKey.requestedProfile else {
+                    return .failed(metadata, .context, .profileMismatch)
+                }
+
+                await execution.releaseReader()
+                emitCatalogTelemetry(
+                    sink: telemetrySink,
+                    surface: .context,
+                    phase: .gateWaitStarted,
+                    operationID: metadata.operationID,
+                    admission: nil
+                )
+
+                let switchResponse: ProfileSwitchResponse
+                do {
+                    switchResponse = try await switchProfile(name: requestedProfile)
+                } catch let failure as ProfileContextSwitchFailure {
+                    return .failed(metadata, .context, catalogFailure(forProfileSwitch: failure))
+                } catch {
+                    return .failed(metadata, .context, .transport)
+                }
+
+                // switchProfile advances the gate epoch only after validating
+                // its response. Rebuild operation metadata before reacquiring;
+                // this also keeps cancellation terminals fenceable if the
+                // reacquisition is canceled.
+                let switchedMetadata = catalogProvisionalMetadata(
+                    requestedProfile: requestedProfile,
+                    operationID: metadata.operationID,
+                    operationGeneration: metadata.operationGeneration,
+                    startingGateEpoch: await gate.gateEpoch
+                )
+                guard case let .provisional(switchedOperationKey) = switchedMetadata.identity else {
+                    return .cancelled(metadata)
+                }
+                metadata = switchedMetadata
+                operationKey = switchedOperationKey
+                execution.rebind(
+                    metadata: metadata,
+                    operationKey: operationKey,
+                    admission: nil
+                )
+
+                let reacquiredAdmission: CatalogLeaseAdmission
+                do {
+                    reacquiredAdmission = try await execution.acquireReader()
+                } catch {
+                    return .cancelled(metadata)
+                }
+                admission = CatalogLeaseAdmissionMetadata(
+                    admissionID: reacquiredAdmission.admissionID,
+                    gateEpoch: reacquiredAdmission.gateEpoch
+                )
+                metadata = catalogProvisionalMetadata(
+                    requestedProfile: requestedProfile,
+                    operationID: metadata.operationID,
+                    operationGeneration: metadata.operationGeneration,
+                    startingGateEpoch: reacquiredAdmission.gateEpoch
+                )
+                guard case let .provisional(reacquiredOperationKey) = metadata.identity else {
+                    return .cancelled(metadata)
+                }
+                operationKey = reacquiredOperationKey
+                execution.rebind(
+                    metadata: metadata,
+                    operationKey: operationKey,
+                    admission: admission
+                )
+                emitCatalogTelemetry(
+                    sink: telemetrySink,
+                    surface: .context,
+                    phase: .gateAcquired,
+                    operationID: metadata.operationID,
+                    admission: admission
+                )
+
+                let rereadResult = await fetchCatalogData(endpoint: .profiles)
+                switch rereadResult {
+                case let .failure(category):
+                    if category == .cancelled || Task.isCancelled {
+                        return .cancelled(metadata)
+                    }
+                    return .failed(metadata, .context, category)
+                case let .success(rereadData):
+                    let rereadResponse: ProfilesResponse
+                    do {
+                        rereadResponse = try decode(ProfilesResponse.self, from: rereadData)
+                    } catch {
+                        return .failed(metadata, .context, .profileUnavailable)
+                    }
+                    let rereadVerification = CatalogProfileVerifier.verify(
+                        profiles: rereadResponse.profiles ?? [],
+                        explicitActive: rereadResponse.active,
+                        singleProfileMode: rereadResponse.singleProfileMode ?? false,
+                        requestedProfile: requestedProfile
+                    )
+                    switch rereadVerification {
+                    case .unavailable:
+                        return .failed(metadata, .context, .profileUnavailable)
+                    case .mismatch:
+                        return .failed(metadata, .context, .profileMismatch)
+                    case let .verified(activeProfile, singleProfileMode):
+                        let defaults = CatalogProfileDefaults(
+                            model: switchResponse.defaultModel,
+                            workspace: switchResponse.defaultWorkspace
+                        )
+                        context = CatalogProfileContext(
+                            profiles: rereadResponse.profiles ?? [],
+                            activeProfile: activeProfile,
+                            requestedProfile: requestedProfile,
+                            singleProfileMode: singleProfileMode,
+                            defaults: defaults,
+                            switchResult: .switched(defaults: defaults)
+                        )
+                    }
+                }
             case let .verified(activeProfile, singleProfileMode):
-                let context = CatalogProfileContext(
+                context = CatalogProfileContext(
                     profiles: response.profiles ?? [],
                     activeProfile: activeProfile,
                     requestedProfile: operationKey.requestedProfile,
                     singleProfileMode: singleProfileMode,
                     defaults: CatalogProfileDefaults(model: nil, workspace: nil),
-                    switchResult: .notRequested
+                    switchResult: operationKey.requestedProfile == nil
+                        ? .notRequested
+                        : .alreadyActive
                 )
-                let event = CatalogNetworkEvent.contextVerified(metadata, context)
-                guard await yieldCatalogEvent(
-                    event,
-                    operationKey: operationKey,
-                    operationID: metadata.operationID,
-                    operationGeneration: metadata.operationGeneration,
-                    gate: gate,
-                    continuation: continuation
-                ) else {
-                    return .cancelled(metadata)
-                }
+            }
+
+            let event = CatalogNetworkEvent.contextVerified(metadata, context)
+            guard await yieldCatalogEvent(
+                event,
+                operationKey: operationKey,
+                operationID: metadata.operationID,
+                operationGeneration: metadata.operationGeneration,
+                gate: gate,
+                continuation: continuation
+            ) else {
+                return .cancelled(metadata)
             }
         }
 
@@ -1441,6 +1630,21 @@ private extension APIClient {
             return .transport
         case .invalidServerURL:
             return .transport
+        }
+    }
+
+    func catalogFailure(forProfileSwitch failure: ProfileContextSwitchFailure) -> CatalogFailureCategory {
+        switch failure {
+        case .rejected:
+            return .profileSwitchRejected
+        case .transport:
+            return .transport
+        case .unauthorized:
+            return .unauthorized
+        case .decoding:
+            return .decoding
+        case .cancelled:
+            return .cancelled
         }
     }
 

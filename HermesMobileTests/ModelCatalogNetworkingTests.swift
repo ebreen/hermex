@@ -803,10 +803,12 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
     }
 
-    func testActiveProfileMismatchDoesNotAdvanceEpochOrIssueModelsGET() async throws {
+    func testActiveProfileMismatchSwitchesAndReverifiesBeforeModelsGET() async throws {
         let fixture = IsolatedCatalogURLProtocolFixture()
-        fixture.installProfilesOnly(
-            #"{"profiles":[{"name":"work","isActive":true}],"active":"work","single_profile_mode":false}"#
+        fixture.installCatalogWithProfileSwitch(
+            initialProfilesJSON: #"{"profiles":[{"name":"work","isActive":true},{"name":"default"}],"active":"work","single_profile_mode":false}"#,
+            switchedProfilesJSON: #"{"profiles":[{"name":"default","isActive":true}],"active":"default","single_profile_mode":false}"#,
+            switchJSON: #"{"profiles":[{"name":"default","isActive":true}],"active":"default","default_model":"default-model","default_workspace":"default-space"}"#
         )
         let client = fixture.makeClient()
         let gate = gateFor(fixture: fixture, client: client)
@@ -817,18 +819,79 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1
         )
         let events = await Self.collectEvents(from: stream)
-        guard case let .failed(_, phase, category)? = events.last else {
-            XCTFail("a requested-profile mismatch must produce a failed terminal")
+        guard case let .contextVerified(_, context)? = events.first(where: { event in
+            if case .contextVerified = event { return true }
+            return false
+        }) else {
+            XCTFail("a requested-profile mismatch must switch and publish an authoritative context")
             return
         }
-        XCTAssertEqual(phase, .context)
-        XCTAssertEqual(category, .profileMismatch)
-        let epoch = await gate.gateEpoch
-        XCTAssertEqual(epoch, 0, "a mismatched profile must not advance the epoch")
+        XCTAssertEqual(context.activeProfile, "default")
+        XCTAssertEqual(context.requestedProfile, "default")
+        XCTAssertEqual(
+            context.switchResult,
+            .switched(defaults: CatalogProfileDefaults(model: "default-model", workspace: "default-space"))
+        )
+        XCTAssertEqual(await gate.gateEpoch, 1)
         let paths = fixture.requests().compactMap { $0.url?.path }
-        XCTAssertFalse(paths.contains("/api/models"))
-        XCTAssertFalse(paths.contains("/api/models/live"))
-        XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
+        XCTAssertEqual(
+            paths,
+            ["/api/profiles", "/api/profile/switch", "/api/profiles", "/api/models", "/api/models/live"]
+        )
+        XCTAssertEqual(terminalCount(of: events), 1)
+    }
+
+    func testRequestedProfileSwitchReverifiesBeforePublishingCatalog() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installCatalogWithProfileSwitch(
+            initialProfilesJSON: #"{"profiles":[{"name":"default","isActive":true},{"name":"work"}],"active":"default","single_profile_mode":false}"#,
+            switchedProfilesJSON: #"{"profiles":[{"name":"work","isActive":true}],"active":"work","single_profile_mode":false}"#,
+            switchJSON: #"{"profiles":[{"name":"work","isActive":true}],"active":"work","default_model":"work-model","default_workspace":"work-space"}"#
+        )
+        let client = fixture.makeClient()
+        let gate = gateFor(fixture: fixture, client: client)
+
+        let stream = await client.modelCatalogStream(
+            requestedProfile: "work",
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        let events = await Self.collectEvents(from: stream)
+
+        guard case let .contextVerified(_, context)? = events.first(where: { event in
+            if case .contextVerified = event { return true }
+            return false
+        }) else {
+            XCTFail("requested-profile flow must publish an authoritative context")
+            return
+        }
+        XCTAssertEqual(context.activeProfile, "work")
+        XCTAssertEqual(context.requestedProfile, "work")
+        XCTAssertEqual(
+            context.switchResult,
+            .switched(defaults: CatalogProfileDefaults(model: "work-model", workspace: "work-space"))
+        )
+        XCTAssertEqual(await gate.gateEpoch, 1)
+
+        let requests = fixture.requests()
+        let paths = requests.compactMap { $0.url?.path }
+        XCTAssertEqual(
+            paths.filter { $0 == "/api/profiles" }.count,
+            2,
+            "the switch flow reads profiles before and after the POST"
+        )
+        guard let switchRequest = requests.first(where: { $0.url?.path == "/api/profile/switch" }) else {
+            XCTFail("requested-profile flow must issue the switch POST")
+            return
+        }
+        XCTAssertEqual(switchRequest.httpMethod, "POST")
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: try XCTUnwrap(switchRequest.httpBody)) as? [String: String],
+            ["name": "work"]
+        )
+        XCTAssertTrue(paths.contains("/api/models"))
+        XCTAssertTrue(paths.contains("/api/models/live"))
+        XCTAssertEqual(terminalCount(of: events), 1)
     }
 
     func testAmbiguousProfilesResponseIssuesZeroModelsGETs() async throws {
@@ -2146,10 +2209,32 @@ private final class IsolatedCatalogURLProtocolFixture: @unchecked Sendable {
         }
     }
 
+    func installCatalogWithProfileSwitch(
+        initialProfilesJSON: String,
+        switchedProfilesJSON: String,
+        switchJSON: String
+    ) {
+        install { [recorder] request in
+            switch request.url?.path {
+            case "/api/profiles":
+                let profileReads = recorder.snapshot().filter { $0.url?.path == "/api/profiles" }.count
+                let json = profileReads == 1 ? initialProfilesJSON : switchedProfilesJSON
+                return try Self.jsonResponse(json, for: request)
+            case "/api/models":
+                return try Self.jsonResponse(Self.modelsDefaultJSON, for: request)
+            case "/api/models/live":
+                return try Self.jsonResponse(Self.liveDefaultJSON, for: request)
+            case "/api/profile/switch":
+                return try Self.jsonResponse(switchJSON, for: request)
+            default:
+                throw URLError(.resourceUnavailable)
+            }
+        }
+    }
+
     func installCatalogWithSwitch(switchJSON: String) {
         installCatalog(profilesJSON: Self.profilesDefaultJSON, switchJSON: switchJSON)
     }
-
     static func jsonResponse(
         _ json: String,
         for request: URLRequest,
