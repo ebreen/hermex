@@ -72,10 +72,18 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         call.continuation.yield(.base(makeBaseSnapshot(metadata: metadata, groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])], defaultModel: "gpt-5", activeProvider: "openai")))
 
         // The live child is still pending: the base must already be visible and
-        // loading must be cleared.
+        // loading must be cleared. Wait for the readiness publication after the
+        // base event so the actor has completed the state transition before the
+        // assertion reads its state.
         await subscriber.collector.waitUntil { events in
             events.contains { event in
                 if case .base = event { return true }
+                return false
+            }
+        }
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .state(state) = event, state == .freshReady { return true }
                 return false
             }
         }
