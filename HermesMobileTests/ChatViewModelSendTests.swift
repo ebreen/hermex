@@ -5521,6 +5521,15 @@ final class ChatViewModelSendTests: XCTestCase {
                   ]
                 }
                 """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [
+                    {"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}
+                  ]
+                }
+                """, for: request)
             case "/api/reasoning":
                 return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
             case "/api/workspaces":
@@ -5553,6 +5562,7 @@ final class ChatViewModelSendTests: XCTestCase {
             "/api/profiles",
             "/api/profile/switch",
             "/api/models",
+            "/api/models/live",
             "/api/reasoning",
             "/api/workspaces",
             "/api/commands",
@@ -5599,6 +5609,15 @@ final class ChatViewModelSendTests: XCTestCase {
                         {"id": "\(sessionModel)", "name": "GPT 5.5"}
                       ]
                     }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [
+                    {"id": "\(openRouterDefault)", "name": "DeepSeek Chat v3 Free"}
                   ]
                 }
                 """, for: request)
@@ -5697,6 +5716,15 @@ final class ChatViewModelSendTests: XCTestCase {
                         {"id": "gpt-5.4", "name": "GPT 5.4"}
                       ]
                     }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openai",
+                  "models": [
+                    {"id": "gpt-5.4", "name": "GPT 5.4"}
                   ]
                 }
                 """, for: request)
