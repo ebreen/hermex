@@ -663,7 +663,15 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
         clock.advance(by: 100)
         await harness.coordinator.openPicker()
-        _ = await subscriber.task.value
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.metadata.operationID != originalCall.operationID
+                }
+                return false
+            }
+        }
+        await cancel(subscriber)
 
         let events = subscriber.collector.snapshot()
         let replayContextIndex = try XCTUnwrap(events.firstIndex { event in
