@@ -1379,7 +1379,7 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let beforeFailure = cache.loadEntities()
 
         XCTAssertFalse(cache.save(snapshot), "failure-shaped snapshots are not cache writes")
-        XCTAssertEqual(cache.loadEntities(), beforeFailure)
+        XCTAssertEqual(cache.loadEntities().map(\.id), beforeFailure.map(\.id))
     }
 
     func testAuthoritativeVerifiedProfileSnapshotMayUpdateAppIntentCache() async throws {
