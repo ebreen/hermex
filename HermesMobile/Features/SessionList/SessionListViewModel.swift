@@ -276,12 +276,20 @@ final class SessionListViewModel {
                 operationID: operationID,
                 operationGeneration: operationGeneration
             )
-            guard !Task.isCancelled,
-                  await client.acceptsCatalogSnapshot(
-                      snapshot,
-                      operationID: operationID,
-                      operationGeneration: operationGeneration
-                  ) else { return }
+            guard !Task.isCancelled else { return }
+            guard snapshot.isAuthoritative else {
+                // Failure-shaped profile snapshots are deliberately not
+                // accepted into profile state, but the UI still needs a
+                // visible failure indication so a failed refresh is not
+                // indistinguishable from an empty profile list.
+                activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
+                return
+            }
+            guard await client.acceptsCatalogSnapshot(
+                snapshot,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            ) else { return }
             guard !snapshot.activeProfile.isEmpty else {
                 activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
                 return
