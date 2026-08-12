@@ -173,12 +173,16 @@ struct ChatComposerConfigLoader {
                     ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
             }
             // A live failure is non-terminal when a usable base was accepted.
-            // Preserve the cache-first/base-success behavior of the coordinator.
+            // Preserve the base projection, but expose the scoped failure so
+            // the caller can report degraded live data without discarding rows.
+            if let failure = catalogResult.failure {
+                configurationError = Self.error(for: failure)
+            }
         } else {
             configurationError = Self.error(for: catalogResult.failure ?? .transport)
         }
 
-        if configurationError == nil {
+        if catalogResult.base != nil {
             do {
                 let reasoningResponse = try await client.reasoning(
                     model: Self.nonEmpty(state.currentModel),
@@ -188,7 +192,7 @@ struct ChatComposerConfigLoader {
                 state.supportedReasoningEfforts = reasoningResponse.normalizedSupportedEfforts
                 state.supportsReasoningEffort = reasoningResponse.supportsReasoningEffort
             } catch {
-                configurationError = error
+                if configurationError == nil { configurationError = error }
             }
 
             do {
@@ -246,6 +250,17 @@ struct ChatComposerConfigLoader {
             return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileSwitchRejected.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileSwitchRejected.localizedDescription])
         default:
             return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.catalogUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription])
+        }
+    }
+
+    private static func failure(for failure: CatalogFailureCategory) -> ChatComposerConfigFailure {
+        switch failure {
+        case .profileUnavailable, .profileMismatch, .unknownContext:
+            return .profileUnavailable
+        case .profileSwitchRejected:
+            return .profileSwitchRejected
+        default:
+            return .catalogUnavailable
         }
     }
 
@@ -340,6 +355,7 @@ struct ChatComposerConfigLoader {
         var acceptedCatalogMetadata: CatalogEventMetadata?
         var sawContextVerified = false
         var sawBase = false
+        var sawLiveOutcome = false
         for await event in catalogEvents {
             guard let metadata = Self.catalogEventMetadata(for: event),
                   await acceptsCatalogEvent(metadata)
@@ -381,10 +397,17 @@ struct ChatComposerConfigLoader {
                         ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
                 }
                 publishedSnapshot = snapshot
-            case .live, .liveFailed, .failed, .finished, .cancelled, .contextReset, .state:
+            case .live:
+                sawLiveOutcome = true
+            case let .liveFailed(_, failure):
+                sawLiveOutcome = true
+                if configurationFailure == nil {
+                    configurationFailure = Self.failure(for: failure)
+                }
+            case .failed, .finished, .cancelled, .contextReset, .state:
                 break
             }
-            if sawContextVerified, sawBase {
+            if sawContextVerified, sawBase, sawLiveOutcome {
                 break
             }
         }

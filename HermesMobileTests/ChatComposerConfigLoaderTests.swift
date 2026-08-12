@@ -79,6 +79,36 @@ final class ChatComposerConfigLoaderTests: APIClientTestCase {
         ])
     }
 
+    func testDirectLoadKeepsBaseAndReportsLiveFailure() async throws {
+        let model = "gpt-5"
+        let client = makeClient { request in
+            switch request.url?.path {
+            case "/api/profiles":
+                return apiTestJSONResponse(#"{"active":"default","profiles":[{"name":"default","model":"gpt-5","provider":"openai","is_active":true}]}"#, for: request)
+            case "/api/models":
+                return apiTestJSONResponse(#"{"default_model":"gpt-5","groups":[{"name":"OpenAI","provider_id":"openai","models":[{"id":"gpt-5","name":"GPT-5"}]}]}"#, for: request)
+            case "/api/models/live":
+                throw URLError(.timedOut)
+            case "/api/reasoning":
+                return apiTestJSONResponse(#"{"reasoning_effort":"medium"}"#, for: request)
+            case "/api/workspaces":
+                return apiTestJSONResponse(#"{"workspaces":[],"last":null}"#, for: request)
+            case "/api/commands":
+                return apiTestJSONResponse(#"{"commands":[]}"#, for: request)
+            default:
+                XCTFail("Unexpected request path: \(request.url?.path ?? "nil")")
+                throw URLError(.badURL)
+            }
+        }
+
+        let result = await ChatComposerConfigLoader(client: client).loadConfiguration(
+            from: ChatComposerConfigState(currentProfile: "default")
+        )
+
+        XCTAssertEqual(result.state.modelCatalogGroups.flatMap(\.models).map(\.id), [model])
+        XCTAssertEqual(result.configurationFailure, .catalogUnavailable)
+        XCTAssertTrue(result.catalogValuesAuthorized)
+    }
     func testLoadKeepsSessionModelOverrideWhenProfileHasDifferentDefault() async throws {
         let sessionModel = "@openai:gpt-5.5"
         let profileDefault = "deepseek/deepseek-chat-v3-0324:free"
