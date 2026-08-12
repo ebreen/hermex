@@ -305,7 +305,6 @@ actor ChatModelCatalogCoordinator {
                     return
                 }
                 currentOperation?.isTerminal = true
-                multicast.finish()
                 return
             }
             // Stale (or at capacity): publish stale rows immediately, then

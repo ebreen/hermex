@@ -375,6 +375,18 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             }.count >= 2
         }
 
+        let replaySubscriber = await makeSubscriber(harness.coordinator)
+        await harness.coordinator.openPicker()
+        let replayDelivered = await replaySubscriber.collector.waitForResult { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.groups.flatMap(\.models).map(\.id) == ["gpt-5"]
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(replayDelivered, "a fresh cache replay must not permanently close the coordinator multicast")
+
         // Deterministic no-refresh barrier: an explicit retry must be the SECOND
         // provider call. A phantom refresh from the fresh open would make it the
         // third.
@@ -394,6 +406,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
         // Drain the barrier retry operation so no coordinator task stays parked.
         harness.provider.call(1).continuation.finish()
+        await cancel(replaySubscriber)
         await cancel(subscriber)
     }
 
@@ -1519,7 +1532,12 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
     ) async -> (collector: CatalogEventCollector, task: Task<Void, Never>) {
         let stream = await coordinator.subscribe()
         let collector = CatalogEventCollector()
-        let task = Task { for await event in stream { collector.append(event) } }
+        let task = Task {
+            for await event in stream {
+                collector.append(event)
+            }
+            collector.markTerminated()
+        }
         return (collector, task)
     }
 
@@ -1890,19 +1908,33 @@ private final class CatalogEventCollector: @unchecked Sendable {
         let continuation: CheckedContinuation<Void, Never>
     }
 
+    private struct ResultWaiter {
+        let id: UUID
+        let predicate: ([CatalogEvent]) -> Bool
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private let lock = NSLock()
     private var events: [CatalogEvent] = []
     private var waiters: [Waiter] = []
+    private var resultWaiters: [ResultWaiter] = []
+    private var terminated = false
 
     func append(_ event: CatalogEvent) {
         lock.lock()
         events.append(event)
-        let resolved = waiters.filter { $0.predicate(events) }
-        let resolvedIDs = Set(resolved.map { $0.id })
-        waiters.removeAll { resolvedIDs.contains($0.id) }
+        let eventWaiters = waiters.filter { $0.predicate(events) }
+        let eventWaiterIDs = Set(eventWaiters.map { $0.id })
+        waiters.removeAll { eventWaiterIDs.contains($0.id) }
+        let resultWaiters = self.resultWaiters.filter { $0.predicate(events) }
+        let resultWaiterIDs = Set(resultWaiters.map { $0.id })
+        self.resultWaiters.removeAll { resultWaiterIDs.contains($0.id) }
         lock.unlock()
-        for waiter in resolved {
+        for waiter in eventWaiters {
             waiter.continuation.resume()
+        }
+        for waiter in resultWaiters {
+            waiter.continuation.resume(returning: true)
         }
     }
 
@@ -1916,6 +1948,35 @@ private final class CatalogEventCollector: @unchecked Sendable {
             }
             waiters.append(Waiter(id: UUID(), predicate: predicate, continuation: continuation))
             lock.unlock()
+        }
+    }
+
+    func waitForResult(_ predicate: @escaping ([CatalogEvent]) -> Bool) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            lock.lock()
+            if predicate(events) {
+                lock.unlock()
+                continuation.resume(returning: true)
+                return
+            }
+            if terminated {
+                lock.unlock()
+                continuation.resume(returning: false)
+                return
+            }
+            resultWaiters.append(ResultWaiter(id: UUID(), predicate: predicate, continuation: continuation))
+            lock.unlock()
+        }
+    }
+
+    func markTerminated() {
+        lock.lock()
+        terminated = true
+        let waiters = resultWaiters
+        resultWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.continuation.resume(returning: false)
         }
     }
 
