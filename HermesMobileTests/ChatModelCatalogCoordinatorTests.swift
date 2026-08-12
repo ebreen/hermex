@@ -619,6 +619,61 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
     // MARK: - Provisional-key coalescing
 
+    func testFreshCacheReplayPublishesVerifiedContextBeforeBaseAndTerminatesStream() async throws {
+        let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let harness = makeHarness(clock: { clock.now() })
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let originalCall = harness.provider.call(0)
+        completeOperation(
+            call: originalCall,
+            harness: harness,
+            activeProfile: "default",
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])]
+        )
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .finished = event { return true }
+                return false
+            }
+        }
+
+        clock.advance(by: 100)
+        await harness.coordinator.openPicker()
+        _ = await subscriber.task.value
+
+        let events = subscriber.collector.snapshot()
+        let replayContextIndex = try XCTUnwrap(events.firstIndex { event in
+            if case let .contextVerified(metadata, _) = event {
+                return metadata.operationID != originalCall.operationID
+            }
+            return false
+        })
+        let replayBaseIndex = try XCTUnwrap(events.firstIndex { event in
+            if case let .base(snapshot) = event {
+                return snapshot.metadata.operationID != originalCall.operationID
+            }
+            return false
+        })
+        XCTAssertLessThan(replayContextIndex, replayBaseIndex, "fresh replay verifies cached context before publishing base")
+
+        guard case let .contextVerified(replayMetadata, replayContext) = events[replayContextIndex] else {
+            return XCTFail("expected the fresh replay contextVerified event")
+        }
+        guard case let .base(replayBase) = events[replayBaseIndex] else {
+            return XCTFail("expected the fresh replay base event")
+        }
+        XCTAssertEqual(replayContext, makeProfileContext(activeProfile: "default"))
+        XCTAssertEqual(replayMetadata.operationID, replayBase.metadata.operationID)
+        XCTAssertNotEqual(replayMetadata.operationID, originalCall.operationID)
+        XCTAssertEqual(harness.provider.callCount(), 1, "a fresh cache replay must not start network work")
+        let stateSnapshot = await harness.coordinator.currentStateSnapshot()
+        XCTAssertEqual(stateSnapshot?.metadata.operationID, replayMetadata.operationID)
+        XCTAssertEqual(stateSnapshot?.state, .freshReady)
+    }
+
     func testInitialLoadAndPickerRefreshShareOneOperation() async throws {
         let harness = makeHarness()
         let subscriber = await makeSubscriber(harness.coordinator)

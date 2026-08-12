@@ -252,12 +252,23 @@ actor ChatModelCatalogCoordinator {
                cache.count < configuration.completedContextLimit,
                visible.gateEpoch == authoritativeEpoch {
                 // A fresh replay is a new fenced operation even though it does
-                // not perform network work. Cache entries contain projections
-                // only; never replay an old operation UUID/generation.
+                // does not perform network work. Cache entries contain the
+                // verified context and projections, but never delivery
+                // metadata such as an old operation UUID/generation.
                 let replayMetadata = startCacheReplayOperation(
                     contextKey: visible,
-                    startingGateEpoch: authoritativeEpoch
+                    startingGateEpoch: authoritativeEpoch,
+                    profileContext: entry.profileContext
                 )
+                guard await publish(
+                    .contextVerified(replayMetadata, entry.profileContext),
+                    metadata: replayMetadata,
+                    contextKey: visible,
+                    cacheRevision: revisionAtRead
+                ) else {
+                    currentOperation?.isTerminal = true
+                    return
+                }
                 guard await publish(
                     .base(
                         CatalogBaseSnapshot(
@@ -284,6 +295,7 @@ actor ChatModelCatalogCoordinator {
                     return
                 }
                 currentOperation?.isTerminal = true
+                multicast.finish()
                 return
             }
             // Stale (or at capacity): publish stale rows immediately, then
@@ -478,9 +490,12 @@ actor ChatModelCatalogCoordinator {
                   !Task.isCancelled
             else { return }
 
-            // Cache only the projection. Delivery metadata is always rebound
-            // from the current operation when the projection is replayed.
+            // Cache the verified context alongside the projection. Delivery
+            // metadata is always rebound from the current operation when the
+            // projection is replayed.
+            guard let profileContext = current.profileContext else { return }
             cache[contextKey] = CachedContext(
+                profileContext: profileContext,
                 groups: snapshot.groups,
                 defaultModel: snapshot.defaultModel,
                 activeProvider: snapshot.activeProvider,
@@ -707,7 +722,8 @@ actor ChatModelCatalogCoordinator {
     /// operation while avoiding a second request.
     private func startCacheReplayOperation(
         contextKey: CatalogContextKey,
-        startingGateEpoch: UInt64
+        startingGateEpoch: UInt64,
+        profileContext: CatalogProfileContext
     ) -> CatalogEventMetadata {
         let operationID = UUID()
         let operationGeneration = nextOperationGeneration
@@ -729,7 +745,7 @@ actor ChatModelCatalogCoordinator {
             operationGeneration: operationGeneration,
             operationKey: operationKey,
             verifiedContextKey: contextKey,
-            profileContext: nil,
+            profileContext: profileContext,
             pendingLive: nil
         )
         return metadata
@@ -975,6 +991,7 @@ private struct CurrentOperation: Sendable {
 /// Completed context entry: the projection WITHOUT event metadata. Delivery
 /// metadata is created afresh for every current operation.
 private struct CachedContext: Sendable {
+    let profileContext: CatalogProfileContext
     let groups: [ModelCatalogGroup]
     let defaultModel: String?
     let activeProvider: String?
