@@ -771,7 +771,7 @@ final class ChatViewModel {
         let operationID = UUID()
         let operationGeneration: UInt64 = 1
         let stream = await client.modelCatalogStream(
-            requestedProfile: nil,
+            requestedProfile: Self.nonEmpty(currentProfile),
             operationID: operationID,
             operationGeneration: operationGeneration
         )

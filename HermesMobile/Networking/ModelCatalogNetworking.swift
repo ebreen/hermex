@@ -410,7 +410,9 @@ final class CatalogGateTicket: @unchecked Sendable {
 actor ProfileContextGate {
     private var epoch: UInt64 = 0
     private var heldReaderIDs: [UUID] = []
+    private var heldReaderAdmissions: [UUID: CatalogLeaseAdmission] = [:]
     private var heldWriterID: UUID?
+    private var heldWriterAdmission: CatalogLeaseAdmission?
     private var heldWriterTicket: CatalogGateTicket?
     private var queue: [CatalogGateTicket] = []
     private var cancellations: [UUID: @Sendable () -> Void] = [:]
@@ -427,16 +429,19 @@ actor ProfileContextGate {
     }
 
     func releaseReader(operationID: UUID, admission: CatalogLeaseAdmission) {
+        guard heldReaderAdmissions[operationID] == admission else { return }
+        heldReaderAdmissions.removeValue(forKey: operationID)
         heldReaderIDs.removeAll { $0 == operationID }
         notifyChange()
         serveIfPossible()
     }
 
     func releaseWriter(operationID: UUID, admission: CatalogLeaseAdmission) {
-        if heldWriterID == operationID {
-            heldWriterID = nil
-            heldWriterTicket = nil
-        }
+        guard heldWriterID == operationID,
+              heldWriterAdmission == admission else { return }
+        heldWriterID = nil
+        heldWriterAdmission = nil
+        heldWriterTicket = nil
         notifyChange()
         serveIfPossible()
     }
@@ -483,7 +488,7 @@ actor ProfileContextGate {
     func leaseState(of operationID: UUID) -> CatalogGateLeaseState? {
         purgeCancelledTickets()
         if heldWriterID == operationID { return .heldWriter }
-        if heldReaderIDs.contains(operationID) { return .heldReader }
+        if heldReaderAdmissions[operationID] != nil { return .heldReader }
         if let ticket = queue.first(where: { $0.operationID == operationID }) {
             return ticket.isWriter ? .waitingWriter : .waitingReader
         }
@@ -576,15 +581,17 @@ actor ProfileContextGate {
             guard let head = queue.first else { return }
             guard heldWriterID == nil else { return }
             if head.isWriter {
-                guard heldReaderIDs.isEmpty else { return }
+                guard heldReaderAdmissions.isEmpty else { return }
             }
             queue.removeFirst()
             let admission = CatalogLeaseAdmission(admissionID: UUID(), gateEpoch: epoch)
             if head.serve(admission) {
                 if head.isWriter {
                     heldWriterID = head.operationID
+                    heldWriterAdmission = admission
                     heldWriterTicket = head
                 } else {
+                    heldReaderAdmissions[head.operationID] = admission
                     heldReaderIDs.append(head.operationID)
                 }
                 notifyChange()

@@ -615,6 +615,9 @@ extension APIClient {
                 method: "POST",
                 body: ProfileSwitchRequest(name: normalizedName)
             )
+            guard response.error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
+                throw ProfileContextSwitchFailure.rejected
+            }
             let verification = CatalogProfileVerifier.verify(
                 profiles: response.profiles ?? [],
                 explicitActive: response.active,

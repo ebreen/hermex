@@ -462,6 +462,40 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertTrue(children.allSatisfy { $0.admission?.admissionID == admissionIDs.first })
     }
 
+    func testStaleWriterReleaseCannotReleaseReplacementAdmission() async throws {
+        let gate = makeIsolatedGate()
+        let operationID = UUID()
+
+        let first = try await gate.acquireWriter(operationID: operationID)
+        await gate.releaseWriter(operationID: operationID, admission: first)
+        let replacement = try await gate.acquireWriter(operationID: operationID)
+
+        await gate.releaseWriter(operationID: operationID, admission: first)
+        let stateAfterStaleRelease = await gate.snapshot()
+        XCTAssertEqual(stateAfterStaleRelease.heldWriter, operationID)
+
+        await gate.releaseWriter(operationID: operationID, admission: replacement)
+        let finalState = await gate.snapshot()
+        XCTAssertNil(finalState.heldWriter)
+        XCTAssertTrue(finalState.heldReaders.isEmpty)
+    }
+
+    func testSwitchProfileRejectsNonEmptyResponseErrorWithoutAdvancingEpoch() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installSwitchOnly(#"{"active":"work","error":"profile activation failed","profiles":[{"name":"default","is_active":false},{"name":"work","is_active":true}]}"#)
+        let client = fixture.makeClient()
+        let gate = gateFor(fixture: fixture, client: client)
+
+        do {
+            _ = try await client.switchProfile(name: "work")
+            XCTFail("a non-empty switch response error must reject the switch")
+        } catch {
+            XCTAssertNotNil(error)
+        }
+        let epoch = await gate.gateEpoch
+        XCTAssertEqual(epoch, 0)
+    }
+
     func testWriterWaitsForHeldReaderLiveChild() async throws {
         let gate = makeIsolatedGate()
         let readerOperation = UUID()
