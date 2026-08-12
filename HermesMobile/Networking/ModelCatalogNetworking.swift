@@ -1001,7 +1001,7 @@ private extension APIClient {
             operationGeneration: metadata.operationGeneration,
             startingGateEpoch: admission.gateEpoch
         )
-        guard case let .provisional(admittedOperationKey) = admittedMetadata else {
+        guard case let .provisional(admittedOperationKey) = admittedMetadata.identity else {
             await gate.releaseReader(operationID: metadata.operationID, admission: admission)
             await gate.unregisterCancellation(operationID: metadata.operationID)
             await finish(
