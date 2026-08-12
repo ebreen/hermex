@@ -5565,6 +5565,7 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(requestPaths, [
             "/api/profiles",
             "/api/profile/switch",
+            "/api/profiles",
             "/api/models",
             "/api/models/live",
             "/api/reasoning",
