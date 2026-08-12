@@ -72,10 +72,18 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         call.continuation.yield(.base(makeBaseSnapshot(metadata: metadata, groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])], defaultModel: "gpt-5", activeProvider: "openai")))
 
         // The live child is still pending: the base must already be visible and
-        // loading must be cleared.
+        // loading must be cleared. Wait for the readiness publication after the
+        // base event so the actor has completed the state transition before the
+        // assertion reads its state.
         await subscriber.collector.waitUntil { events in
             events.contains { event in
                 if case .base = event { return true }
+                return false
+            }
+        }
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .state(state) = event, state == .freshReady { return true }
                 return false
             }
         }
@@ -367,6 +375,18 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             }.count >= 2
         }
 
+        let replaySubscriber = await makeSubscriber(harness.coordinator)
+        await harness.coordinator.openPicker()
+        let replayDelivered = await replaySubscriber.collector.waitForResult { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.groups.flatMap(\.models).map(\.id) == ["gpt-5"]
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(replayDelivered, "a fresh cache replay must not permanently close the coordinator multicast")
+
         // Deterministic no-refresh barrier: an explicit retry must be the SECOND
         // provider call. A phantom refresh from the fresh open would make it the
         // third.
@@ -386,6 +406,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
 
         // Drain the barrier retry operation so no coordinator task stays parked.
         harness.provider.call(1).continuation.finish()
+        await cancel(replaySubscriber)
         await cancel(subscriber)
     }
 
@@ -568,7 +589,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
-    func testFreshCacheHitPublishesWithLastKnownMetadata() async throws {
+    func testFreshCacheHitPublishesWithFreshOperationMetadata() async throws {
         let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
         let harness = makeHarness(clock: { clock.now() })
         let subscriber = await makeSubscriber(harness.coordinator)
@@ -598,19 +619,168 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             }.count >= 2
         }
 
-        // The cache stores projections without event metadata; a cache-hit
-        // publication carries the last-known operation metadata for the context.
+        // The cache stores projections without event metadata; a fresh replay
+        // creates new operation metadata for the current publication.
         let cachedBase = try XCTUnwrap(lastBase(in: subscriber.collector.snapshot()))
         XCTAssertEqual(cachedBase.groups.map(\.id), ["openai"])
-        XCTAssertEqual(
+        XCTAssertNotEqual(
             cachedBase.metadata.operationID,
             originalCall.operationID,
-            "a fresh cache hit rebinds the last-known operation metadata"
+            "a fresh cache hit must not replay the old operation metadata"
         )
+        let stateSnapshot = await harness.coordinator.currentStateSnapshot()
+        XCTAssertNotNil(stateSnapshot)
+        if let stateSnapshot {
+            XCTAssertEqual(stateSnapshot.metadata.operationID, cachedBase.metadata.operationID)
+            XCTAssertEqual(stateSnapshot.state, .freshReady)
+            XCTAssertNotEqual(stateSnapshot.metadata.operationGeneration, originalCall.operationGeneration)
+        }
         await cancel(subscriber)
     }
 
     // MARK: - Provisional-key coalescing
+
+    func testFreshCacheReplayPublishesVerifiedContextBeforeBaseAndTerminatesStream() async throws {
+        let clock = ScriptedClock(Date(timeIntervalSince1970: 1_700_000_000))
+        let harness = makeHarness(clock: { clock.now() })
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let originalCall = harness.provider.call(0)
+        completeOperation(
+            call: originalCall,
+            harness: harness,
+            activeProfile: "default",
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])]
+        )
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .finished = event { return true }
+                return false
+            }
+        }
+
+        clock.advance(by: 100)
+        await harness.coordinator.openPicker()
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.metadata.operationID != originalCall.operationID
+                }
+                return false
+            }
+        }
+        await cancel(subscriber)
+
+        let events = subscriber.collector.snapshot()
+        let replayContextIndex = try XCTUnwrap(events.firstIndex { event in
+            if case let .contextVerified(metadata, _) = event {
+                return metadata.operationID != originalCall.operationID
+            }
+            return false
+        })
+        let replayBaseIndex = try XCTUnwrap(events.firstIndex { event in
+            if case let .base(snapshot) = event {
+                return snapshot.metadata.operationID != originalCall.operationID
+            }
+            return false
+        })
+        XCTAssertLessThan(replayContextIndex, replayBaseIndex, "fresh replay verifies cached context before publishing base")
+
+        guard case let .contextVerified(replayMetadata, replayContext) = events[replayContextIndex] else {
+            return XCTFail("expected the fresh replay contextVerified event")
+        }
+        guard case let .base(replayBase) = events[replayBaseIndex] else {
+            return XCTFail("expected the fresh replay base event")
+        }
+        XCTAssertEqual(replayContext, makeProfileContext(activeProfile: "default"))
+        XCTAssertEqual(replayMetadata.operationID, replayBase.metadata.operationID)
+        XCTAssertNotEqual(replayMetadata.operationID, originalCall.operationID)
+        XCTAssertEqual(harness.provider.callCount(), 1, "a fresh cache replay must not start network work")
+        let stateSnapshot = await harness.coordinator.currentStateSnapshot()
+        XCTAssertEqual(stateSnapshot?.metadata.operationID, replayMetadata.operationID)
+        XCTAssertEqual(stateSnapshot?.state, .freshReady)
+    }
+
+    func testRequestedProfileIsForwardedToEveryCoordinatorOperation() async throws {
+        let harness = makeHarness(requestedProfile: "work")
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        XCTAssertEqual(harness.provider.call(0).requestedProfile, "work")
+
+        completeOperation(
+            call: harness.provider.call(0),
+            harness: harness,
+            activeProfile: "work",
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])]
+        )
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .finished = event { return true }
+                return false
+            }
+        }
+
+        await harness.coordinator.retry()
+        await harness.provider.waitForCallCount(2)
+        XCTAssertEqual(harness.provider.call(1).requestedProfile, "work")
+        await cancel(subscriber)
+    }
+
+    func testRequestedProfileRebindsCoordinatorAfterGateEpochAdvances() async throws {
+        let harness = makeHarness(requestedProfile: "work")
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let call = harness.provider.call(0)
+
+        try await advanceGateEpoch(gateKey: harness.gateKey)
+        let switchedMetadata = provisionalMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            requestedProfile: "work",
+            startingGateEpoch: 1,
+            operationID: call.operationID,
+            operationGeneration: call.operationGeneration
+        )
+        call.continuation.yield(
+            .contextVerified(switchedMetadata, makeProfileContext(activeProfile: "work"))
+        )
+        call.continuation.yield(
+            .base(
+                makeBaseSnapshot(
+                    metadata: switchedMetadata,
+                    groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])],
+                    defaultModel: "gpt-5",
+                    activeProvider: "openai"
+                )
+            )
+        )
+        call.continuation.yield(.finished(switchedMetadata))
+        call.continuation.finish()
+
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.metadata == switchedMetadata
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(
+            subscriber.collector.snapshot().contains { event in
+                if case .finished = event { return true }
+                return false
+            },
+            "the post-switch operation must reach its terminal event"
+        )
+        await cancel(subscriber)
+    }
+
 
     func testInitialLoadAndPickerRefreshShareOneOperation() async throws {
         let harness = makeHarness()
@@ -968,6 +1138,99 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
+    func testOldLiveCompletionCannotPublishAfterSwitchEpoch() async throws {
+        let harness = makeHarness()
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        // Operation A is verified and its base is visible under epoch 0.
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let callA = harness.provider.call(0)
+        let metadataA = verifiedMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            activeProfile: "default",
+            gateEpoch: Self.epochZero,
+            operationID: callA.operationID,
+            operationGeneration: callA.operationGeneration
+        )
+        callA.continuation.yield(.contextVerified(metadataA, makeProfileContext(activeProfile: "default")))
+        callA.continuation.yield(.base(makeBaseSnapshot(
+            metadata: metadataA,
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])],
+            defaultModel: "gpt-5",
+            activeProvider: "openai"
+        )))
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case .base = event { return true }
+                return false
+            }
+        }
+
+        // The switch advances the authoritative epoch before the old live
+        // completion is released. Operation B is the only current context.
+        try await advanceGateEpoch(gateKey: harness.gateKey)
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(2)
+        let callB = harness.provider.call(1)
+        let metadataB = verifiedMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            activeProfile: "work",
+            gateEpoch: 1,
+            operationID: callB.operationID,
+            operationGeneration: callB.operationGeneration
+        )
+
+        // A's live child completes late and must be dropped before it reaches
+        // the coordinator multicast stream.
+        callA.continuation.yield(.live(makeLiveSnapshot(
+            metadata: metadataA,
+            groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5-mini"])],
+            provider: "openai"
+        )))
+        callA.continuation.yield(.finished(metadataA))
+        callA.continuation.finish()
+
+        callB.continuation.yield(.contextVerified(metadataB, makeProfileContext(activeProfile: "work")))
+        callB.continuation.yield(.base(makeBaseSnapshot(
+            metadata: metadataB,
+            groups: [makeGroup(providerID: "anthropic", modelIDs: ["claude-4"])],
+            defaultModel: "claude-4",
+            activeProvider: "anthropic"
+        )))
+        callB.continuation.yield(.live(makeLiveSnapshot(
+            metadata: metadataB,
+            groups: [makeGroup(providerID: "anthropic", modelIDs: ["claude-4-mini"])],
+            provider: "anthropic"
+        )))
+        callB.continuation.yield(.finished(metadataB))
+        callB.continuation.finish()
+
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .live(snapshot) = event, snapshot.metadata.operationID == callB.operationID {
+                    return true
+                }
+                return false
+            }
+        }
+        let events = subscriber.collector.snapshot()
+        XCTAssertFalse(
+            events.contains { event in
+                if case let .live(snapshot) = event {
+                    return snapshot.metadata.operationID == callA.operationID
+                }
+                return false
+            },
+            "the old live completion must never publish after the switch epoch"
+        )
+        let finalState = await harness.coordinator.state
+        XCTAssertEqual(finalState, .freshReady)
+        await cancel(subscriber)
+    }
+
     func testCoordinatorRejectsEventWithStaleGateEpochBeforeYield() async throws {
         let harness = makeHarness()
         let subscriber = await makeSubscriber(harness.coordinator)
@@ -1132,7 +1395,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
-    func testUnverifiedProfileFailureIssuesZeroModelGETsAndRetryIsAccessible() async throws {
+    func testUnverifiedProfileFailureIssuesZeroModelGETs() async throws {
         let fixture = CoordinatorWireFixture()
         fixture.installProfilesOnly(#"{"profiles":[],"active":null}"#)
         let client = fixture.makeClient()
@@ -1284,6 +1547,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
     }
 
     private func makeHarness(
+        requestedProfile: String? = nil,
         clock: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_700_000_000) },
         freshnessInterval: TimeInterval = 300,
         completedContextLimit: Int = 4
@@ -1295,6 +1559,7 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
             gateKey: gateKey,
             apiClientID: apiClientID,
             authGeneration: 0,
+            requestedProfile: requestedProfile,
             provider: provider.makeProvider(),
             configuration: ChatModelCatalogCoordinator.Configuration(
                 now: clock,
@@ -1327,7 +1592,12 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
     ) async -> (collector: CatalogEventCollector, task: Task<Void, Never>) {
         let stream = await coordinator.subscribe()
         let collector = CatalogEventCollector()
-        let task = Task { for await event in stream { collector.append(event) } }
+        let task = Task {
+            for await event in stream {
+                collector.append(event)
+            }
+            collector.markTerminated()
+        }
         return (collector, task)
     }
 
@@ -1698,19 +1968,33 @@ private final class CatalogEventCollector: @unchecked Sendable {
         let continuation: CheckedContinuation<Void, Never>
     }
 
+    private struct ResultWaiter {
+        let id: UUID
+        let predicate: ([CatalogEvent]) -> Bool
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
     private let lock = NSLock()
     private var events: [CatalogEvent] = []
     private var waiters: [Waiter] = []
+    private var resultWaiters: [ResultWaiter] = []
+    private var terminated = false
 
     func append(_ event: CatalogEvent) {
         lock.lock()
         events.append(event)
-        let resolved = waiters.filter { $0.predicate(events) }
-        let resolvedIDs = Set(resolved.map { $0.id })
-        waiters.removeAll { resolvedIDs.contains($0.id) }
+        let eventWaiters = waiters.filter { $0.predicate(events) }
+        let eventWaiterIDs = Set(eventWaiters.map { $0.id })
+        waiters.removeAll { eventWaiterIDs.contains($0.id) }
+        let resultWaiters = self.resultWaiters.filter { $0.predicate(events) }
+        let resultWaiterIDs = Set(resultWaiters.map { $0.id })
+        self.resultWaiters.removeAll { resultWaiterIDs.contains($0.id) }
         lock.unlock()
-        for waiter in resolved {
+        for waiter in eventWaiters {
             waiter.continuation.resume()
+        }
+        for waiter in resultWaiters {
+            waiter.continuation.resume(returning: true)
         }
     }
 
@@ -1724,6 +2008,35 @@ private final class CatalogEventCollector: @unchecked Sendable {
             }
             waiters.append(Waiter(id: UUID(), predicate: predicate, continuation: continuation))
             lock.unlock()
+        }
+    }
+
+    func waitForResult(_ predicate: @escaping ([CatalogEvent]) -> Bool) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            lock.lock()
+            if predicate(events) {
+                lock.unlock()
+                continuation.resume(returning: true)
+                return
+            }
+            if terminated {
+                lock.unlock()
+                continuation.resume(returning: false)
+                return
+            }
+            resultWaiters.append(ResultWaiter(id: UUID(), predicate: predicate, continuation: continuation))
+            lock.unlock()
+        }
+    }
+
+    func markTerminated() {
+        lock.lock()
+        terminated = true
+        let waiters = resultWaiters
+        resultWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.continuation.resume(returning: false)
         }
     }
 

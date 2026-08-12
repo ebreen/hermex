@@ -245,7 +245,11 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             return
         }
 
-        let inventory = legacyCatalogInventory(root: root)
+        // This is the immutable Slice 4 RED inventory captured before the
+        // typed API deletion. It must be checked independently of the current
+        // tree, where the final-tree assertion below proves the typed surface
+        // is gone.
+        let inventory = frozenLegacyCatalogInventory()
         XCTAssertEqual(inventory.count, 9, "Slice 0 freezes nine legacy catalog matches")
         let callers = inventory.filter { !$0.path.hasSuffix("APIClient+ServerPanels.swift") }
         XCTAssertEqual(callers.count, 7, "Slice 0 permits seven legacy production callers")
@@ -284,6 +288,18 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         }
     }
 
+    func testFinalTreeHasNoTypedCatalogDefinitionsOrCallers() throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+
+        XCTAssertTrue(
+            typedCatalogInventory(root: root).isEmpty,
+            "Slice 4 final tree must have zero production models()/modelsLive() definitions or callers"
+        )
+    }
+
     // MARK: - Slice 1 gate protocol (RED)
     //
     // These tests encode the ticketed reader/writer gate contract from issue
@@ -310,12 +326,40 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1,
             telemetrySink: sink
         )
-        let collectTask = Task { await Self.collectEvents(from: stream) }
+        let (basePublishedStream, basePublishedContinuation) = AsyncStream<Bool>.makeStream()
+        let collectTask = Task { () -> [CatalogNetworkEvent] in
+            var events: [CatalogNetworkEvent] = []
+            for await event in stream {
+                events.append(event)
+                switch event {
+                case .base(_):
+                    basePublishedContinuation.yield(true)
+                    basePublishedContinuation.finish()
+                case .finished(_), .failed(_, _, _), .cancelled(_):
+                    basePublishedContinuation.yield(false)
+                    basePublishedContinuation.finish()
+                    return events
+                case .contextVerified(_, _), .live(_), .liveFailed(_, _):
+                    continue
+                }
+            }
+            basePublishedContinuation.finish()
+            return events
+        }
+        var basePublishedIterator = basePublishedStream.makeAsyncIterator()
 
         // The live child is parked on the wire, so the single physical
         // operation-level reader lease must still be held: it covers profile
-        // verification plus both children until both have unwound.
+        // verification plus both children until both have unwound. A valid base
+        // must nevertheless be published before the held live response is
+        // released; this is the networking-level base-before-live fence.
         await fixture.waitForParkedLoad(path: "/api/models/live")
+        let basePublished = await basePublishedIterator.next()
+        XCTAssertEqual(
+            basePublished,
+            true,
+            "base publication must not await held live completion"
+        )
         let midFlight = await gate.snapshot()
         XCTAssertEqual(midFlight.heldReaders, [operationID])
         XCTAssertNil(midFlight.heldWriter)
@@ -338,6 +382,23 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             if case .failed = event { return true }
             return false
         })
+        guard let baseIndex = events.firstIndex(where: { event in
+            if case .base = event { return true }
+            return false
+        }), let liveIndex = events.firstIndex(where: { event in
+            if case .live = event { return true }
+            return false
+        }) else {
+            XCTFail("expected both base and live projections")
+            return
+        }
+        XCTAssertLessThan(baseIndex, liveIndex)
+        if case let .base(baseSnapshot) = events[baseIndex] {
+            XCTAssertEqual(baseSnapshot.metadata.operationID, operationID)
+        }
+        if case let .live(liveSnapshot) = events[liveIndex] {
+            XCTAssertEqual(liveSnapshot.metadata.operationID, operationID)
+        }
 
         let finalState = await gate.snapshot()
         XCTAssertTrue(finalState.heldReaders.isEmpty, "the shared lease releases only after both children unwind")
@@ -399,6 +460,40 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             "children emit no gate phases; there is no nested admission"
         )
         XCTAssertTrue(children.allSatisfy { $0.admission?.admissionID == admissionIDs.first })
+    }
+
+    func testStaleWriterReleaseCannotReleaseReplacementAdmission() async throws {
+        let gate = makeIsolatedGate()
+        let operationID = UUID()
+
+        let first = try await gate.acquireWriter(operationID: operationID)
+        await gate.releaseWriter(operationID: operationID, admission: first)
+        let replacement = try await gate.acquireWriter(operationID: operationID)
+
+        await gate.releaseWriter(operationID: operationID, admission: first)
+        let stateAfterStaleRelease = await gate.snapshot()
+        XCTAssertEqual(stateAfterStaleRelease.heldWriter, operationID)
+
+        await gate.releaseWriter(operationID: operationID, admission: replacement)
+        let finalState = await gate.snapshot()
+        XCTAssertNil(finalState.heldWriter)
+        XCTAssertTrue(finalState.heldReaders.isEmpty)
+    }
+
+    func testSwitchProfileRejectsNonEmptyResponseErrorWithoutAdvancingEpoch() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installSwitchOnly(#"{"active":"work","error":"profile activation failed","profiles":[{"name":"default","is_active":false},{"name":"work","is_active":true}]}"#)
+        let client = fixture.makeClient()
+        let gate = gateFor(fixture: fixture, client: client)
+
+        do {
+            _ = try await client.switchProfile(name: "work")
+            XCTFail("a non-empty switch response error must reject the switch")
+        } catch {
+            XCTAssertNotNil(error)
+        }
+        let epoch = await gate.gateEpoch
+        XCTAssertEqual(epoch, 0)
     }
 
     func testWriterWaitsForHeldReaderLiveChild() async throws {
@@ -669,6 +764,121 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         _ = await queuedReader.task.value
     }
 
+    func testReaderCohortAdmitsConcurrentReadersBeforeWriter() async throws {
+        let gate = makeIsolatedGate()
+        let firstReaderID = UUID()
+        let secondReaderID = UUID()
+        let writerID = UUID()
+        let lateReaderID = UUID()
+
+        let firstReader = makeReaderTask(gate: gate, operationID: firstReaderID)
+        let secondReader = makeReaderTask(gate: gate, operationID: secondReaderID)
+        _ = await firstReader.admitted.first(where: { _ in true })
+        _ = await secondReader.admitted.first(where: { _ in true })
+
+        let writer = makeWriterTask(gate: gate, operationID: writerID)
+        await gate.waitForLeaseState(writerID, .waitingWriter)
+        let lateReader = makeReaderTask(gate: gate, operationID: lateReaderID, holdsAfterAdmission: false)
+        await gate.waitForLeaseState(lateReaderID, .waitingReader)
+
+        let held = await gate.snapshot()
+        XCTAssertEqual(held.heldReaders.count, 2)
+        XCTAssertEqual(Set(held.heldReaders), Set([firstReaderID, secondReaderID]))
+        XCTAssertNil(held.heldWriter)
+        XCTAssertEqual(held.waitingWriters, [writerID])
+        XCTAssertEqual(held.waitingReaders, [lateReaderID])
+
+        firstReader.release.yield(())
+        secondReader.release.yield(())
+        let writerAdmission = await writer.admitted.first(where: { _ in true })
+        XCTAssertNotNil(writerAdmission)
+        writer.release.yield(())
+        let lateReaderAdmission = await lateReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(lateReaderAdmission)
+
+        _ = await firstReader.task.value
+        _ = await secondReader.task.value
+        _ = await writer.task.value
+        _ = await lateReader.task.value
+    }
+
+    func testCancellationLatchedBeforeCompatibilityTaskAttachment() async throws {
+        let cancellation = CatalogTaskCancellationBox<Bool, Error>()
+        let (releaseStream, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let task = Task { () throws -> Bool in
+            for await _ in releaseStream { break }
+            try Task.checkCancellation()
+            return true
+        }
+
+        cancellation.cancel()
+        cancellation.attach(task)
+        releaseContinuation.yield(())
+
+        do {
+            _ = try await task.value
+            XCTFail("a task attached after cancellation must remain canceled")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        // Hold the gate so the canceled operation has a deterministic waiting
+        // point. The registration is complete, the body task is queued, and the
+        // writer is queued behind it before cancellation is replayed by attach.
+        let gate = makeIsolatedGate()
+        let heldOperationID = UUID()
+        let canceledOperationID = UUID()
+        let writerOperationID = UUID()
+        let heldReader = makeReaderTask(gate: gate, operationID: heldOperationID)
+        _ = await heldReader.admitted.first(where: { _ in true })
+
+        let gateCancellation = CatalogTaskCancellationBox<Void, Error>()
+        await gate.registerCancellation(operationID: canceledOperationID) {
+            gateCancellation.cancel()
+        }
+        let bodyTask = Task { () throws -> Void in
+            let admission = try await gate.acquireReader(operationID: canceledOperationID)
+            await gate.releaseReader(operationID: canceledOperationID, admission: admission)
+        }
+        await gate.waitForLeaseState(canceledOperationID, .waitingReader)
+
+        let writer = makeWriterTask(gate: gate, operationID: writerOperationID)
+        await gate.waitForLeaseState(writerOperationID, .waitingWriter)
+
+        // This is the registration-to-attachment window: the gate invokes the
+        // lock-protected hook before the body task is attached to the box.
+        await gate.cancel(operationID: canceledOperationID)
+        gateCancellation.attach(bodyTask)
+
+        do {
+            _ = try await bodyTask.value
+            XCTFail("the pre-attachment cancellation must prevent reader admission")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let canceledLeaseState = await gate.leaseState(of: canceledOperationID)
+        XCTAssertNil(canceledLeaseState, "pre-attachment cancellation leaves no reader lease")
+        let beforeRelease = await gate.snapshot()
+        XCTAssertFalse(beforeRelease.heldReaders.contains(canceledOperationID))
+        XCTAssertEqual(beforeRelease.waitingWriters, [writerOperationID])
+        await gate.unregisterCancellation(operationID: canceledOperationID)
+
+        heldReader.release.yield(())
+        let writerAdmission = await writer.admitted.first(where: { _ in true })
+        XCTAssertNotNil(writerAdmission, "the queued writer proceeds after the canceled reader drains")
+        let writerState = await gate.leaseState(of: writerOperationID)
+        XCTAssertEqual(writerState, .heldWriter)
+        writer.release.yield(())
+
+        _ = await heldReader.task.value
+        _ = await writer.task.value
+        let finalState = await gate.snapshot()
+        XCTAssertTrue(finalState.heldReaders.isEmpty)
+        XCTAssertNil(finalState.heldWriter)
+        XCTAssertTrue(finalState.waitingReaders.isEmpty)
+        XCTAssertTrue(finalState.waitingWriters.isEmpty)
+    }
+
     func testQueuedReadersAndWritersMakeProgressWithoutStarvation() async throws {
         let gate = makeIsolatedGate()
         let firstReader = UUID()
@@ -742,10 +952,12 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
     }
 
-    func testActiveProfileMismatchDoesNotAdvanceEpochOrIssueModelsGET() async throws {
+    func testActiveProfileMismatchSwitchesAndReverifiesBeforeModelsGET() async throws {
         let fixture = IsolatedCatalogURLProtocolFixture()
-        fixture.installProfilesOnly(
-            #"{"profiles":[{"name":"work","isActive":true}],"active":"work","single_profile_mode":false}"#
+        fixture.installCatalogWithProfileSwitch(
+            initialProfilesJSON: #"{"profiles":[{"name":"work","isActive":true},{"name":"default"}],"active":"work","single_profile_mode":false}"#,
+            switchedProfilesJSON: #"{"profiles":[{"name":"default","isActive":true}],"active":"default","single_profile_mode":false}"#,
+            switchJSON: #"{"profiles":[{"name":"default","isActive":true}],"active":"default","default_model":"default-model","default_workspace":"default-space"}"#
         )
         let client = fixture.makeClient()
         let gate = gateFor(fixture: fixture, client: client)
@@ -756,18 +968,83 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             operationGeneration: 1
         )
         let events = await Self.collectEvents(from: stream)
-        guard case let .failed(_, phase, category)? = events.last else {
-            XCTFail("a requested-profile mismatch must produce a failed terminal")
+        guard case let .contextVerified(_, context)? = events.first(where: { event in
+            if case .contextVerified = event { return true }
+            return false
+        }) else {
+            XCTFail("a requested-profile mismatch must switch and publish an authoritative context")
             return
         }
-        XCTAssertEqual(phase, .context)
-        XCTAssertEqual(category, .profileMismatch)
-        let epoch = await gate.gateEpoch
-        XCTAssertEqual(epoch, 0, "a mismatched profile must not advance the epoch")
+        XCTAssertEqual(context.activeProfile, "default")
+        XCTAssertEqual(context.requestedProfile, "default")
+        XCTAssertEqual(
+            context.switchResult,
+            .switched(defaults: CatalogProfileDefaults(model: "default-model", workspace: "default-space"))
+        )
+        let gateEpoch = await gate.gateEpoch
+        XCTAssertEqual(gateEpoch, 1)
         let paths = fixture.requests().compactMap { $0.url?.path }
-        XCTAssertFalse(paths.contains("/api/models"))
-        XCTAssertFalse(paths.contains("/api/models/live"))
-        XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
+        XCTAssertEqual(Array(paths.prefix(3)), ["/api/profiles", "/api/profile/switch", "/api/profiles"])
+        XCTAssertEqual(
+            Set(paths.suffix(2)),
+            Set(["/api/models", "/api/models/live"])
+        )
+        XCTAssertEqual(terminalCount(of: events), 1)
+    }
+
+    func testRequestedProfileSwitchReverifiesBeforePublishingCatalog() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installCatalogWithProfileSwitch(
+            initialProfilesJSON: #"{"profiles":[{"name":"default","isActive":true},{"name":"work"}],"active":"default","single_profile_mode":false}"#,
+            switchedProfilesJSON: #"{"profiles":[{"name":"work","isActive":true}],"active":"work","single_profile_mode":false}"#,
+            switchJSON: #"{"profiles":[{"name":"work","isActive":true}],"active":"work","default_model":"work-model","default_workspace":"work-space"}"#
+        )
+        let client = fixture.makeClient()
+        let gate = gateFor(fixture: fixture, client: client)
+
+        let stream = await client.modelCatalogStream(
+            requestedProfile: "work",
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        let events = await Self.collectEvents(from: stream)
+
+        guard case let .contextVerified(_, context)? = events.first(where: { event in
+            if case .contextVerified = event { return true }
+            return false
+        }) else {
+            XCTFail("requested-profile flow must publish an authoritative context")
+            return
+        }
+        XCTAssertEqual(context.activeProfile, "work")
+        XCTAssertEqual(context.requestedProfile, "work")
+        XCTAssertEqual(
+            context.switchResult,
+            .switched(defaults: CatalogProfileDefaults(model: "work-model", workspace: "work-space"))
+        )
+        let gateEpoch = await gate.gateEpoch
+        XCTAssertEqual(gateEpoch, 1)
+
+        let requests = fixture.requests()
+        let paths = requests.compactMap { $0.url?.path }
+        XCTAssertEqual(
+            paths.filter { $0 == "/api/profiles" }.count,
+            2,
+            "the switch flow reads profiles before and after the POST"
+        )
+        guard let switchRequest = requests.first(where: { $0.url?.path == "/api/profile/switch" }) else {
+            XCTFail("requested-profile flow must issue the switch POST")
+            return
+        }
+        XCTAssertEqual(switchRequest.httpMethod, "POST")
+        let data = try XCTUnwrap(apiTestBodyData(from: switchRequest))
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: data) as? [String: String],
+            ["name": "work"]
+        )
+        XCTAssertTrue(paths.contains("/api/models"))
+        XCTAssertTrue(paths.contains("/api/models/live"))
+        XCTAssertEqual(terminalCount(of: events), 1)
     }
 
     func testAmbiguousProfilesResponseIssuesZeroModelsGETs() async throws {
@@ -1217,6 +1494,294 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         XCTAssertFalse(acceptsStaleEpoch, "an advanced epoch rejects the pre-switch compatibility envelope before apply")
     }
 
+    // MARK: - Slice 4 RED: neutral caller migration and profile-read fencing
+
+    // These caller-level tests deliberately inspect the production path as well
+    // as exercising the neutral request surface. The five paths must stop using
+    // compatibility DTO envelopes in Slice 4: Chat loader/VM consume the ordered
+    // stream, while the three Settings callers consume modelCatalogSnapshot.
+    // The source assertions are expected RED on the protected Slice 4 base; the
+    // request-count assertions pin the neutral surface that GREEN must route to.
+
+    func testChatLoaderCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift",
+            requiredCall: "modelCatalogStream"
+        )
+    }
+
+    func testChatViewModelCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Chat/ChatViewModel.swift",
+            requiredCall: "modelCatalogStream"
+        )
+    }
+
+    func testDefaultModelPickerCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testDefaultProfilePickerCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testSettingsSummaryCatalogPathUsesNeutralSurfaceAndExactRequestCounts() async throws {
+        try await assertNeutralCatalogCaller(
+            relativePath: "HermesMobile/Features/Settings/SettingsView.swift",
+            requiredCall: "modelCatalogSnapshot"
+        )
+    }
+
+    func testSessionListProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/SessionList/SessionListViewModel.swift"
+        )
+    }
+
+    func testDefaultProfilePickerProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift"
+        )
+    }
+
+    func testSettingsProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/Features/Settings/SettingsView.swift"
+        )
+    }
+
+    func testAppIntentProfileReadAcceptanceRejectsAdvancedEpoch() async throws {
+        try await assertProfileReadCaller(
+            relativePath: "HermesMobile/AppIntents/ProfileEntity.swift"
+        )
+    }
+
+    func testFailureShapedProfileSnapshotCannotClearVerifiedAppIntentCache() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installProfilesOnly(
+            #"{"profiles":[{"name":"a","isActive":true},{"name":"b","isActive":true}],"single_profile_mode":false}"#
+        )
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertFalse(snapshot.isAuthoritative)
+        XCTAssertTrue(snapshot.profiles.isEmpty)
+        XCTAssertTrue(snapshot.activeProfile.isEmpty)
+
+        let suite = "test.profileentitycache.failure.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cache = ProfileEntityCache(defaults: defaults)
+        let verifiedProfile = ProfileSummary(
+            name: "verified",
+            path: nil,
+            isDefault: nil,
+            isActive: true,
+            gatewayRunning: nil,
+            model: nil,
+            provider: nil,
+            hasEnv: nil,
+            skillCount: nil
+        )
+        XCTAssertTrue(cache.save([verifiedProfile]))
+        let beforeFailure = cache.loadEntities()
+
+        XCTAssertFalse(cache.save(snapshot), "failure-shaped snapshots are not cache writes")
+        XCTAssertEqual(cache.loadEntities().map(\.id), beforeFailure.map(\.id))
+    }
+
+    func testAuthoritativeVerifiedProfileSnapshotMayUpdateAppIntentCache() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertTrue(snapshot.isAuthoritative)
+        XCTAssertEqual(snapshot.activeProfile, "default")
+
+        let suite = "test.profileentitycache.verified.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cache = ProfileEntityCache(defaults: defaults)
+
+        XCTAssertTrue(cache.save(snapshot), "only a verified snapshot may update the cache")
+        XCTAssertEqual(cache.loadEntities().map(\.id), ["default"])
+    }
+
+    func testProfileSnapshotAcceptanceRejectsMismatchedOperationIdentity() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 7
+        let snapshot = await client.profileContextSnapshot(
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+
+        let accepted = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        XCTAssertTrue(accepted)
+
+        let rejectedOperationID = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: UUID(),
+            operationGeneration: operationGeneration
+        )
+        XCTAssertFalse(rejectedOperationID, "a different operation cannot apply a valid snapshot")
+
+        let rejectedGeneration = await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration + 1
+        )
+        XCTAssertFalse(rejectedGeneration, "a later operation generation cannot apply an older snapshot")
+    }
+
+    func testUnverifiedProfileSnapshotIsRejectedBeforeStateApplication() async throws {
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installProfilesOnly(
+            #"{"profiles":[{"name":"a","isActive":true},{"name":"b","isActive":true}],"single_profile_mode":false}"#
+        )
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
+        let snapshot = await client.profileContextSnapshot(
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        XCTAssertFalse(snapshot.isAuthoritative)
+
+        var appliedProfile: String?
+        if await client.acceptsCatalogSnapshot(
+            snapshot,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        ) {
+            appliedProfile = snapshot.activeProfile
+        }
+        XCTAssertNil(appliedProfile, "an unverified profile read must not reach state mutation")
+    }
+
+    private func assertNeutralCatalogCaller(
+        relativePath: String,
+        requiredCall: String
+    ) async throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains(requiredCall),
+            "\(relativePath) must route catalog work through \(requiredCall)"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityModels("),
+            "\(relativePath) must not retain a compatibility model DTO caller"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityProfiles("),
+            "\(relativePath) must not resolve profile context beside the neutral catalog operation"
+        )
+
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let operationID = UUID()
+        if requiredCall == "modelCatalogStream" {
+            let events = await Self.collectEvents(from: await client.modelCatalogStream(
+                requestedProfile: nil,
+                operationID: operationID,
+                operationGeneration: 1
+            ))
+            XCTAssertTrue(events.contains { event in
+                if case .finished = event { return true }
+                return false
+            })
+        } else {
+            let snapshot = await client.modelCatalogSnapshot(
+                requestedProfile: nil,
+                operationID: operationID,
+                operationGeneration: 1
+            )
+            XCTAssertNil(snapshot.failure)
+            XCTAssertNotNil(snapshot.base)
+        }
+
+        let paths = fixture.requests().compactMap { $0.url?.path }
+        XCTAssertEqual(paths.filter { $0 == "/api/profiles" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "/api/models" }.count, 1)
+        XCTAssertEqual(paths.filter { $0 == "/api/models/live" }.count, 1)
+    }
+
+    private func assertProfileReadCaller(relativePath: String) async throws {
+        guard let root = repositoryRoot(startingAt: #filePath) else {
+            XCTFail("Could not locate the repository by walking upward from #filePath")
+            return
+        }
+        let sourceURL = root.appendingPathComponent(relativePath)
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("profileContextSnapshot"),
+            "\(relativePath) must use the neutral profile read surface"
+        )
+        XCTAssertFalse(
+            source.contains("compatibilityProfiles("),
+            "\(relativePath) must not apply a compatibility profile envelope"
+        )
+
+        let fixture = IsolatedCatalogURLProtocolFixture()
+        fixture.installStandardCatalogResponses()
+        let client = fixture.makeClient()
+        let snapshot = await client.profileContextSnapshot(
+            operationID: UUID(),
+            operationGeneration: 1
+        )
+        XCTAssertEqual(snapshot.activeProfile, "default")
+        XCTAssertEqual(snapshot.profiles.map(\.name), ["default"])
+
+        let acceptedBeforeSwitch = await client.acceptsCatalogMetadata(snapshot.metadata)
+        XCTAssertTrue(acceptedBeforeSwitch, "the current profile read is accepted before the epoch changes")
+
+        try await advanceEpochForSlice4(gate: gateFor(fixture: fixture, client: client))
+        let acceptedAfterSwitch = await client.acceptsCatalogMetadata(snapshot.metadata)
+        XCTAssertFalse(
+            acceptedAfterSwitch,
+            "a decoded profile read must not publish after the authoritative epoch advances"
+        )
+        XCTAssertEqual(
+            fixture.requests().filter { $0.url?.path == "/api/profiles" }.count,
+            1,
+            "profile reads use one neutral profiles request and never issue model requests"
+        )
+        XCTAssertEqual(
+            fixture.requests().filter { $0.url?.path == "/api/models" || $0.url?.path == "/api/models/live" }.count,
+            0
+        )
+    }
+
+    private func advanceEpochForSlice4(gate: ProfileContextGate) async throws {
+        let operationID = UUID()
+        let admission = try await gate.acquireWriter(operationID: operationID)
+        await gate.advanceEpoch(operationID: operationID)
+        await gate.releaseWriter(operationID: operationID, admission: admission)
+    }
+
     // MARK: - Slice 1 gate helpers
 
     private func gateFor(
@@ -1478,14 +2043,53 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let line: Int
     }
 
-    private func legacyCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
-        // Slice 1 routing swapped the seven production typed calls for the
-        // Networking compatibility adapters one-for-one in the same files.
-        // The frozen inventory contract is count/location equality (nine
-        // matches: two compatibility definitions + seven production sites);
-        // it must never GROW. Slice 4 alone proves zero production typed
-        // callers and deletes the typed methods.
-        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|\.compatibilityModels(Live)?\([^)]*\)|func (models|modelsLive)\(\)"#)
+    private func frozenLegacyCatalogInventory() -> [LegacyCatalogMatch] {
+        // Exact Slice 4 RED baseline from the adapter-routed tree: seven
+        // compatibilityModels/compatibilityModelsLive call sites plus the two
+        // typed API definitions. This historical inventory is intentionally
+        // independent of the final tree, where all nine entries are removed.
+        [
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatComposerConfigLoader.swift",
+                line: 114
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatViewModel.swift",
+                line: 763
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Chat/ChatViewModel.swift",
+                line: 771
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+                line: 200
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultModelPickerView.swift",
+                line: 221
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/DefaultProfilePickerView.swift",
+                line: 468
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Features/Settings/SettingsView.swift",
+                line: 1062
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Networking/APIClient+ServerPanels.swift",
+                line: 4
+            ),
+            LegacyCatalogMatch(
+                path: "HermesMobile/Networking/APIClient+ServerPanels.swift",
+                line: 11
+            )
+        ]
+    }
+
+    private func typedCatalogInventory(root: URL) -> [LegacyCatalogMatch] {
+        let pattern = try! NSRegularExpression(pattern: #"\.(models|modelsLive)\(\)|func (models|modelsLive)\(\)"#)
         let appRoot = root.appendingPathComponent("HermesMobile", isDirectory: true)
         let fileManager = FileManager.default
         let relativePaths = (fileManager.subpaths(atPath: appRoot.path) ?? [])
@@ -1758,10 +2362,32 @@ private final class IsolatedCatalogURLProtocolFixture: @unchecked Sendable {
         }
     }
 
+    func installCatalogWithProfileSwitch(
+        initialProfilesJSON: String,
+        switchedProfilesJSON: String,
+        switchJSON: String
+    ) {
+        install { [recorder] request in
+            switch request.url?.path {
+            case "/api/profiles":
+                let profileReads = recorder.snapshot().filter { $0.url?.path == "/api/profiles" }.count
+                let json = profileReads == 1 ? initialProfilesJSON : switchedProfilesJSON
+                return try Self.jsonResponse(json, for: request)
+            case "/api/models":
+                return try Self.jsonResponse(Self.modelsDefaultJSON, for: request)
+            case "/api/models/live":
+                return try Self.jsonResponse(Self.liveDefaultJSON, for: request)
+            case "/api/profile/switch":
+                return try Self.jsonResponse(switchJSON, for: request)
+            default:
+                throw URLError(.resourceUnavailable)
+            }
+        }
+    }
+
     func installCatalogWithSwitch(switchJSON: String) {
         installCatalog(profilesJSON: Self.profilesDefaultJSON, switchJSON: switchJSON)
     }
-
     static func jsonResponse(
         _ json: String,
         for request: URLRequest,

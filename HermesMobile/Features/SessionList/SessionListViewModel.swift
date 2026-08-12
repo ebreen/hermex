@@ -270,13 +270,31 @@ final class SessionListViewModel {
         defer { isLoadingActiveProfile = false }
 
         do {
-            // Raw profile read under the Networking compatibility lease (issue
-            // #16 Slice 1); an epoch-advanced result (a concurrent profile
-            // switch) is discarded before state mutation.
-            let envelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-                applyActiveProfile(envelope.value)
+            let operationID = UUID()
+            let operationGeneration: UInt64 = 1
+            let snapshot = await client.profileContextSnapshot(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+            guard !Task.isCancelled else { return }
+            guard snapshot.isAuthoritative else {
+                // Failure-shaped profile snapshots are deliberately not
+                // accepted into profile state, but the UI still needs a
+                // visible failure indication so a failed refresh is not
+                // indistinguishable from an empty profile list.
+                activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
+                return
             }
+            guard await client.acceptsCatalogSnapshot(
+                snapshot,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            ) else { return }
+            guard !snapshot.activeProfile.isEmpty else {
+                activeProfileErrorMessage = String(localized: "Could Not Load Profiles")
+                return
+            }
+            applyActiveProfile(snapshot)
         } catch {
             guard !isCancellationError(error) else { return }
 
@@ -1097,6 +1115,21 @@ final class SessionListViewModel {
         activeProfileDisplayName = response.displayName(for: profileName)
             ?? profile?.displayName
         activeProfileModel = Self.nonEmpty(profile?.model) ?? Self.nonEmpty(fallbackDefaultModel)
+        activeProfileProvider = Self.nonEmpty(profile?.provider)
+    }
+
+    private func applyActiveProfile(_ snapshot: CatalogProfileReadSnapshot) {
+        profileOptions = snapshot.profiles
+        isSingleProfileMode = snapshot.singleProfileMode
+
+        let changed = ProfileEntityCache.shared.save(snapshot.profiles)
+        ProfileEntityProvider.refreshAppShortcuts(changed: changed)
+
+        let profile = snapshot.profiles.first { $0.normalizedName == snapshot.activeProfile }
+        activeProfileName = snapshot.activeProfile
+        activeProfileDisplayName = profile?.displayName
+            ?? (snapshot.activeProfile == "default" ? String(localized: "Default") : snapshot.activeProfile)
+        activeProfileModel = Self.nonEmpty(profile?.model)
         activeProfileProvider = Self.nonEmpty(profile?.provider)
     }
 

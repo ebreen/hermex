@@ -1,15 +1,510 @@
 import Foundation
 
+/// Neutral, actor-crossing profile projection. The recursive wire DTO remains
+/// inside APIClient; only this immutable snapshot is consumed by UI and App
+/// Intent callers.
+struct CatalogProfileReadSnapshot: Equatable, Sendable {
+    let metadata: CatalogEventMetadata
+    let profiles: [ProfileSummary]
+    let activeProfile: String
+    let singleProfileMode: Bool
+    /// True only when the profile response passed strict authoritative
+    /// verification. Failure-shaped snapshots are deliberately non-authoritative
+    /// even when their provisional metadata still matches the current epoch.
+    let isAuthoritative: Bool
+}
+
 extension APIClient {
-    func models() async throws -> ModelsResponse {
-        try await send(endpoint: .models, method: "GET")
+    /// Reads and strictly verifies profile context without issuing model
+    /// requests. The returned metadata is the authoritative apply token.
+    func profileContextSnapshot(
+        operationID: UUID,
+        operationGeneration: UInt64,
+        telemetrySink: (any CatalogTelemetrySink)? = nil
+    ) async -> CatalogProfileReadSnapshot {
+        _ = telemetrySink
+        do {
+            let envelope = try await compatibilityProfiles(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+            let response = envelope.value
+            let profiles = response.profiles ?? []
+            switch CatalogProfileVerifier.verify(
+                profiles: profiles,
+                explicitActive: response.active,
+                singleProfileMode: response.singleProfileMode ?? false,
+                requestedProfile: nil
+            ) {
+            case let .verified(activeProfile, singleProfileMode):
+                return CatalogProfileReadSnapshot(
+                    metadata: catalogMetadata(
+                        operationID: operationID,
+                        operationGeneration: operationGeneration,
+                        gateKey: envelope.gateKey,
+                        gateEpoch: envelope.gateEpoch,
+                        activeProfile: activeProfile
+                    ),
+                    profiles: profiles,
+                    activeProfile: activeProfile,
+                    singleProfileMode: singleProfileMode,
+                    isAuthoritative: true
+                )
+            case .unavailable, .mismatch:
+                return emptyProfileContextSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: envelope.gateKey,
+                    gateEpoch: envelope.gateEpoch
+                )
+            }
+        } catch {
+            let gateKey = ProfileContextGateKey(
+                origin: NormalizedServerOrigin(url: baseURL),
+                cookieContextID: cookieContextID
+            )
+            let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
+            return emptyProfileContextSnapshot(
+                operationID: operationID,
+                operationGeneration: operationGeneration,
+                gateKey: gateKey,
+                gateEpoch: await gate.gateEpoch
+            )
+        }
     }
 
-    /// Live (uncached) model list for the active provider. The server resolves
-    /// the provider itself when no `provider` param is sent and echoes it back,
-    /// so callers can match the result against the cached catalog's groups.
-    func modelsLive() async throws -> ModelsLiveResponse {
-        try await send(endpoint: .modelsLive, method: "GET")
+    /// Authoritative acceptance for a neutral profile/catalog result. The
+    /// check is intentionally performed against the shared gate, not a
+    /// caller's last-applied profile or local epoch copy. The caller-supplied
+    /// operation identity is part of the acceptance contract: a response from
+    /// another request must not be applied merely because it shares a client
+    /// and gate epoch.
+    func acceptsCatalogMetadata(
+        _ metadata: CatalogEventMetadata,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        guard metadata.operationID == operationID,
+              metadata.operationGeneration == operationGeneration else { return false }
+
+        let gateKey: ProfileContextGateKey
+        let epoch: UInt64
+        switch metadata.identity {
+        case let .provisional(key):
+            guard key.gateKey == catalogGateKey,
+                  key.apiClientID == apiClientID,
+                  key.authGeneration == 0 else { return false }
+            gateKey = key.gateKey
+            epoch = key.startingGateEpoch
+        case let .verified(key):
+            guard key.gateKey == catalogGateKey,
+                  key.apiClientID == apiClientID,
+                  key.authGeneration == 0 else { return false }
+            gateKey = key.gateKey
+            epoch = key.gateEpoch
+        }
+
+        guard !Task.isCancelled else { return false }
+        let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
+        let authoritativeEpoch = await gate.gateEpoch
+        return !Task.isCancelled && authoritativeEpoch == epoch
+    }
+
+    /// Compatibility adapter for existing stream consumers. New snapshot
+    /// callers pass their captured operation identity through the overloads
+    /// below; this form remains for the existing event metadata boundary.
+    func acceptsCatalogMetadata(_ metadata: CatalogEventMetadata) async -> Bool {
+        await acceptsCatalogMetadata(
+            metadata,
+            operationID: metadata.operationID,
+            operationGeneration: metadata.operationGeneration
+        )
+    }
+
+    func acceptsCatalogSnapshot(
+        _ result: CatalogSnapshotResult,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        await acceptsCatalogMetadata(
+            result.metadata,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    func acceptsCatalogSnapshot(_ result: CatalogSnapshotResult) async -> Bool {
+        await acceptsCatalogSnapshot(
+            result,
+            operationID: result.metadata.operationID,
+            operationGeneration: result.metadata.operationGeneration
+        )
+    }
+
+    /// Profile reads have one additional authority condition: only a snapshot
+    /// produced by strict profile verification may reach cache, selection, or
+    /// UI state. Failure-shaped snapshots remain value-semantic and Sendable,
+    /// but are never accepted even when their provisional metadata is current.
+    func acceptsCatalogSnapshot(
+        _ result: CatalogProfileReadSnapshot,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> Bool {
+        guard result.isAuthoritative else { return false }
+        return await acceptsCatalogMetadata(
+            result.metadata,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    func acceptsCatalogSnapshot(_ result: CatalogProfileReadSnapshot) async -> Bool {
+        await acceptsCatalogSnapshot(
+            result,
+            operationID: result.metadata.operationID,
+            operationGeneration: result.metadata.operationGeneration
+        )
+    }
+
+    /// Neutral base catalog read used by the direct (non-Chat coordinator)
+    /// composer path. It retains the single profile phase and never issues a
+    /// live request; the Chat coordinator's ordered stream remains the full
+    /// base/live surface.
+    func modelCatalogBaseSnapshot(
+        requestedProfile: String? = nil,
+        operationID: UUID,
+        operationGeneration: UInt64,
+        telemetrySink: (any CatalogTelemetrySink)? = nil
+    ) async -> CatalogSnapshotResult {
+        _ = telemetrySink
+        let profileEnvelope: CatalogCompatibilityEnvelope<ProfilesResponse>
+        do {
+            profileEnvelope = try await compatibilityProfiles(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+        } catch {
+            return await failedCatalogSnapshot(
+                operationID: operationID,
+                operationGeneration: operationGeneration,
+                category: .profileUnavailable
+            )
+        }
+
+        let normalizedRequestedProfile = requestedProfile
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let initialResponse = profileEnvelope.value
+        let initialProfiles = initialResponse.profiles ?? []
+        let initialVerification = CatalogProfileVerifier.verify(
+            profiles: initialProfiles,
+            explicitActive: initialResponse.active,
+            singleProfileMode: initialResponse.singleProfileMode ?? false,
+            requestedProfile: normalizedRequestedProfile
+        )
+
+        let authoritativeProfileEnvelope: CatalogCompatibilityEnvelope<ProfilesResponse>
+        let profiles: [ProfileSummary]
+        let activeProfile: String
+        let singleProfileMode: Bool
+        let defaults: CatalogProfileDefaults
+        let switchResult: CatalogProfileSwitchResult
+
+        switch initialVerification {
+        case .unavailable:
+            return await failedCatalogSnapshot(
+                operationID: operationID,
+                operationGeneration: operationGeneration,
+                gateKey: profileEnvelope.gateKey,
+                gateEpoch: profileEnvelope.gateEpoch,
+                category: .profileUnavailable
+            )
+        case let .verified(verifiedProfile, verifiedSingleProfileMode):
+            authoritativeProfileEnvelope = profileEnvelope
+            profiles = initialProfiles
+            activeProfile = verifiedProfile
+            singleProfileMode = verifiedSingleProfileMode
+            defaults = CatalogProfileDefaults(model: nil, workspace: nil)
+            switchResult = normalizedRequestedProfile == nil ? .notRequested : .alreadyActive
+        case .mismatch:
+            guard let normalizedRequestedProfile else {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: profileEnvelope.gateEpoch,
+                    category: .profileMismatch
+                )
+            }
+
+            let switchResponse: ProfileSwitchResponse
+            do {
+                switchResponse = try await switchProfile(name: normalizedRequestedProfile)
+            } catch let failure as ProfileContextSwitchFailure {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: catalogFailure(forProfileSwitch: failure)
+                )
+            } catch {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: .transport
+                )
+            }
+
+            do {
+                authoritativeProfileEnvelope = try await compatibilityProfiles(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            } catch {
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: profileEnvelope.gateKey,
+                    gateEpoch: await ProfileContextGateRegistry.shared.gate(for: profileEnvelope.gateKey).gateEpoch,
+                    category: .profileUnavailable
+                )
+            }
+
+            let switchedResponse = authoritativeProfileEnvelope.value
+            let switchedProfiles = switchedResponse.profiles ?? []
+            let switchedVerification = CatalogProfileVerifier.verify(
+                profiles: switchedProfiles,
+                explicitActive: switchedResponse.active,
+                singleProfileMode: switchedResponse.singleProfileMode ?? false,
+                requestedProfile: normalizedRequestedProfile
+            )
+            guard case let .verified(verifiedProfile, verifiedSingleProfileMode) = switchedVerification else {
+                let category: CatalogFailureCategory = switchedVerification == .mismatch
+                    ? .profileMismatch
+                    : .profileUnavailable
+                return await failedCatalogSnapshot(
+                    operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    gateKey: authoritativeProfileEnvelope.gateKey,
+                    gateEpoch: authoritativeProfileEnvelope.gateEpoch,
+                    category: category
+                )
+            }
+
+            profiles = switchedProfiles
+            activeProfile = verifiedProfile
+            singleProfileMode = verifiedSingleProfileMode
+            defaults = CatalogProfileDefaults(
+                model: switchResponse.defaultModel,
+                workspace: switchResponse.defaultWorkspace
+            )
+            switchResult = .switched(defaults: defaults)
+        }
+
+        let metadata = catalogMetadata(
+            operationID: operationID,
+            operationGeneration: operationGeneration,
+            gateKey: authoritativeProfileEnvelope.gateKey,
+            gateEpoch: authoritativeProfileEnvelope.gateEpoch,
+            activeProfile: activeProfile
+        )
+        let context = CatalogProfileContext(
+            profiles: profiles,
+            activeProfile: activeProfile,
+            requestedProfile: normalizedRequestedProfile,
+            singleProfileMode: singleProfileMode,
+            defaults: defaults,
+            switchResult: switchResult
+        )
+
+        do {
+            let baseEnvelope = try await compatibilityModels(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+            let base = CatalogBaseSnapshot(
+                metadata: metadata,
+                groups: baseEnvelope.value.groups,
+                defaultModel: baseEnvelope.value.defaultModel,
+                activeProvider: baseEnvelope.value.activeProvider
+            )
+            return CatalogSnapshotResult(
+                metadata: metadata,
+                context: context,
+                base: base,
+                live: nil,
+                failure: nil
+            )
+        } catch {
+            return CatalogSnapshotResult(
+                metadata: metadata,
+                context: context,
+                base: nil,
+                live: nil,
+                failure: .transport
+            )
+        }
+    }
+
+    /// Base-only neutral read for a caller that has just completed the gated
+    /// profile switch itself. It preserves the old request graph while still
+    /// returning a Sendable, epoch-fenced projection.
+    func modelCatalogBaseOnlySnapshot(
+        operationID: UUID,
+        operationGeneration: UInt64,
+        activeProfile: String? = nil,
+        telemetrySink: (any CatalogTelemetrySink)? = nil
+    ) async -> CatalogSnapshotResult {
+        _ = telemetrySink
+        let gateKey = catalogGateKey
+        let gate = ProfileContextGateRegistry.shared.gate(for: gateKey)
+        let epoch = await gate.gateEpoch
+        let metadata = catalogMetadata(
+            operationID: operationID,
+            operationGeneration: operationGeneration,
+            gateKey: gateKey,
+            gateEpoch: epoch,
+            activeProfile: activeProfile
+        )
+        do {
+            let envelope = try await compatibilityModels(
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+            let base = CatalogBaseSnapshot(
+                metadata: metadata,
+                groups: envelope.value.groups,
+                defaultModel: envelope.value.defaultModel,
+                activeProvider: envelope.value.activeProvider
+            )
+            return CatalogSnapshotResult(
+                metadata: metadata,
+                context: nil,
+                base: base,
+                live: nil,
+                failure: nil
+            )
+        } catch {
+            return CatalogSnapshotResult(
+                metadata: metadata,
+                context: nil,
+                base: nil,
+                live: nil,
+                failure: .transport
+            )
+        }
+    }
+
+    private var catalogGateKey: ProfileContextGateKey {
+        ProfileContextGateKey(
+            origin: NormalizedServerOrigin(url: baseURL),
+            cookieContextID: cookieContextID
+        )
+    }
+
+    private func catalogMetadata(
+        operationID: UUID,
+        operationGeneration: UInt64,
+        gateKey: ProfileContextGateKey,
+        gateEpoch: UInt64,
+        activeProfile: String?
+    ) -> CatalogEventMetadata {
+        let identity: CatalogEventIdentity
+        if let activeProfile, !activeProfile.isEmpty {
+            identity = .verified(
+                CatalogContextKey(
+                    gateKey: gateKey,
+                    apiClientID: apiClientID,
+                    authGeneration: 0,
+                    activeProfile: activeProfile,
+                    gateEpoch: gateEpoch
+                )
+            )
+        } else {
+            identity = .provisional(
+                CatalogOperationKey(
+                    gateKey: gateKey,
+                    apiClientID: apiClientID,
+                    authGeneration: 0,
+                    requestedProfile: nil,
+                    startingGateEpoch: gateEpoch
+                )
+            )
+        }
+        return CatalogEventMetadata(
+            identity: identity,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    private func emptyProfileContextSnapshot(
+        operationID: UUID,
+        operationGeneration: UInt64,
+        gateKey: ProfileContextGateKey,
+        gateEpoch: UInt64
+    ) -> CatalogProfileReadSnapshot {
+        CatalogProfileReadSnapshot(
+            metadata: catalogMetadata(
+                operationID: operationID,
+                operationGeneration: operationGeneration,
+                gateKey: gateKey,
+                gateEpoch: gateEpoch,
+                activeProfile: nil
+            ),
+            profiles: [],
+            activeProfile: "",
+            singleProfileMode: false,
+            isAuthoritative: false
+        )
+    }
+
+    private func catalogFailure(forProfileSwitch failure: ProfileContextSwitchFailure) -> CatalogFailureCategory {
+        switch failure {
+        case .rejected:
+            return .profileSwitchRejected
+        case .transport:
+            return .transport
+        case .unauthorized:
+            return .unauthorized
+        case .decoding:
+            return .decoding
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
+    private func failedCatalogSnapshot(
+        operationID: UUID,
+        operationGeneration: UInt64,
+        gateKey: ProfileContextGateKey? = nil,
+        gateEpoch: UInt64? = nil,
+        category: CatalogFailureCategory
+    ) async -> CatalogSnapshotResult {
+        let key = gateKey ?? catalogGateKey
+        let epoch: UInt64
+        if let gateEpoch {
+            epoch = gateEpoch
+        } else {
+            epoch = await ProfileContextGateRegistry.shared.gate(for: key).gateEpoch
+        }
+        let metadata = catalogMetadata(
+            operationID: operationID,
+            operationGeneration: operationGeneration,
+            gateKey: key,
+            gateEpoch: epoch,
+            activeProfile: nil
+        )
+        return CatalogSnapshotResult(
+            metadata: metadata,
+            context: nil,
+            base: nil,
+            live: nil,
+            failure: category
+        )
     }
 
     func commands() async throws -> CommandsResponse {
@@ -120,6 +615,9 @@ extension APIClient {
                 method: "POST",
                 body: ProfileSwitchRequest(name: normalizedName)
             )
+            guard response.error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
+                throw ProfileContextSwitchFailure.rejected
+            }
             let verification = CatalogProfileVerifier.verify(
                 profiles: response.profiles ?? [],
                 explicitActive: response.active,

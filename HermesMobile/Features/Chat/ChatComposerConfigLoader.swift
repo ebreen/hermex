@@ -56,105 +56,212 @@ struct ChatComposerConfigState: Equatable, Sendable {
 struct ChatComposerConfigLoadResult: Sendable {
     let state: ChatComposerConfigState
     let configurationFailure: ChatComposerConfigFailure?
+    /// Whether the catalog-derived fields in this result were backed by a
+    /// verified base snapshot. A failure may still carry current metadata for
+    /// error publication, but it cannot authorize profile/catalog mutation.
+    let catalogValuesAuthorized: Bool
+    /// The last catalog event metadata accepted while building this result.
+    /// Coordinator callers must revalidate it after later awaits.
+    let catalogMetadata: CatalogEventMetadata?
+    /// The direct neutral snapshot, when the fallback path produced this result.
+    /// Direct callers must revalidate it with the captured operation identity.
+    let catalogSnapshot: CatalogSnapshotResult?
+    let catalogOperationID: UUID?
+    let catalogOperationGeneration: UInt64?
 }
 
 struct ChatComposerConfigLoader {
     private let client: APIClient
+    private let acceptsCatalogEvent: (@Sendable (CatalogEventMetadata) async -> Bool)?
 
     init(client: APIClient) {
-        self.client = client; self.catalogEvents = nil; self.onCatalogReady = nil
+        self.client = client
+        self.catalogEvents = nil
+        self.acceptsCatalogEvent = nil
+        self.onCatalogReady = nil
     }
 
     func loadConfigurationFromClient(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
+        return await loadConfigurationFromClient(
+            from: initialState,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+    }
+
+    /// Direct composer fallback with caller-owned operation identity. The
+    /// caller captures both values before the snapshot await so acceptance
+    /// cannot be self-bound to returned metadata.
+    func loadConfigurationFromClient(
+        from initialState: ChatComposerConfigState,
+        operationID: UUID,
+        operationGeneration: UInt64
+    ) async -> ChatComposerConfigLoadResult {
         var state = initialState
         var configurationError: Error?
+        var selectedProfile: ProfileSummary?
+        let requestedProfile = Self.nonEmpty(state.currentProfile)
 
-        do {
-            // Raw profile read under the Networking compatibility lease (issue
-            // #16 Slice 1). An epoch-advanced result (a concurrent profile
-            // switch) is discarded before it can mutate state; the next
-            // configuration load reconciles.
-            var selectedProfile: ProfileSummary?
-            let profilesEnvelope = try await client.compatibilityProfiles(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: profilesEnvelope.gateEpoch, gateKey: profilesEnvelope.gateKey) {
-                let profilesResponse = profilesEnvelope.value
-                state.profileOptions = profilesResponse.profiles ?? []
-                state.isSingleProfileMode = profilesResponse.singleProfileMode ?? false
-                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                    ?? Self.nonEmpty(profilesResponse.active)
-                    ?? profilesResponse.effectiveDefaultProfileName
+        // This compatibility initializer is retained for callers that do not
+        // inject the Chat coordinator. It still consumes the same neutral,
+        // coordinator-backed operation as the ordered `modelCatalogStream`:
+        // profile verification, base/live reads, and terminal fencing are owned
+        // by Networking. The loader never switches profiles or decodes legacy
+        // profile/catalog DTOs itself.
+        let catalogResult = await client.modelCatalogSnapshot(
+            requestedProfile: requestedProfile,
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
 
-                if let sessionProfile = Self.nonEmpty(state.currentProfile),
-                   Self.nonEmpty(profilesResponse.active) != sessionProfile {
-                    let switchResponse = try await client.switchProfile(name: sessionProfile)
-                    state.profileOptions = switchResponse.profiles ?? state.profileOptions
-                    state.selectedProfileName = Self.nonEmpty(switchResponse.active) ?? sessionProfile
-                    state.currentProfile = state.selectedProfileName
-
-                    if state.currentWorkspace == nil {
-                        state.currentWorkspace = Self.nonEmpty(switchResponse.defaultWorkspace)
-                    }
-
-                    if state.currentModel == nil {
-                        state.currentModel = Self.nonEmpty(switchResponse.defaultModel)
-                    }
-                }
-
-                selectedProfile = Self.profileSummary(
-                    matching: state.selectedProfileName,
-                    in: state.profileOptions
-                )
-                if state.currentModel == nil {
-                    state.currentModel = Self.nonEmpty(selectedProfile?.model)
-                }
-            }
-
-            // Base catalog under the same shared compatibility lease; an
-            // epoch-advanced result is discarded before state mutation.
-            let modelsEnvelope = try await client.compatibilityModels(operationID: UUID(), operationGeneration: 1)
-            if await client.acceptsCompatibilityEpoch(gateEpoch: modelsEnvelope.gateEpoch, gateKey: modelsEnvelope.gateKey) {
-                let modelsResponse = modelsEnvelope.value
-                state.modelCatalogGroups = modelsResponse.groups
-                if state.currentModel == nil {
-                    state.currentModel = modelsResponse.defaultModel
-                }
-                if Self.nonEmpty(state.currentModelProvider) == nil {
-                    state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
-                        ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
-                }
-            }
-
-            // Scope the query to the session's resolved model/provider so the
-            // gating fields are model-accurate (issue #18); the seeded effort is
-            // the server's already-coerced value for that model.
-            let reasoningResponse = try await client.reasoning(
-                model: Self.nonEmpty(state.currentModel),
-                provider: Self.nonEmpty(state.currentModelProvider)
+        // Do not apply a snapshot after cancellation, an operation mismatch, or
+        // an authoritative gate-epoch change. This is the snapshot equivalent
+        // of the coordinator's accepts(metadata) check before MainActor apply.
+        guard !Task.isCancelled,
+              catalogResult.metadata.operationID == operationID,
+              catalogResult.metadata.operationGeneration == operationGeneration,
+              await client.acceptsCatalogSnapshot(
+                  catalogResult,
+                  operationID: operationID,
+                  operationGeneration: operationGeneration
+              )
+        else {
+            configurationError = NSError(
+                domain: "ChatComposerConfigLoader",
+                code: ChatComposerConfigFailure.catalogUnavailable.code,
+                userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription]
             )
-            state.selectedReasoningEffort = reasoningResponse.effectiveEffort
-            state.supportedReasoningEfforts = reasoningResponse.normalizedSupportedEfforts
-            state.supportsReasoningEffort = reasoningResponse.supportsReasoningEffort
-
-            let workspaceResponse = try await client.workspaces()
-            state.workspaceRoots = workspaceResponse.workspaces ?? []
-            if state.currentWorkspace == nil {
-                state.currentWorkspace = workspaceResponse.last ?? state.workspaceRoots.compactMap(\.path).first
-            }
-            state.workspaceSuggestions = state.workspaceRoots.compactMap(\.path)
-        } catch {
-            configurationError = error
+            return await finishDirectLoad(
+                state: state,
+                configurationError: configurationError,
+                client: client,
+                catalogSnapshot: catalogResult,
+                catalogOperationID: operationID,
+                catalogOperationGeneration: operationGeneration
+            )
         }
 
+        if let context = catalogResult.context {
+            state.profileOptions = context.profiles
+            state.isSingleProfileMode = context.singleProfileMode
+            state.selectedProfileName = Self.nonEmpty(context.activeProfile)
+                ?? context.requestedProfile
+            state.currentProfile = state.selectedProfileName
+            selectedProfile = Self.profileSummary(
+                matching: state.selectedProfileName,
+                in: state.profileOptions
+            )
+            if state.currentWorkspace == nil {
+                state.currentWorkspace = Self.nonEmpty(context.defaults.workspace)
+            }
+            if state.currentModel == nil {
+                state.currentModel = Self.nonEmpty(context.defaults.model)
+                    ?? Self.nonEmpty(selectedProfile?.model)
+            }
+        }
+
+        if let base = catalogResult.base {
+            state.modelCatalogGroups = base.groups
+            if state.currentModel == nil {
+                state.currentModel = base.defaultModel
+            }
+            if Self.nonEmpty(state.currentModelProvider) == nil {
+                state.currentModelProvider = Self.nonEmpty(selectedProfile?.provider)
+                    ?? Self.nonEmpty(base.activeProvider)
+                    ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
+            }
+            // A live failure is non-terminal when a usable base was accepted.
+            // Preserve the base projection, but expose the scoped failure so
+            // the caller can report degraded live data without discarding rows.
+            if let failure = catalogResult.failure {
+                configurationError = Self.error(for: failure)
+            }
+        } else {
+            configurationError = Self.error(for: catalogResult.failure ?? .transport)
+        }
+
+        if catalogResult.base != nil {
+            do {
+                let reasoningResponse = try await client.reasoning(
+                    model: Self.nonEmpty(state.currentModel),
+                    provider: Self.nonEmpty(state.currentModelProvider)
+                )
+                state.selectedReasoningEffort = reasoningResponse.effectiveEffort
+                state.supportedReasoningEfforts = reasoningResponse.normalizedSupportedEfforts
+                state.supportsReasoningEffort = reasoningResponse.supportsReasoningEffort
+            } catch {
+                if configurationError == nil { configurationError = error }
+            }
+
+            do {
+                let workspaceResponse = try await client.workspaces()
+                state.workspaceRoots = workspaceResponse.workspaces ?? []
+                if state.currentWorkspace == nil {
+                    state.currentWorkspace = workspaceResponse.last ?? state.workspaceRoots.compactMap(\.path).first
+                }
+                state.workspaceSuggestions = state.workspaceRoots.compactMap(\.path)
+            } catch {
+                if configurationError == nil { configurationError = error }
+            }
+        }
+
+        return await finishDirectLoad(
+            state: state,
+            configurationError: configurationError,
+            client: client,
+            catalogSnapshot: catalogResult,
+            catalogOperationID: operationID,
+            catalogOperationGeneration: operationGeneration
+        )
+    }
+
+    private func finishDirectLoad(
+        state: ChatComposerConfigState,
+        configurationError: Error?,
+        client: APIClient,
+        catalogSnapshot: CatalogSnapshotResult,
+        catalogOperationID: UUID,
+        catalogOperationGeneration: UInt64
+    ) async -> ChatComposerConfigLoadResult {
+        var state = state
         do {
             state.agentCommands = (try await client.commands()).commands ?? []
         } catch {
             state.agentCommands = []
         }
-
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationFailure: Self.failureCategory(from: configurationError)
+            configurationFailure: Self.failureCategory(from: configurationError),
+            catalogValuesAuthorized: catalogSnapshot.base != nil,
+            catalogMetadata: nil,
+            catalogSnapshot: catalogSnapshot,
+            catalogOperationID: catalogOperationID,
+            catalogOperationGeneration: catalogOperationGeneration
         )
+    }
+
+    private static func error(for failure: CatalogFailureCategory) -> Error {
+        switch failure {
+        case .profileUnavailable, .profileMismatch, .unknownContext:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileUnavailable.localizedDescription])
+        case .profileSwitchRejected:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.profileSwitchRejected.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.profileSwitchRejected.localizedDescription])
+        default:
+            return NSError(domain: "ChatComposerConfigLoader", code: ChatComposerConfigFailure.catalogUnavailable.code, userInfo: [NSLocalizedDescriptionKey: ChatComposerConfigFailure.catalogUnavailable.localizedDescription])
+        }
+    }
+
+    private static func failure(for failure: CatalogFailureCategory) -> ChatComposerConfigFailure {
+        switch failure {
+        case .profileUnavailable, .profileMismatch, .unknownContext:
+            return .profileUnavailable
+        case .profileSwitchRejected:
+            return .profileSwitchRejected
+        default:
+            return .catalogUnavailable
+        }
     }
 
     private static func failureCategory(from error: Error?) -> ChatComposerConfigFailure? {
@@ -210,18 +317,21 @@ struct ChatComposerConfigLoader {
     init(
         client: APIClient,
         catalogEvents: AsyncStream<CatalogEvent>,
+        acceptsCatalogEvent: @escaping @Sendable (CatalogEventMetadata) async -> Bool,
         onCatalogReady: @escaping @MainActor @Sendable (CatalogBaseSnapshot) -> Void
     ) {
         self.client = client
         self.catalogEvents = catalogEvents
+        self.acceptsCatalogEvent = acceptsCatalogEvent
         self.onCatalogReady = onCatalogReady
     }
 
     func loadConfiguration(from initialState: ChatComposerConfigState) async -> ChatComposerConfigLoadResult {
-        if let catalogEvents, let onCatalogReady {
+        if let catalogEvents, let acceptsCatalogEvent, let onCatalogReady {
             return await loadConfigurationFromCatalog(
                 from: initialState,
                 catalogEvents: catalogEvents,
+                acceptsCatalogEvent: acceptsCatalogEvent,
                 onCatalogReady: onCatalogReady
             )
         }
@@ -231,6 +341,7 @@ struct ChatComposerConfigLoader {
     private func loadConfigurationFromCatalog(
         from initialState: ChatComposerConfigState,
         catalogEvents: AsyncStream<CatalogEvent>,
+        acceptsCatalogEvent: @escaping @Sendable (CatalogEventMetadata) async -> Bool,
         onCatalogReady: @escaping @MainActor @Sendable (CatalogBaseSnapshot) -> Void
     ) async -> ChatComposerConfigLoadResult {
         var state = initialState
@@ -241,15 +352,26 @@ struct ChatComposerConfigLoader {
         // invoked exactly once, immediately after parsing/defaulting and
         // before any reasoning request is awaited.
         var publishedSnapshot: CatalogBaseSnapshot?
+        var acceptedCatalogMetadata: CatalogEventMetadata?
         var sawContextVerified = false
         var sawBase = false
+        var sawLiveOutcome = false
         for await event in catalogEvents {
+            guard let metadata = Self.catalogEventMetadata(for: event),
+                  await acceptsCatalogEvent(metadata)
+            else {
+                // Readiness transitions intentionally carry no metadata and
+                // cannot authorize a composer mutation. Stale metadata-bearing
+                // events are rejected by the coordinator acceptance closure.
+                continue
+            }
+
             switch event {
-            case let .contextVerified(_, context):
+            case let .contextVerified(metadata, context):
+                acceptedCatalogMetadata = metadata
                 sawContextVerified = true
                 state.profileOptions = context.profiles
-                state.selectedProfileName = Self.nonEmpty(state.currentProfile)
-                    ?? Self.nonEmpty(context.activeProfile)
+                state.selectedProfileName = Self.nonEmpty(context.activeProfile)
                     ?? context.requestedProfile
                 state.isSingleProfileMode = context.singleProfileMode
                 state.currentProfile = state.selectedProfileName
@@ -259,7 +381,12 @@ struct ChatComposerConfigLoader {
                 if state.currentModel == nil {
                     state.currentModel = Self.nonEmpty(context.defaults.model)
                 }
+                if Self.nonEmpty(state.currentModelProvider) == nil,
+                   let profile = context.profiles.first(where: { $0.normalizedName == context.activeProfile }) {
+                    state.currentModelProvider = Self.nonEmpty(profile.provider)
+                }
             case let .base(snapshot):
+                acceptedCatalogMetadata = snapshot.metadata
                 sawBase = true
                 state.modelCatalogGroups = snapshot.groups
                 if state.currentModel == nil {
@@ -270,10 +397,17 @@ struct ChatComposerConfigLoader {
                         ?? Self.uniqueProvider(for: state.currentModel, in: state.modelCatalogGroups)
                 }
                 publishedSnapshot = snapshot
-            case .live, .liveFailed, .failed, .finished, .cancelled, .contextReset, .state:
+            case .live:
+                sawLiveOutcome = true
+            case let .liveFailed(_, failure):
+                sawLiveOutcome = true
+                if configurationFailure == nil {
+                    configurationFailure = Self.failure(for: failure)
+                }
+            case .failed, .finished, .cancelled, .contextReset, .state:
                 break
             }
-            if sawContextVerified, sawBase {
+            if sawContextVerified, sawBase, sawLiveOutcome {
                 break
             }
         }
@@ -324,8 +458,32 @@ struct ChatComposerConfigLoader {
 
         return ChatComposerConfigLoadResult(
             state: state,
-            configurationFailure: configurationFailure
+            configurationFailure: configurationFailure,
+            catalogValuesAuthorized: publishedSnapshot != nil,
+            catalogMetadata: acceptedCatalogMetadata,
+            catalogSnapshot: nil,
+            catalogOperationID: acceptedCatalogMetadata?.operationID,
+            catalogOperationGeneration: acceptedCatalogMetadata?.operationGeneration
         )
+    }
+
+    private static func catalogEventMetadata(for event: CatalogEvent) -> CatalogEventMetadata? {
+        switch event {
+        case let .contextVerified(metadata, _),
+             let .liveFailed(metadata, _),
+             let .finished(metadata),
+             let .cancelled(metadata),
+             let .contextReset(metadata):
+            return metadata
+        case let .failed(metadata, _, _):
+            return metadata
+        case let .base(snapshot):
+            return snapshot.metadata
+        case let .live(snapshot):
+            return snapshot.metadata
+        case .state:
+            return nil
+        }
     }
 }
 

@@ -584,10 +584,20 @@ final class ChatViewModel {
             return String(localized: "Model")
         }
 
-        let catalogName = modelCatalogGroups
-            .flatMap(\.models)
-            .firstMatchingSelection(modelID: currentModel, providerID: currentModelProvider)?
-            .displayName
+        // A title is only authoritative when the selected provider is known.
+        // Model IDs are not globally unique across providers, so never choose
+        // the first same-ID option as a title fallback.
+        let catalogName: String?
+        if let provider = Self.nonEmpty(currentModelProvider) {
+            catalogName = modelCatalogGroups
+                .flatMap(\.models)
+                .first { option in
+                    option.id == currentModel && option.providerID == provider
+                }?
+                .displayName
+        } else {
+            catalogName = nil
+        }
 
         return catalogName ?? Self.compactModelTitle(currentModel)
     }
@@ -744,7 +754,26 @@ final class ChatViewModel {
                 continue
             }
 
-            applyComposerConfigurationState(result.state, preservingSelectionFrom: initialState)
+            guard await acceptsComposerConfigurationCatalog(result) else {
+                needsComposerConfigurationReload = true
+                continue
+            }
+
+            var stateToApply = result.state
+            if !result.catalogValuesAuthorized {
+                // Preserve the last verified catalog projection while still
+                // applying reasoning/workspace/command results and reporting a
+                // current catalog failure.
+                stateToApply.currentWorkspace = initialState.currentWorkspace
+                stateToApply.currentModel = initialState.currentModel
+                stateToApply.currentModelProvider = initialState.currentModelProvider
+                stateToApply.currentProfile = initialState.currentProfile
+                stateToApply.selectedProfileName = initialState.selectedProfileName
+                stateToApply.modelCatalogGroups = initialState.modelCatalogGroups
+                stateToApply.profileOptions = initialState.profileOptions
+                stateToApply.isSingleProfileMode = initialState.isSingleProfileMode
+            }
+            applyComposerConfigurationState(stateToApply, preservingSelectionFrom: initialState)
 
             if let error = result.configurationError {
                 lastError = error
@@ -753,30 +782,42 @@ final class ChatViewModel {
         } while needsComposerConfigurationReload
     }
 
-    /// Refreshes the model catalog when a picker opens: refetch `/api/models`
-    /// through the Networking compatibility lease (so the sheet stops pinning
-    /// the chat-load-time snapshot), then overlay the active provider's live
-    /// list from `/api/models/live`. Failures are silent by design — the
-    /// picker keeps whatever it already shows. An epoch-advanced envelope (a
-    /// profile switch raced this refresh) is discarded before state mutation.
+    /// Refreshes the model catalog when a picker opens through the Networking
+    /// neutral ordered stream. Each projection is revalidated immediately after
+    /// the await and before it mutates MainActor state; a profile switch that
+    /// advances the authoritative epoch silently drops the old result.
     func refreshModelCatalogForPickerOpen() async {
-        if let envelope = try? await client.compatibilityModels(operationID: UUID(), operationGeneration: 1),
-           await client.acceptsCompatibilityEpoch(gateEpoch: envelope.gateEpoch, gateKey: envelope.gateKey) {
-            let groups = envelope.value.groups
-            if !groups.isEmpty {
-                modelCatalogGroups = groups
-            }
-        }
-
-        if let live = try? await client.compatibilityModelsLive(operationID: UUID(), operationGeneration: 1),
-           await client.acceptsCompatibilityEpoch(gateEpoch: live.gateEpoch, gateKey: live.gateKey) {
-            // The live compatibility snapshot merges onto an empty base in
-            // this fencing slice, so an empty result keeps the cached groups;
-            // the coordinator-owned neutral surface (Slice 3/4) carries the
-            // full merged projection.
-            let liveGroups = live.value.groups
-            if !liveGroups.isEmpty {
-                modelCatalogGroups = liveGroups
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
+        let stream = await client.modelCatalogStream(
+            requestedProfile: Self.nonEmpty(currentProfile),
+            operationID: operationID,
+            operationGeneration: operationGeneration
+        )
+        for await event in stream {
+            switch event {
+            case let .base(snapshot):
+                guard await client.acceptsCatalogMetadata(
+                    snapshot.metadata,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                ) else { return }
+                if !snapshot.groups.isEmpty {
+                    modelCatalogGroups = snapshot.groups
+                }
+            case let .live(snapshot):
+                guard await client.acceptsCatalogMetadata(
+                    snapshot.metadata,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                ) else { return }
+                if !snapshot.groups.isEmpty {
+                    modelCatalogGroups = snapshot.groups
+                }
+            case .contextVerified, .liveFailed:
+                continue
+            case .failed, .finished, .cancelled:
+                return
             }
         }
     }
@@ -861,7 +902,19 @@ final class ChatViewModel {
             await refreshModelCatalogForPickerOpen()
             return
         }
+        startCatalogMonitorIfNeeded()
         await modelCatalogCoordinator.openPicker()
+        await applyCurrentCatalogState(from: modelCatalogCoordinator)
+    }
+
+    /// Applies the coordinator's fenced readiness projection. The compatibility
+    /// `.state` event is intentionally ignored as an untrusted hint; callers
+    /// use this snapshot after an awaited open to recover the authoritative
+    /// state without accepting metadata-free input.
+    private func applyCurrentCatalogState(from coordinator: ChatModelCatalogCoordinator) async {
+        guard let snapshot = await coordinator.currentStateSnapshot(),
+              await coordinator.accepts(snapshot.metadata) else { return }
+        catalogCacheState = snapshot.state
     }
 
     /// Applies one catalog event after authoritative revalidation. The VM
@@ -870,9 +923,14 @@ final class ChatViewModel {
     /// any event lands in MainActor state after an await.
     private func applyCatalogEvent(_ event: CatalogEvent, from coordinator: ChatModelCatalogCoordinator) async {
         guard let metadata = event.catalogMetadata else {
-            if case let .state(cacheState) = event {
-                catalogCacheState = cacheState
-            }
+            // `.state` carries no operation or gate metadata and cannot
+            // authorize a MainActor mutation. Replace its payload with the
+            // coordinator's current fenced snapshot and validate that token
+            // immediately before applying the readiness state.
+            guard case .state = event,
+                  let snapshot = await coordinator.currentStateSnapshot(),
+                  await coordinator.accepts(snapshot.metadata) else { return }
+            catalogCacheState = snapshot.state
             return
         }
 
@@ -894,6 +952,41 @@ final class ChatViewModel {
         }
     }
 
+    private func acceptsComposerConfigurationCatalog(
+        _ result: ChatComposerConfigLoadResult
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+
+        if let snapshot = result.catalogSnapshot,
+           let operationID = result.catalogOperationID,
+           let operationGeneration = result.catalogOperationGeneration {
+            if snapshot.context != nil || snapshot.base != nil {
+                return await client.acceptsCatalogSnapshot(
+                    snapshot,
+                    operationID: operationID,
+                    operationGeneration: operationGeneration
+                )
+            }
+            // A current failure-shaped snapshot may publish its scoped error and
+            // clear loading state, but it must not authorize catalog values.
+            return await client.acceptsCatalogMetadata(
+                snapshot.metadata,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
+        }
+
+        if let metadata = result.catalogMetadata,
+           let modelCatalogCoordinator {
+            return await modelCatalogCoordinator.accepts(metadata)
+        }
+
+        // A result without an accepted catalog token is a catalog failure. Keep
+        // failure observability intact; there is no catalog-derived state to
+        // authorize or overwrite.
+        return result.catalogMetadata == nil && result.catalogSnapshot == nil
+    }
+
     /// Loads the composer configuration through the coordinator-owned catalog
     /// surface when present, preserving the legacy direct path otherwise.
     private func loadComposerConfigurationResult(
@@ -906,12 +999,21 @@ final class ChatViewModel {
             return await ChatComposerConfigLoader(
                 client: client,
                 catalogEvents: catalogStream,
+                acceptsCatalogEvent: { metadata in
+                    await modelCatalogCoordinator.accepts(metadata)
+                },
                 onCatalogReady: { @MainActor _ in }
             )
             .loadConfiguration(from: initialState)
         }
+        let operationID = UUID()
+        let operationGeneration: UInt64 = 1
         return await ChatComposerConfigLoader(client: client)
-            .loadConfiguration(from: initialState)
+            .loadConfigurationFromClient(
+                from: initialState,
+                operationID: operationID,
+                operationGeneration: operationGeneration
+            )
     }
 
     /// Applies the loaded state without clobbering a newer user selection:

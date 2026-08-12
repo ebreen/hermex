@@ -5474,6 +5474,7 @@ final class ChatViewModelSendTests: XCTestCase {
         let openRouterModel = "deepseek/deepseek-chat-v3-0324:free"
         let streamClient = SpySSEStreamingClient()
         var requestPaths: [String] = []
+        let switchedToWork = LockedFlag()
         let viewModel = try makeViewModel(
             streamClient: streamClient,
             sessionSummary: makeSession(model: nil, modelProvider: nil, profile: "work")
@@ -5482,16 +5483,19 @@ final class ChatViewModelSendTests: XCTestCase {
 
             switch request.url?.path {
             case "/api/profiles":
+                let active = switchedToWork.value ? "work" : "default"
+                let workActive = switchedToWork.value ? "true" : "false"
                 return apiTestJSONResponse("""
                 {
-                  "active": "default",
+                  "active": "\(active)",
                   "profiles": [
                     {"name": "default", "model": "gpt-5.4", "provider": "openai", "is_default": true},
-                    {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter"}
+                    {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter", "is_active": \(workActive)}
                   ]
                 }
                 """, for: request)
             case "/api/profile/switch":
+                switchedToWork.value = true
                 let body = try XCTUnwrap(apiTestJSONBody(from: request))
                 XCTAssertEqual(body["name"] as? String, "work")
                 return apiTestJSONResponse("""
@@ -5518,6 +5522,15 @@ final class ChatViewModelSendTests: XCTestCase {
                         {"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}
                       ]
                     }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [
+                    {"id": "\(openRouterModel)", "name": "DeepSeek Chat v3 Free"}
                   ]
                 }
                 """, for: request)
@@ -5552,7 +5565,9 @@ final class ChatViewModelSendTests: XCTestCase {
         XCTAssertEqual(requestPaths, [
             "/api/profiles",
             "/api/profile/switch",
+            "/api/profiles",
             "/api/models",
+            "/api/models/live",
             "/api/reasoning",
             "/api/workspaces",
             "/api/commands",
@@ -5599,6 +5614,15 @@ final class ChatViewModelSendTests: XCTestCase {
                         {"id": "\(sessionModel)", "name": "GPT 5.5"}
                       ]
                     }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openrouter",
+                  "models": [
+                    {"id": "\(openRouterDefault)", "name": "DeepSeek Chat v3 Free"}
                   ]
                 }
                 """, for: request)
@@ -5697,6 +5721,15 @@ final class ChatViewModelSendTests: XCTestCase {
                         {"id": "gpt-5.4", "name": "GPT 5.4"}
                       ]
                     }
+                  ]
+                }
+                """, for: request)
+            case "/api/models/live":
+                return apiTestJSONResponse("""
+                {
+                  "provider": "openai",
+                  "models": [
+                    {"id": "gpt-5.4", "name": "GPT 5.4"}
                   ]
                 }
                 """, for: request)
@@ -6319,9 +6352,11 @@ final class ChatViewModelSendTests: XCTestCase {
             ) { request in
                 switch request.url?.path {
                 case "/api/profiles":
-                    return apiTestJSONResponse(#"{"profiles": []}"#, for: request)
+                    return apiTestJSONResponse(#"{"active": "default", "profiles": [{"name": "default", "is_active": true}], "single_profile_mode": true}"#, for: request)
                 case "/api/models":
                     return apiTestJSONResponse(modelsJSON, for: request)
+                case "/api/models/live":
+                    return apiTestJSONResponse(#"{"provider": "openai", "models": []}"#, for: request)
                 case "/api/reasoning":
                     return apiTestJSONResponse(#"{"reasoning_effort": "medium"}"#, for: request)
                 case "/api/workspaces":
@@ -8606,6 +8641,24 @@ private final class LockedCounter {
         defer { lock.unlock() }
 
         return value
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedValue
+        }
+        set {
+            lock.lock()
+            storedValue = newValue
+            lock.unlock()
+        }
     }
 }
 
