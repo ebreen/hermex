@@ -722,6 +722,58 @@ final class ChatModelCatalogCoordinatorTests: XCTestCase {
         await cancel(subscriber)
     }
 
+    func testRequestedProfileRebindsCoordinatorAfterGateEpochAdvances() async throws {
+        let harness = makeHarness(requestedProfile: "work")
+        let subscriber = await makeSubscriber(harness.coordinator)
+
+        await harness.coordinator.openPicker()
+        await harness.provider.waitForCallCount(1)
+        let call = harness.provider.call(0)
+
+        try await advanceGateEpoch(gateKey: harness.gateKey)
+        let switchedMetadata = provisionalMetadata(
+            gateKey: harness.gateKey,
+            apiClientID: harness.apiClientID,
+            requestedProfile: "work",
+            startingGateEpoch: 1,
+            operationID: call.operationID,
+            operationGeneration: call.operationGeneration
+        )
+        call.continuation.yield(
+            .contextVerified(switchedMetadata, makeProfileContext(activeProfile: "work"))
+        )
+        call.continuation.yield(
+            .base(
+                makeBaseSnapshot(
+                    metadata: switchedMetadata,
+                    groups: [makeGroup(providerID: "openai", modelIDs: ["gpt-5"])],
+                    defaultModel: "gpt-5",
+                    activeProvider: "openai"
+                )
+            )
+        )
+        call.continuation.yield(.finished(switchedMetadata))
+        call.continuation.finish()
+
+        await subscriber.collector.waitUntil { events in
+            events.contains { event in
+                if case let .base(snapshot) = event {
+                    return snapshot.metadata == switchedMetadata
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(
+            subscriber.collector.snapshot().contains { event in
+                if case .finished = event { return true }
+                return false
+            },
+            "the post-switch operation must reach its terminal event"
+        )
+        await cancel(subscriber)
+    }
+
+
     func testInitialLoadAndPickerRefreshShareOneOperation() async throws {
         let harness = makeHarness()
         let subscriber = await makeSubscriber(harness.coordinator)

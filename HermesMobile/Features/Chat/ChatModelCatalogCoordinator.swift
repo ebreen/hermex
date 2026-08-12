@@ -405,7 +405,30 @@ actor ChatModelCatalogCoordinator {
         return true
     }
 
-    // MARK: Network event handling
+    /// Rebinds the provisional operation identity after Networking completes a
+    /// requested-profile switch. The operation UUID/generation stays stable;
+    /// only the authoritative gate epoch changes. This is the one permitted
+    /// identity transition inside an operation.
+    private func rebindOperationKeyIfNeeded(
+        _ metadata: CatalogEventMetadata,
+        gateEpoch: UInt64
+    ) -> Bool {
+        guard case let .provisional(key) = metadata.identity,
+              let current = currentOperation,
+              current.operationID == metadata.operationID,
+              current.operationGeneration == metadata.operationGeneration,
+              key.gateKey == current.operationKey.gateKey,
+              key.apiClientID == current.operationKey.apiClientID,
+              key.authGeneration == current.operationKey.authGeneration,
+              key.requestedProfile != nil,
+              key.requestedProfile == current.operationKey.requestedProfile,
+              key.startingGateEpoch == gateEpoch,
+              key.startingGateEpoch >= current.operationKey.startingGateEpoch
+        else { return false }
+        currentOperation?.operationKey = key
+        return true
+    }
+
 
     /// Actor-serialized handler for one network event. Every event is fenced
     /// twice: once against the current operation identity (UUID/generation)
@@ -421,19 +444,33 @@ actor ChatModelCatalogCoordinator {
         let gate = ProfileContextGateRegistry.shared.gate(for: initial.operationKey.gateKey)
         let authoritativeEpoch = await gate.gateEpoch
 
-        // This pre-handler check is intentionally not the publication fence.
-        // Every branch below repeats the complete check immediately before its
-        // own multicast yield.
         guard !Task.isCancelled,
-              authoritativeEpoch == initial.operationKey.startingGateEpoch,
+              let metadata = event.eventMetadata,
+              metadata.operationID == operationID,
+              metadata.operationGeneration == initial.operationGeneration,
               let current = currentOperation,
               current.operationID == operationID,
               current.operationGeneration == initial.operationGeneration,
-              !current.isTerminal,
-              let metadata = event.eventMetadata,
-              metadata.operationID == current.operationID,
-              metadata.operationGeneration == current.operationGeneration
+              !current.isTerminal
         else { return }
+
+        // Networking rebinds the provisional metadata after a requested
+        // profile switch advances the shared gate epoch. Rebind the same
+        // coordinator operation before the normal publication fence runs.
+        if case let .provisional(key) = metadata.identity,
+           key.startingGateEpoch != current.operationKey.startingGateEpoch {
+            guard rebindOperationKeyIfNeeded(metadata, gateEpoch: authoritativeEpoch) else { return }
+        }
+
+        guard !Task.isCancelled,
+              let current = currentOperation,
+              current.operationID == operationID,
+              current.operationGeneration == initial.operationGeneration,
+              !current.isTerminal
+        else { return }
+
+        let reboundEpoch = current.operationKey.startingGateEpoch
+        guard authoritativeEpoch == reboundEpoch else { return }
 
         switch event {
         case let .contextVerified(metadata, context):
@@ -998,7 +1035,7 @@ actor ChatModelCatalogCoordinator {
 private struct CurrentOperation: Sendable {
     let operationID: UUID
     let operationGeneration: UInt64
-    let operationKey: CatalogOperationKey
+    var operationKey: CatalogOperationKey
     var verifiedContextKey: CatalogContextKey?
     var profileContext: CatalogProfileContext?
     /// A live snapshot that arrived before the base; flushed after the base
