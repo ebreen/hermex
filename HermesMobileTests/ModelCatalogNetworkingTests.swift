@@ -821,6 +821,62 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         } catch {
             XCTAssertTrue(error is CancellationError)
         }
+
+        // Hold the gate so the canceled operation has a deterministic waiting
+        // point. The registration is complete, the body task is queued, and the
+        // writer is queued behind it before cancellation is replayed by attach.
+        let gate = makeIsolatedGate()
+        let heldOperationID = UUID()
+        let canceledOperationID = UUID()
+        let writerOperationID = UUID()
+        let heldReader = makeReaderTask(gate: gate, operationID: heldOperationID)
+        _ = await heldReader.admitted.first(where: { _ in true })
+
+        let gateCancellation = CatalogTaskCancellationBox<Void, Error>()
+        await gate.registerCancellation(operationID: canceledOperationID) {
+            gateCancellation.cancel()
+        }
+        let bodyTask = Task { () throws -> Void in
+            let admission = try await gate.acquireReader(operationID: canceledOperationID)
+            await gate.releaseReader(operationID: canceledOperationID, admission: admission)
+        }
+        await gate.waitForLeaseState(canceledOperationID, .waitingReader)
+
+        let writer = makeWriterTask(gate: gate, operationID: writerOperationID)
+        await gate.waitForLeaseState(writerOperationID, .waitingWriter)
+
+        // This is the registration-to-attachment window: the gate invokes the
+        // lock-protected hook before the body task is attached to the box.
+        await gate.cancel(operationID: canceledOperationID)
+        gateCancellation.attach(bodyTask)
+
+        do {
+            _ = try await bodyTask.value
+            XCTFail("the pre-attachment cancellation must prevent reader admission")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let canceledLeaseState = await gate.leaseState(of: canceledOperationID)
+        XCTAssertNil(canceledLeaseState, "pre-attachment cancellation leaves no reader lease")
+        let beforeRelease = await gate.snapshot()
+        XCTAssertFalse(beforeRelease.heldReaders.contains(canceledOperationID))
+        XCTAssertEqual(beforeRelease.waitingWriters, [writerOperationID])
+        await gate.unregisterCancellation(operationID: canceledOperationID)
+
+        heldReader.release.yield(())
+        let writerAdmission = await writer.admitted.first(where: { _ in true })
+        XCTAssertNotNil(writerAdmission, "the queued writer proceeds after the canceled reader drains")
+        let writerState = await gate.leaseState(of: writerOperationID)
+        XCTAssertEqual(writerState, .heldWriter)
+        writer.release.yield(())
+
+        _ = await heldReader.task.value
+        _ = await writer.task.value
+        let finalState = await gate.snapshot()
+        XCTAssertTrue(finalState.heldReaders.isEmpty)
+        XCTAssertNil(finalState.heldWriter)
+        XCTAssertTrue(finalState.waitingReaders.isEmpty)
+        XCTAssertTrue(finalState.waitingWriters.isEmpty)
     }
 
     func testQueuedReadersAndWritersMakeProgressWithoutStarvation() async throws {
