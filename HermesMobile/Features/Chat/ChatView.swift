@@ -367,10 +367,10 @@ struct ChatView: View {
             session: session,
             server: server,
             client: resolvedClient,
-            modelCatalogCoordinator: catalogCoordinator,
             // Production terminal persistence: the real CacheStore-backed
             // writer — never a no-op (#18 §522).
             terminalCacheWriter: CacheStoreTerminalCacheWriter(serverURL: server),
+            modelCatalogCoordinator: catalogCoordinator,
             showsLiveActivityResponseExcerpts: UserDefaults.standard.bool(
                 forKey: AgentRunLiveActivityPrivacy.showsResponseExcerptsKey
             )
