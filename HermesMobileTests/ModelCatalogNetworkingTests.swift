@@ -730,6 +730,65 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         _ = await queuedReader.task.value
     }
 
+    func testReaderCohortAdmitsConcurrentReadersBeforeWriter() async throws {
+        let gate = makeIsolatedGate()
+        let firstReaderID = UUID()
+        let secondReaderID = UUID()
+        let writerID = UUID()
+        let lateReaderID = UUID()
+
+        let firstReader = makeReaderTask(gate: gate, operationID: firstReaderID)
+        let secondReader = makeReaderTask(gate: gate, operationID: secondReaderID)
+        _ = await firstReader.admitted.first(where: { _ in true })
+        _ = await secondReader.admitted.first(where: { _ in true })
+
+        let writer = makeWriterTask(gate: gate, operationID: writerID)
+        await gate.waitForLeaseState(writerID, .waitingWriter)
+        let lateReader = makeReaderTask(gate: gate, operationID: lateReaderID, holdsAfterAdmission: false)
+        await gate.waitForLeaseState(lateReaderID, .waitingReader)
+
+        let held = await gate.snapshot()
+        XCTAssertEqual(held.heldReaders.count, 2)
+        XCTAssertEqual(Set(held.heldReaders), Set([firstReaderID, secondReaderID]))
+        XCTAssertNil(held.heldWriter)
+        XCTAssertEqual(held.waitingWriters, [writerID])
+        XCTAssertEqual(held.waitingReaders, [lateReaderID])
+
+        firstReader.release.yield(())
+        secondReader.release.yield(())
+        let writerAdmission = await writer.admitted.first(where: { _ in true })
+        XCTAssertNotNil(writerAdmission)
+        writer.release.yield(())
+        let lateReaderAdmission = await lateReader.admitted.first(where: { _ in true })
+        XCTAssertNotNil(lateReaderAdmission)
+
+        _ = await firstReader.task.value
+        _ = await secondReader.task.value
+        _ = await writer.task.value
+        _ = await lateReader.task.value
+    }
+
+    func testCancellationLatchedBeforeCompatibilityTaskAttachment() async throws {
+        let cancellation = CatalogTaskCancellationBox<Bool, Error>()
+        let (releaseStream, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let task = Task { () throws -> Bool in
+            for await _ in releaseStream { break }
+            try Task.checkCancellation()
+            return true
+        }
+
+        cancellation.cancel()
+        cancellation.attach(task)
+        releaseContinuation.yield(())
+
+        do {
+            _ = try await task.value
+            XCTFail("a task attached after cancellation must remain canceled")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
     func testQueuedReadersAndWritersMakeProgressWithoutStarvation() async throws {
         let gate = makeIsolatedGate()
         let firstReader = UUID()
@@ -835,9 +894,10 @@ final class ModelCatalogNetworkingTests: XCTestCase {
         let gateEpoch = await gate.gateEpoch
         XCTAssertEqual(gateEpoch, 1)
         let paths = fixture.requests().compactMap { $0.url?.path }
+        XCTAssertEqual(Array(paths.prefix(3)), ["/api/profiles", "/api/profile/switch", "/api/profiles"])
         XCTAssertEqual(
-            paths,
-            ["/api/profiles", "/api/profile/switch", "/api/profiles", "/api/models", "/api/models/live"]
+            Set(paths.suffix(2)),
+            Set(["/api/models", "/api/models/live"])
         )
         XCTAssertEqual(terminalCount(of: events), 1)
     }
@@ -887,8 +947,9 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             return
         }
         XCTAssertEqual(switchRequest.httpMethod, "POST")
+        let data = try XCTUnwrap(apiTestBodyData(from: switchRequest))
         XCTAssertEqual(
-            try JSONSerialization.jsonObject(with: try XCTUnwrap(switchRequest.httpBody)) as? [String: String],
+            try JSONSerialization.jsonObject(with: data) as? [String: String],
             ["name": "work"]
         )
         XCTAssertTrue(paths.contains("/api/models"))

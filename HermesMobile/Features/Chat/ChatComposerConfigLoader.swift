@@ -337,6 +337,10 @@ struct ChatComposerConfigLoader {
                 if state.currentModel == nil {
                     state.currentModel = Self.nonEmpty(context.defaults.model)
                 }
+                if Self.nonEmpty(state.currentModelProvider) == nil,
+                   let profile = context.profiles.first(where: { $0.normalizedName == context.activeProfile }) {
+                    state.currentModelProvider = Self.nonEmpty(profile.provider)
+                }
             case let .base(snapshot):
                 sawBase = true
                 state.modelCatalogGroups = snapshot.groups

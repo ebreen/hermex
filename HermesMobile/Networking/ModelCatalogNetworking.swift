@@ -574,7 +574,10 @@ actor ProfileContextGate {
         while true {
             purgeCancelledTickets()
             guard let head = queue.first else { return }
-            guard heldWriterID == nil, heldReaderIDs.isEmpty else { return }
+            guard heldWriterID == nil else { return }
+            if head.isWriter {
+                guard heldReaderIDs.isEmpty else { return }
+            }
             queue.removeFirst()
             let admission = CatalogLeaseAdmission(admissionID: UUID(), gateEpoch: epoch)
             if head.serve(admission) {
@@ -1564,8 +1567,8 @@ private extension APIClient {
         // fire into a gap where the reader is already holding a lease but has
         // no hook yet — the hook is the only thing that can cancel a parked
         // wire read. The box is attached synchronously right after the task is
-        // created; a cancel that lands before attach is a no-op and the task
-        // simply runs, mirroring the stream path's box pattern.
+        // created; the cancellation box latches a cancel that lands before
+        // attach and replays it immediately when the task is attached.
         let cancellation = CatalogTaskCancellationBox<CatalogCompatibilityEnvelope<Value>, Error>()
         await gate.registerCancellation(operationID: operationID, hook: { cancellation.cancel() })
         let bodyTask = Task { () throws -> CatalogCompatibilityEnvelope<Value> in
@@ -1717,18 +1720,24 @@ private final class CatalogBaseGroupsBox: @unchecked Sendable {
 /// Strong task handle so an operation-level gate registration can synchronously
 /// cancel the stream task. The box is owned by the stream task itself, so the
 /// handle never outlives the task; there is no retain cycle to break with weak.
-private final class CatalogTaskCancellationBox<Success: Sendable, Failure: Error>: @unchecked Sendable {
+final class CatalogTaskCancellationBox<Success: Sendable, Failure: Error>: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Success, Failure>?
+    private var cancellationRequested = false
 
     func attach(_ task: Task<Success, Failure>) {
         lock.lock()
         self.task = task
+        let shouldCancel = cancellationRequested
         lock.unlock()
+        if shouldCancel {
+            task.cancel()
+        }
     }
 
     func cancel() {
         lock.lock()
+        cancellationRequested = true
         let task = self.task
         lock.unlock()
         task?.cancel()

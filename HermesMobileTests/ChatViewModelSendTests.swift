@@ -5474,6 +5474,7 @@ final class ChatViewModelSendTests: XCTestCase {
         let openRouterModel = "deepseek/deepseek-chat-v3-0324:free"
         let streamClient = SpySSEStreamingClient()
         var requestPaths: [String] = []
+        let switchedToWork = LockedFlag()
         let viewModel = try makeViewModel(
             streamClient: streamClient,
             sessionSummary: makeSession(model: nil, modelProvider: nil, profile: "work")
@@ -5482,16 +5483,19 @@ final class ChatViewModelSendTests: XCTestCase {
 
             switch request.url?.path {
             case "/api/profiles":
+                let active = switchedToWork.value ? "work" : "default"
+                let workActive = switchedToWork.value ? "true" : "false"
                 return apiTestJSONResponse("""
                 {
-                  "active": "default",
+                  "active": "\(active)",
                   "profiles": [
                     {"name": "default", "model": "gpt-5.4", "provider": "openai", "is_default": true},
-                    {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter"}
+                    {"name": "work", "model": "\(openRouterModel)", "provider": "openrouter", "is_active": \(workActive)}
                   ]
                 }
                 """, for: request)
             case "/api/profile/switch":
+                switchedToWork.value = true
                 let body = try XCTUnwrap(apiTestJSONBody(from: request))
                 XCTAssertEqual(body["name"] as? String, "work")
                 return apiTestJSONResponse("""
@@ -8636,6 +8640,24 @@ private final class LockedCounter {
         defer { lock.unlock() }
 
         return value
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = false
+
+    var value: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedValue
+        }
+        set {
+            lock.lock()
+            storedValue = newValue
+            lock.unlock()
+        }
     }
 }
 
