@@ -832,7 +832,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             context.switchResult,
             .switched(defaults: CatalogProfileDefaults(model: "default-model", workspace: "default-space"))
         )
-        XCTAssertEqual(await gate.gateEpoch, 1)
+        let gateEpoch = await gate.gateEpoch
+        XCTAssertEqual(gateEpoch, 1)
         let paths = fixture.requests().compactMap { $0.url?.path }
         XCTAssertEqual(
             paths,
@@ -871,7 +872,8 @@ final class ModelCatalogNetworkingTests: XCTestCase {
             context.switchResult,
             .switched(defaults: CatalogProfileDefaults(model: "work-model", workspace: "work-space"))
         )
-        XCTAssertEqual(await gate.gateEpoch, 1)
+        let gateEpoch = await gate.gateEpoch
+        XCTAssertEqual(gateEpoch, 1)
 
         let requests = fixture.requests()
         let paths = requests.compactMap { $0.url?.path }
