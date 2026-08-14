@@ -438,74 +438,127 @@ final class ChatTranscriptDisplaySettingsTests: XCTestCase {
 }
 
 final class ChatActiveRunStatusPolicyTests: XCTestCase {
-    func testStatusHidesWhenTranscriptBottomIsVisible() {
-        XCTAssertNil(ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: false,
-            hasActiveStream: true,
-            activeStreamRecoveryState: .idle,
-            isCancellingStream: false,
-            isScrolledNearBottom: true
-        ))
+    private let firstIdentity = ChatRunIdentity(
+        sessionID: "session-1",
+        streamID: "stream-1",
+        generation: 1
+    )
+
+    private func snapshot(
+        identity: ChatRunIdentity? = nil,
+        lifecycle: ChatRunStatusLifecycle = .active,
+        recoveryState: ActiveStreamRecoveryState = .idle
+    ) -> ChatRunStatusSnapshot {
+        ChatRunStatusSnapshot(
+            identity: identity ?? firstIdentity,
+            lifecycle: lifecycle,
+            goal: "Finish the release notes",
+            recoveryState: recoveryState
+        )
     }
 
-    func testStatusShowsActiveRunWhenScrolledAwayFromBottom() {
+    func testPolicyDoesNotShowStatusWithoutCoordinatorRunIdentity() {
         let presentation = ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: false,
-            hasActiveStream: true,
-            activeStreamRecoveryState: .idle,
-            isCancellingStream: false,
+            snapshot: nil,
+            dismissedIdentity: nil,
+            isScrolledNearBottom: false
+        )
+
+        XCTAssertNil(presentation)
+    }
+
+    func testPolicyProjectsActiveCoordinatorSnapshot() {
+        let presentation = ChatActiveRunStatusPolicy.presentation(
+            snapshot: snapshot(),
+            dismissedIdentity: nil,
             isScrolledNearBottom: false
         )
 
         XCTAssertEqual(presentation?.kind, .active)
-        XCTAssertEqual(presentation?.label, "Hermes is working")
+        XCTAssertEqual(presentation?.lifecycle, .active)
+        XCTAssertEqual(presentation?.layoutMode, .expanded)
+        XCTAssertEqual(presentation?.goal, "Finish the release notes")
     }
 
-    func testStatusShowsStartingBeforeStreamIDExists() {
-        let presentation = ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: true,
-            hasActiveStream: false,
-            activeStreamRecoveryState: .idle,
-            isCancellingStream: false,
+    func testPolicyProjectsCheckingAndReconnectingWithoutChangingLifecycle() {
+        let checking = ChatActiveRunStatusPolicy.presentation(
+            snapshot: snapshot(recoveryState: .checking),
+            dismissedIdentity: nil,
+            isScrolledNearBottom: false
+        )
+        let reconnecting = ChatActiveRunStatusPolicy.presentation(
+            snapshot: snapshot(recoveryState: .reconnecting),
+            dismissedIdentity: nil,
             isScrolledNearBottom: false
         )
 
-        XCTAssertEqual(presentation?.kind, .starting)
+        XCTAssertEqual(checking?.kind, .checking)
+        XCTAssertEqual(checking?.lifecycle, .active)
+        XCTAssertEqual(reconnecting?.kind, .reconnecting)
+        XCTAssertEqual(reconnecting?.lifecycle, .active)
     }
 
-    func testStatusPrioritizesRecoveryStateOverGenericActiveRun() {
+    func testDismissedIsUIOnlyAndDoesNotCancelOrFinalize() {
+        let activeSnapshot = snapshot()
         let presentation = ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: false,
-            hasActiveStream: true,
-            activeStreamRecoveryState: .reconnecting,
-            isCancellingStream: false,
+            snapshot: activeSnapshot,
+            dismissedIdentity: firstIdentity,
             isScrolledNearBottom: false
         )
 
-        XCTAssertEqual(presentation?.kind, .reconnecting)
-        XCTAssertEqual(presentation?.accessibilityLabel, "Hermes is reconnecting the response stream")
+        XCTAssertNil(presentation)
+        XCTAssertEqual(activeSnapshot.identity, firstIdentity)
+        XCTAssertEqual(activeSnapshot.lifecycle, .active)
     }
 
-    func testStatusPrioritizesCancellationOverOtherStates() {
+    func testNewGenerationClearsDismissedProjection() {
+        let replacementIdentity = ChatRunIdentity(
+            sessionID: firstIdentity.sessionID,
+            streamID: firstIdentity.streamID,
+            generation: firstIdentity.generation + 1
+        )
         let presentation = ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: true,
-            hasActiveStream: true,
-            activeStreamRecoveryState: .checking,
-            isCancellingStream: true,
+            snapshot: snapshot(identity: replacementIdentity),
+            dismissedIdentity: firstIdentity,
             isScrolledNearBottom: false
         )
 
-        XCTAssertEqual(presentation?.kind, .stopping)
+        XCTAssertEqual(presentation?.lifecycle, .active)
+        XCTAssertEqual(presentation?.layoutMode, .expanded)
     }
 
-    func testStatusHidesWhenIdleAndNoRunIsStarting() {
-        XCTAssertNil(ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: false,
-            hasActiveStream: false,
-            activeStreamRecoveryState: .idle,
-            isCancellingStream: false,
+    func testTerminalCoordinatorSnapshotProjectsToInlineEventNotPinnedRow() {
+        let terminalSnapshot = snapshot(lifecycle: .completed)
+        let presentation = ChatActiveRunStatusPolicy.presentation(
+            snapshot: terminalSnapshot,
+            dismissedIdentity: nil,
             isScrolledNearBottom: false
-        ))
+        )
+
+        XCTAssertNil(presentation)
+        XCTAssertEqual(terminalSnapshot.lifecycle, .completed)
+    }
+
+    func testNearBottomProjectsCompactStatusInsteadOfHidingIt() {
+        let presentation = ChatActiveRunStatusPolicy.presentation(
+            snapshot: snapshot(),
+            dismissedIdentity: nil,
+            isScrolledNearBottom: true
+        )
+
+        XCTAssertEqual(presentation?.kind, .active)
+        XCTAssertEqual(presentation?.layoutMode, .compact)
+    }
+
+    func testAwayFromBottomProjectsExpandedStatus() {
+        let presentation = ChatActiveRunStatusPolicy.presentation(
+            snapshot: snapshot(),
+            dismissedIdentity: nil,
+            isScrolledNearBottom: false
+        )
+
+        XCTAssertEqual(presentation?.kind, .active)
+        XCTAssertEqual(presentation?.layoutMode, .expanded)
     }
 }
 

@@ -1,5 +1,10 @@
 import SwiftUI
 
+enum ChatRunStatusParentMotion: Equatable {
+    case none
+    case slideAndFade
+}
+
 enum ChatMotion {
     static func press(duration: Double, reduceMotion: Bool) -> Animation? {
         reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: duration, extraBounce: 0)
@@ -31,6 +36,10 @@ enum ChatMotion {
 
     static func typingIndicator(reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
+    }
+
+    static func runStatusParentMotion(reduceMotion: Bool) -> ChatRunStatusParentMotion {
+        reduceMotion ? .none : .slideAndFade
     }
 
     static func bottomOverlayTransition(reduceMotion: Bool) -> AnyTransition {

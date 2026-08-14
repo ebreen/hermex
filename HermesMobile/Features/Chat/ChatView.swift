@@ -1046,9 +1046,20 @@ struct ChatView: View {
                         .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
                 }
 
-                if let activeRunStatusPresentation {
-                    ChatActiveRunStatusView(presentation: activeRunStatusPresentation)
-                        .transition(ChatMotion.bottomOverlayTransition(reduceMotion: reduceMotion))
+                if let activeRunStatusPresentation,
+                   let runSnapshot = viewModel.activeRunStatusSnapshot,
+                   let connectionIdentity = viewModel.activeRunConnectionIdentity {
+                    ChatActiveRunStatusView(
+                        presentation: activeRunStatusPresentation,
+                        connectionIdentity: connectionIdentity,
+                        onClose: {
+                            viewModel.dismissActiveRunStatus(for: runSnapshot.identity)
+                        },
+                        onCancel: { expectedIdentity in
+                            Task { await cancelStream(expectedIdentity: expectedIdentity) }
+                        }
+                    )
+                    .transition(runStatusParentTransition)
                 }
 
                 if showsApprovalBypassStatus {
@@ -1058,10 +1069,12 @@ struct ChatView: View {
             }
             .padding(.horizontal)
             .padding(.bottom, composerHeight + 8)
-            .allowsHitTesting(false)
             .zIndex(8)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: composerAccessoryVisibleItemCount)
-            .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: activeRunStatusPresentation)
+            .animation(
+                reduceMotion ? nil : ChatMotion.quickState(reduceMotion: reduceMotion),
+                value: activeRunStatusPresentation
+            )
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: viewModel.pinnedLocalNotices)
             .animation(ChatMotion.quickState(reduceMotion: reduceMotion), value: showsApprovalBypassStatus)
         }
@@ -1229,12 +1242,19 @@ struct ChatView: View {
 
     private var activeRunStatusPresentation: ChatActiveRunStatusPresentation? {
         ChatActiveRunStatusPolicy.presentation(
-            isStartingChat: viewModel.isStartingChat,
-            hasActiveStream: viewModel.activeStreamID != nil,
-            activeStreamRecoveryState: viewModel.activeStreamRecoveryState,
-            isCancellingStream: viewModel.isCancellingStream,
+            snapshot: viewModel.activeRunStatusSnapshot,
+            dismissedIdentity: viewModel.dismissedRunStatusIdentity,
             isScrolledNearBottom: isScrolledNearBottom
         )
+    }
+
+    private var runStatusParentTransition: AnyTransition {
+        switch ChatMotion.runStatusParentMotion(reduceMotion: reduceMotion) {
+        case .none:
+            return .identity
+        case .slideAndFade:
+            return .move(edge: .bottom).combined(with: .opacity)
+        }
     }
 
     private var showsApprovalBypassStatus: Bool {
@@ -1560,11 +1580,15 @@ struct ChatView: View {
         }
     }
 
-    private func cancelStream() async {
-        let didCancel = await viewModel.cancelActiveStream()
-        if didCancel {
+    private func cancelStream(expectedIdentity: ChatRunConnectionIdentity? = nil) async {
+        let disposition = await viewModel.cancelActiveStreamDisposition(expectedIdentity: expectedIdentity)
+        if case .accepted = disposition {
             ChatHaptics.streamCancelled(isEnabled: isHapticsEnabled)
         }
+
+        // A stale cancellation belongs to an older connection/run. Never
+        // forward the replacement run's lastError through this action.
+        if case .stale = disposition { return }
 
         if let lastError = viewModel.lastError {
             onAPIError(lastError)

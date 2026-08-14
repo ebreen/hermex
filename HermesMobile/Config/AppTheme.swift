@@ -384,19 +384,76 @@ enum ChatActiveRunStatusKind: Equatable {
     }
 }
 
+enum ChatActiveRunStatusLayoutMode: Equatable {
+    case compact
+    case expanded
+}
+
 struct ChatActiveRunStatusPresentation: Equatable {
     let kind: ChatActiveRunStatusKind
+    let lifecycle: ChatRunStatusLifecycle
+    let goal: String
+    let layoutMode: ChatActiveRunStatusLayoutMode
 
-    var label: String {
-        kind.label
+    init(
+        kind: ChatActiveRunStatusKind,
+        lifecycle: ChatRunStatusLifecycle = .active,
+        goal: String = ""
+    ) {
+        self.kind = kind
+        self.lifecycle = lifecycle
+        self.goal = goal
+        self.layoutMode = .expanded
     }
 
-    var accessibilityLabel: String {
-        kind.accessibilityLabel
+    init(
+        kind: ChatActiveRunStatusKind,
+        lifecycle: ChatRunStatusLifecycle,
+        goal: String,
+        layoutMode: ChatActiveRunStatusLayoutMode
+    ) {
+        self.kind = kind
+        self.lifecycle = lifecycle
+        self.goal = goal
+        self.layoutMode = layoutMode
     }
+
+    var label: String { kind.label }
+    var accessibilityLabel: String { kind.accessibilityLabel }
 }
 
 enum ChatActiveRunStatusPolicy {
+    static func presentation(
+        snapshot: ChatRunStatusSnapshot?,
+        dismissedIdentity: ChatRunIdentity?,
+        isScrolledNearBottom: Bool
+    ) -> ChatActiveRunStatusPresentation? {
+        guard let snapshot,
+              snapshot.lifecycle == .active,
+              snapshot.identity != dismissedIdentity
+        else { return nil }
+
+        let kind: ChatActiveRunStatusKind
+        switch snapshot.recoveryState {
+        case .checking:
+            kind = .checking
+        case .reconnecting:
+            kind = .reconnecting
+        case .idle:
+            kind = .active
+        }
+
+        return ChatActiveRunStatusPresentation(
+            kind: kind,
+            lifecycle: snapshot.lifecycle,
+            goal: snapshot.goal,
+            layoutMode: isScrolledNearBottom ? .compact : .expanded
+        )
+    }
+
+    /// Compatibility-only surface for callers not yet migrated to the confirmed
+    /// coordinator snapshot. ChatView production code must not call this flag
+    /// overload; it cannot invent a run identity for a starting flag.
     static func presentation(
         isStartingChat: Bool,
         hasActiveStream: Bool,
@@ -404,27 +461,23 @@ enum ChatActiveRunStatusPolicy {
         isCancellingStream: Bool,
         isScrolledNearBottom: Bool
     ) -> ChatActiveRunStatusPresentation? {
-        guard !isScrolledNearBottom else { return nil }
-
-        if isCancellingStream {
-            return ChatActiveRunStatusPresentation(kind: .stopping)
+        guard hasActiveStream || isStartingChat || isCancellingStream else { return nil }
+        let kind: ChatActiveRunStatusKind
+        if isCancellingStream { kind = .stopping }
+        else if isStartingChat { kind = .starting }
+        else {
+            switch activeStreamRecoveryState {
+            case .checking: kind = .checking
+            case .reconnecting: kind = .reconnecting
+            case .idle: kind = .active
+            }
         }
-
-        if isStartingChat {
-            return ChatActiveRunStatusPresentation(kind: .starting)
-        }
-
-        switch activeStreamRecoveryState {
-        case .checking:
-            return ChatActiveRunStatusPresentation(kind: .checking)
-        case .reconnecting:
-            return ChatActiveRunStatusPresentation(kind: .reconnecting)
-        case .idle:
-            break
-        }
-
-        guard hasActiveStream else { return nil }
-        return ChatActiveRunStatusPresentation(kind: .active)
+        return ChatActiveRunStatusPresentation(
+            kind: kind,
+            lifecycle: .active,
+            goal: "",
+            layoutMode: isScrolledNearBottom ? .compact : .expanded
+        )
     }
 }
 
